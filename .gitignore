@@ -1,0 +1,7 @@
+.pio/
+__pycache__/
+# firmware images and device backups (third-party code, device keys)
+*.bin
+*.zigbee
+backups/
+firmware/
