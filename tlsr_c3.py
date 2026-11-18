@@ -10,6 +10,7 @@ Examples:
 """
 import argparse
 import base64
+import os
 import sys
 import time
 import zlib
@@ -317,6 +318,8 @@ def main():
             size = (1 << jedec[2]) >> 10 if 10 <= jedec[2] <= 24 else 0
             print('Flash:   JEDEC %s, %d kbytes, status 0x%s' % (jedec.hex(), size, f.cmd('FS')))
         elif args.op == 'rf':
+            # create the folder first, so that a long read is not lost on a missing directory
+            os.makedirs(os.path.dirname(os.path.abspath(args.filename)), exist_ok=True)
             f.cmd('STAT')
             t1 = time.time()
             data = f.read_flash(args.address, args.size)
