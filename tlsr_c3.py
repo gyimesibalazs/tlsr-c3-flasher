@@ -256,6 +256,9 @@ def main():
     ap.add_argument('--burst', type=auto_int, default=0,
                     help='bytes read per burst, 1 = slow and safe (default 64)')
     ap.add_argument('-r', '--run', action='store_true', help='restart the target CPU at the end')
+    ap.add_argument('--wake', action='store_true',
+                    help='after activation switch the clocks on and wake the flash from deep power-down '
+                         '(for a flash that reads all zeros / JEDEC 000000)')
     sub = ap.add_subparsers(dest='op', required=True)
     sub.add_parser('info', help='chip id, program counter, flash id')
     sub.add_parser('selftest', help='line test without talking to the target (TX - resistor - RX)')
@@ -307,6 +310,17 @@ def main():
             print('Done in %.1f s' % (time.time() - t0))
             return
         print('Target: ', f.activate(args.tact))
+        if args.wake:
+            # A chip stopped before its boot code ran can have the flash interface clocks off, and a
+            # firmware may have left the flash in deep power-down (0xB9), where it ignores everything
+            # but 0xAB (release). Clocks on as the SDK start-up does, then 0xAB, then >= 30 us.
+            f.cmd('S 0x60 000000ffffff')
+            time.sleep(0.01)
+            f.cmd('S 0x0d 00')                        # flash CS low
+            f.cmd('S 0x0c ab')                        # release from deep power-down
+            f.cmd('S 0x0d 01')                        # CS high
+            time.sleep(0.01)
+            print('Wake:    clocks on, flash 0xAB sent; JEDEC now %s' % f.cmd('FJ'))
 
         if args.op == 'info':
             # 0x7e: chip id (0x5562 = TLSR825x), 0x6bc: program counter
