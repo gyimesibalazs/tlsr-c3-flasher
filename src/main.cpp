@@ -22,6 +22,7 @@
 #include "driver/rmt_tx.h"
 #include "driver/uart.h"
 #include "config.h"
+#include "swd.h"
 
 #define FW_NAME "tlsr-c3-flasher"
 #define FW_VERSION "0.15"
@@ -362,10 +363,15 @@ static bool r_read(const uint8_t *head, uint8_t *out, int n) {
 
 // ================================================================ mode-independent SWire access
 
+static bool swd_on = false;
 static void bridge_end();
 
 static bool set_mode(SwsMode m) {
   bridge_end();
+  if (swd_on) {
+    swd_end();
+    swd_on = false;
+  }
   uart_teardown();
   rmt_teardown();
   mode = m;
@@ -804,6 +810,10 @@ static void bridge_end() {
 // boot: 1 = BOOT pin high, 0 = low, -1 = left open; the target is restarted with that level
 static bool bridge_begin(uint32_t baud, int boot) {
 #if ARDUINO_USB_CDC_ON_BOOT
+  if (swd_on) {
+    swd_end();
+    swd_on = false;
+  }
   uart_teardown();
   rmt_teardown();
   pinMode(PIN_SWS_TX, INPUT);                // the resistor side of the SWS wire stays quiet
@@ -865,10 +875,18 @@ static void bridge_pump() {
   }
 }
 
+// ================================================================ SWD commands
+
+static bool swd_check(int r) {
+  if (r == SWD_OK) return true;
+  Serial.printf("ERR swd %s\n", swd_ack_name(r));
+  return false;
+}
+
 static void handle(char *ln) {
-  char *argv[4] = {NULL, NULL, NULL, NULL};
+  char *argv[9] = {NULL};
   int argc = 0;
-  for (char *tok = strtok(ln, " \t\r"); tok && argc < 4; tok = strtok(NULL, " \t\r")) argv[argc++] = tok;
+  for (char *tok = strtok(ln, " \t\r"); tok && argc < 9; tok = strtok(NULL, " \t\r")) argv[argc++] = tok;
   if (!argc) return;
   const char *cmd = argv[0];
   uint32_t a1 = argc > 1 ? strtoul(argv[1], NULL, 0) : 0;
@@ -986,6 +1004,68 @@ static void handle(char *ln) {
     if (n < 1) return err("data");
     if (!flash_write_page(a1, data_buf, n)) return err("write failed");
     ok();
+  } else if (!strcmp(cmd, "SWD")) {          // SWD: switch the pins to SWD, target power on
+    bridge_end();
+    uart_teardown();
+    rmt_teardown();
+    swd_begin();
+    swd_on = true;
+    target_power(true);
+    digitalWrite(PIN_RST, HIGH);
+    ok();
+  } else if (!strcmp(cmd, "SWCLK")) {        // SWCLK <kHz>
+    if (a1 < 10 || a1 > 4000) return err("10..4000 kHz");
+    swd_set_khz(a1);
+    Serial.printf("OK %u\n", (unsigned)swd_khz());
+  } else if (!swd_on && cmd[0] == 'S' && cmd[1] && strchr("CDAMFHR", cmd[1]) && strcmp(cmd, "SELFTEST") &&
+             strcmp(cmd, "STAT") && strcmp(cmd, "SRST")) {
+    err("not in SWD mode (send SWD first)");
+  } else if (!strcmp(cmd, "SC")) {           // SC [reset | md <targetsel>]: connect, IDCODE, debug power-up
+    if (argc > 1 && !strcmp(argv[1], "reset")) digitalWrite(PIN_RST, LOW);
+    uint32_t id = 0;
+    int r = argc > 2 && !strcmp(argv[1], "md") ? swd_connect_multidrop(strtoul(argv[2], NULL, 0), &id)
+                                                : swd_connect(&id);
+    if (r == SWD_OK) r = swd_power_up();
+    if (!swd_check(r)) return;
+    Serial.printf("OK %08x\n", (unsigned)id);
+  } else if (!strcmp(cmd, "SRST")) {         // SRST 0|1: release or hold the reset wire
+    digitalWrite(PIN_RST, a1 ? HIGH : LOW);
+    ok();
+  } else if (!strcmp(cmd, "SDR")) {          // SDR <addr>: DP register read
+    uint32_t v = 0;
+    if (!swd_check(swd_dp_read(a1, &v))) return;
+    Serial.printf("OK %08x\n", (unsigned)v);
+  } else if (!strcmp(cmd, "SDW")) {          // SDW <addr> <value>
+    if (!swd_check(swd_dp_write(a1, a2))) return;
+    ok();
+  } else if (!strcmp(cmd, "SAR")) {          // SAR <ap> <addr>: AP register read
+    uint32_t v = 0;
+    if (!swd_check(swd_ap_read(a1, a2, &v))) return;
+    Serial.printf("OK %08x\n", (unsigned)v);
+  } else if (!strcmp(cmd, "SAW")) {          // SAW <ap> <addr> <value>
+    uint32_t v = argc > 3 ? strtoul(argv[3], NULL, 0) : 0;
+    if (!swd_check(swd_ap_write(a1, a2, v))) return;
+    ok();
+  } else if (!strcmp(cmd, "SM")) {           // SM <ap> <addr> <len>: memory read, base64 like FB
+    uint32_t len = argc > 3 ? strtoul(argv[3], NULL, 0) : 0;
+    if ((a2 | len) & 3 || len < 4 || len > MAX_READ) return err("addr and len: multiples of 4, len <= 1024");
+    if (!swd_check(swd_mem_read(a1, a2, data_buf, len))) return;
+    reply_b64(data_buf, len);
+  } else if (!strcmp(cmd, "SMW")) {          // SMW <ap> <addr> <hex>: memory write, whole words
+    int n = argc > 3 ? parse_hex(argv[3], data_buf, MAX_READ) : -1;
+    if (n < 4 || (n & 3) || (a2 & 3)) return err("data: whole words at a word address");
+    if (!swd_check(swd_mem_write(a1, a2, data_buf, n))) return;
+    ok();
+  } else if (!strcmp(cmd, "SFC")) {          // SFC <addr> <len>: CRC-32 of target memory (verify without upload)
+    if ((a1 | a2) & 3 || a2 < 4 || a2 > 65536) return err("addr and len: multiples of 4, len <= 65536");
+    uint32_t crc = 0;
+    for (uint32_t done = 0; done < a2;) {
+      int cnt = (int)min((uint32_t)MAX_READ, a2 - done);
+      if (!swd_check(swd_mem_read(0, a1 + done, data_buf, cnt))) return;
+      crc = crc32_update(crc, data_buf, cnt);
+      done += cnt;
+    }
+    Serial.printf("OK %08x\n", (unsigned)crc);
   } else if (!strcmp(cmd, "BRIDGE")) {       // BRIDGE <baud> [hi|lo|z]: transparent UART bridge
     int boot = -1;
     if (argc > 2) boot = !strcmp(argv[2], "hi") ? 1 : !strcmp(argv[2], "lo") ? 0 : -1;
@@ -1015,7 +1095,7 @@ void setup() {
     gpio_set_drive_capability((gpio_num_t)pin, GPIO_DRIVE_CAP_3);
   }
   REG_WRITE(GPIO_OUT_W1TC_REG, pwr_mask);    // the level they will have when they become outputs
-  pinMode(PIN_BOOT, INPUT);
+  pinMode(PIN_SWCLK, INPUT);
   pinMode(PIN_BRIDGE_TX, INPUT);
   set_mode(SWS_MODE_DEFAULT ? MODE_RMT : MODE_UART);
 #if AUTO_ACTIVATE_MS > 0

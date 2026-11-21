@@ -5,3 +5,4 @@ __pycache__/
 *.zigbee
 backups/
 firmware/
+.ref/

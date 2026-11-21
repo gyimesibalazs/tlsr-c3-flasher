@@ -33,6 +33,12 @@
 // RMT mode: SWire bit rate in bit/s. Range 30000 ... 2000000 (the chip's own default is about 960000).
 #define SWS_RATE_DEFAULT 1000000
 
+// ---- SWD (Arm Serial Wire Debug: EFR32, nRF52, STM32 ...)
+// SWDIO is the SWS wire (GPIO 4 drives it through the resistor, GPIO 5 reads it); SWCLK has its own wire.
+#define PIN_SWCLK 0
+// SWD clock in kHz at power-up (SWCLK command); the bit-banged clock reaches about 2000.
+#define SWD_KHZ_DEFAULT 1000
+
 // ---- UART bridge (c3-usb boards only: UART0 is the link to the computer on c3-uart boards)
 // RX is the SWS wire (GPIO 5, GPIO 4 is switched to an input), TX has its own wire. GPIO 21 also carries
 // the C3's own boot messages for a moment after the flasher is plugged in.

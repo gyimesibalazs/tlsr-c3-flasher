@@ -7,6 +7,8 @@ Examples:
     python3 tlsr_c3.py -p /dev/ttyACM0 wf 0 firmware.bin
     python3 tlsr_c3.py -p /dev/ttyACM0 --rate 1500000 rf 0 0x80000 stock.bin --twice
     python3 tlsr_c3.py -p /dev/ttyACM0 --mode uart info
+    python3 tlsr_c3.py -p /dev/ttyACM0 --swd info                     # Arm SWD target (EFR32, nRF52, STM32)
+    python3 tlsr_c3.py -p /dev/ttyACM0 --swd rf 0 0x40000 efr32.bin --twice
     python3 tlsr_c3.py -p /dev/ttyACM0 bridge 115200 --boot hi        # UART bridge, BOOT pin high
     python3 tlsr_c3.py -p /dev/ttyACM0 bridge-exit
 """
@@ -243,6 +245,329 @@ def find_led(f, skip, hold, only=''):
     print('Done, all pins are inputs again.')
 
 
+# ---------------------------------------------------------------- SWD
+
+# MEM-AP / Cortex-M registers
+CPUID = 0xE000ED00
+DHCSR = 0xE000EDF0
+CORTEX = {0xC20: 'Cortex-M0', 0xC60: 'Cortex-M0+', 0xC23: 'Cortex-M3', 0xC24: 'Cortex-M4', 0xC27: 'Cortex-M7',
+          0xD20: 'Cortex-M23', 0xD21: 'Cortex-M33', 0xD22: 'Cortex-M55'}
+AP_IDR = {0x24770011: 'AHB-AP (Cortex-M3/M4)', 0x04770031: 'AHB-AP (Cortex-M0+)', 0x84770001: 'AHB-AP',
+          0x14770015: 'AHB5-AP (Cortex-M33)', 0x74770001: 'AHB-AP (Cortex-M0)', 0x16E60001: 'Silabs AAP (debug locked?)',
+          0x02880000: 'nRF CTRL-AP'}
+EFR32_SERIES1_FAMILY = {16: 'EFR32MG1P', 17: 'EFR32MG1B', 18: 'EFR32MG1V', 19: 'EFR32BG1P', 25: 'EFR32FG1P',
+                        28: 'EFR32MG12P', 31: 'EFR32BG12P', 37: 'EFR32FG12P', 40: 'EFR32MG13P', 43: 'EFR32BG13P',
+                        46: 'EFR32FG13P', 49: 'EFR32MG14P', 52: 'EFR32BG14P', 55: 'EFR32FG14P'}
+
+
+def swd_word(f, addr, ap=0):
+    data = base64.b64decode(f.cmd('SM %d %d 4' % (ap, addr)))
+    return int.from_bytes(data, 'little')
+
+
+class SwdTarget:
+    def __init__(self, name='', flash=None, page=None, family=None, base=0, sfam_args='', sectors=None, rp2040=False,
+                 write_unit=None, erase_unit=None):
+        self.name, self.flash, self.page, self.family = name, flash, page, family
+        self.write_unit = write_unit     # one SFW may not cross this (the SAM page buffer); None = any
+        self.erase_unit = erase_unit or page
+        self.base = base                 # address of the first flash byte
+        self.sfam_args = sfam_args       # extra SFAM arguments (STM32 page size, second bank)
+        self.sectors = sectors           # erase units as (start, size), for chips with uneven sectors
+        self.rp2040 = rp2040
+
+    def erase_units(self, start, end):
+        """(address, size) of every erase unit that overlaps start..end-1."""
+        if self.sectors:
+            return [(a, n) for a, n in self.sectors if a < end and a + n > start]
+        u = self.erase_unit
+        first = start - (start - self.base) % u
+        return [(a, u) for a in range(first, end, u)]
+
+
+# STM32: DBGMCU DEV_ID -> (name, writer, erase page, flash size register, dual bank rule)
+#   writer: stm32f1 (F0 / F1 / F3 registers), stm32f4, stm32v2 (G0 / G4 / L4 / WB), None = identify only
+STM32 = {
+    0x440: ('STM32F05x', 'stm32f1', 1024, 0x1FFFF7CC, None), 0x444: ('STM32F03x', 'stm32f1', 1024, 0x1FFFF7CC, None),
+    0x445: ('STM32F04x', 'stm32f1', 1024, 0x1FFFF7CC, None), 0x448: ('STM32F07x', 'stm32f1', 2048, 0x1FFFF7CC, None),
+    0x442: ('STM32F09x', 'stm32f1', 2048, 0x1FFFF7CC, None),
+    0x412: ('STM32F10x low density', 'stm32f1', 1024, 0x1FFFF7E0, None),
+    0x410: ('STM32F10x medium density', 'stm32f1', 1024, 0x1FFFF7E0, None),
+    0x414: ('STM32F10x high density', 'stm32f1', 2048, 0x1FFFF7E0, None),
+    0x418: ('STM32F105/107', 'stm32f1', 2048, 0x1FFFF7E0, None),
+    0x420: ('STM32F100 value line', 'stm32f1', 1024, 0x1FFFF7E0, None),
+    0x428: ('STM32F100 value line HD', 'stm32f1', 2048, 0x1FFFF7E0, None),
+    0x430: ('STM32F10x XL density (two flash controllers, not supported)', None, 2048, 0x1FFFF7E0, None),
+    0x422: ('STM32F30x/F31x', 'stm32f1', 2048, 0x1FFFF7CC, None), 0x432: ('STM32F37x', 'stm32f1', 2048, 0x1FFFF7CC, None),
+    0x438: ('STM32F303x6/8', 'stm32f1', 2048, 0x1FFFF7CC, None), 0x439: ('STM32F301/302x6/8', 'stm32f1', 2048, 0x1FFFF7CC, None),
+    0x446: ('STM32F303xD/E', 'stm32f1', 2048, 0x1FFFF7CC, None),
+    0x413: ('STM32F405/407/415/417', 'stm32f4', 0, 0x1FFF7A22, None),
+    0x419: ('STM32F42x/43x', 'stm32f4', 0, 0x1FFF7A22, 'f4dual'),
+    0x423: ('STM32F401xB/C', 'stm32f4', 0, 0x1FFF7A22, None), 0x433: ('STM32F401xD/E', 'stm32f4', 0, 0x1FFF7A22, None),
+    0x431: ('STM32F411', 'stm32f4', 0, 0x1FFF7A22, None), 0x458: ('STM32F410', 'stm32f4', 0, 0x1FFF7A22, None),
+    0x441: ('STM32F412', 'stm32f4', 0, 0x1FFF7A22, None), 0x421: ('STM32F446', 'stm32f4', 0, 0x1FFF7A22, None),
+    0x463: ('STM32F413/423', 'stm32f4', 0, 0x1FFF7A22, None),
+    0x466: ('STM32G03x/G04x', 'stm32v2', 2048, 0x1FFF75E0, None), 0x460: ('STM32G07x/G08x', 'stm32v2', 2048, 0x1FFF75E0, None),
+    0x456: ('STM32G05x/G06x', 'stm32v2', 2048, 0x1FFF75E0, None),
+    0x467: ('STM32G0Bx/G0Cx (dual bank not handled)', None, 2048, 0x1FFF75E0, None),
+    0x468: ('STM32G431/441', 'stm32v2', 2048, 0x1FFF75E0, None),
+    0x469: ('STM32G47x/48x', 'stm32v2', 2048, 0x1FFF75E0, 'g4dbank'),
+    0x479: ('STM32G491/4A1', 'stm32v2', 2048, 0x1FFF75E0, None),
+    0x435: ('STM32L43x/44x', 'stm32v2', 2048, 0x1FFF75E0, None), 0x462: ('STM32L45x/46x', 'stm32v2', 2048, 0x1FFF75E0, None),
+    0x464: ('STM32L41x/42x', 'stm32v2', 2048, 0x1FFF75E0, None), 0x415: ('STM32L47x/48x', 'stm32v2', 2048, 0x1FFF75E0, 'half'),
+    0x461: ('STM32L49x/4Ax', 'stm32v2', 2048, 0x1FFF75E0, 'l4dualbank'),
+    0x495: ('STM32WB55', 'stm32v2', 4096, 0x1FFF75E0, None),
+    0x443: ('STM32C01x', 'stm32v2', 2048, 0x1FFF75A0, None), 0x453: ('STM32C03x', 'stm32v2', 2048, 0x1FFF75A0, None),
+    0x44C: ('STM32C05x', 'stm32v2', 2048, 0x1FFF75A0, None), 0x493: ('STM32C071', 'stm32v2', 2048, 0x1FFF75A0, None),
+    0x44D: ('STM32C09x', 'stm32v2', 2048, 0x1FFF75A0, None),
+    0x457: ('STM32L0 cat. 1', 'stm32l0', 128, 0x1FF8007C, 0x40022000),
+    0x425: ('STM32L0 cat. 2', 'stm32l0', 128, 0x1FF8007C, 0x40022000),
+    0x417: ('STM32L0 cat. 3', 'stm32l0', 128, 0x1FF8007C, 0x40022000),
+    0x447: ('STM32L0 cat. 5', 'stm32l0', 128, 0x1FF8007C, 0x40022000),
+    0x416: ('STM32L1 cat. 1', 'stm32l0', 256, 0x1FF8004C, 0x40023C00),
+    0x429: ('STM32L1 cat. 2', 'stm32l0', 256, 0x1FF8004C, 0x40023C00),
+    0x427: ('STM32L1 cat. 3', 'stm32l0', 256, 0x1FF800CC, 0x40023C00),
+    0x436: ('STM32L1 cat. 4 / cat. 3', 'stm32l0', 256, 0x1FF800CC, 0x40023C00),
+    0x437: ('STM32L1 cat. 5 / cat. 6', 'stm32l0', 256, 0x1FF800CC, 0x40023C00),
+    0x455: ('STM32U535/545', 'stm32u5', 8192, 0x0BFA07A0, 'half'),
+    0x482: ('STM32U575/585', 'stm32u5', 8192, 0x0BFA07A0, 'half'),
+    0x481: ('STM32U59x/5Ax', 'stm32u5', 8192, 0x0BFA07A0, 'half'),
+    0x476: ('STM32U5Fx/5Gx', 'stm32u5', 8192, 0x0BFA07A0, 'half'),
+    0x450: ('STM32H74x/75x (not supported)', None, 0, 0x1FF1E880, None),
+    0x449: ('STM32F74x/75x (not supported)', None, 0, 0x1FF0F442, None),
+}
+STM32_FLASH = 0x08000000
+
+
+def stm32_sectors_f4(size, dual):
+    """F4 sectors: 16 k x 4, 64 k, then 128 k; the 2 Mbyte parts repeat the map in the second bank."""
+    def bank(base, n):
+        out, a = [], base
+        for sz in [0x4000] * 4 + [0x10000] + [0x20000] * 64:
+            if a - base >= n:
+                break
+            out.append((a, sz))
+            a += sz
+        return out
+    if dual:
+        return bank(STM32_FLASH, size // 2) + bank(STM32_FLASH + size // 2, size // 2)
+    return bank(STM32_FLASH, size)
+
+
+# EFR32 Series 2: family number -> bit of the MSC clock in CMU_CLKEN1 (Simplicity SDK device headers; 0 = none)
+EFR32S2_MSC_CLOCK = {21: 0, 22: 17, 23: 16, 24: 16, 25: 16, 26: 16, 27: 17, 28: 16, 29: 17}
+
+
+def efr32_info(f, say, part):
+    if part == 0xC24:                                  # Series 1 (Cortex-M4), DEVINFO at 0x0FE081B0
+        part_reg, msize, meminfo = swd_word(f, 0x0FE081FC), swd_word(f, 0x0FE081F8), swd_word(f, 0x0FE081E4)
+        fam = (part_reg >> 16) & 0xff
+        if fam in EFR32_SERIES1_FAMILY:
+            t = SwdTarget('%s%d' % (EFR32_SERIES1_FAMILY[fam], part_reg & 0xffff), (msize & 0xffff) * 1024,
+                          1 << ((((meminfo >> 24) & 0xff) + 10) & 0xff), 'efr32s1')
+            say('Chip:    %s (Silicon Labs Series 1), flash %d kbytes in %d-byte pages, RAM %d kbytes' % (
+                t.name, t.flash // 1024, t.page, msize >> 16))
+            return t
+    if part == 0xD21:                                  # Series 2 (Cortex-M33), DEVINFO at 0x0FE08000
+        part_reg, msize, meminfo = swd_word(f, 0x0FE08010), swd_word(f, 0x0FE08018), swd_word(f, 0x0FE08014)
+        letters = {0: 'FG', 1: 'MG', 2: 'BG'}
+        famnum = (part_reg >> 16) & 0x3f
+        if famnum in EFR32S2_MSC_CLOCK:
+            letter = letters.get((part_reg >> 24) & 0x3f, '?%d' % ((part_reg >> 24) & 0x3f))
+            t = SwdTarget('EFR32%s%d (device %d)' % (letter, famnum, part_reg & 0xffff), (msize & 0xffff) * 1024,
+                          1 << (((meminfo & 0xff) + 10) & 0xff), 'efr32s2', sfam_args=' %d' % EFR32S2_MSC_CLOCK[famnum])
+            say('Chip:    %s (Silicon Labs Series 2), flash %d kbytes in %d-byte pages, RAM %d kbytes' % (
+                t.name, t.flash // 1024, t.page, (msize >> 16) & 0x7ff))
+            return t
+    return None
+
+
+def nrf_info(f, say, part):
+    if part in (0xC24, 0xC20, 0xC60):                  # nRF52 (Cortex-M4 / M0): FICR at 0x10000000
+        info_part = swd_word(f, 0x10000100)
+        if 0x52000 <= info_part <= 0x52fff:
+            t = SwdTarget('nRF%x' % info_part, swd_word(f, 0x10000110) * 1024, swd_word(f, 0x10000010), 'nrf52')
+            say('Chip:    %s, flash %d kbytes in %d-byte pages' % (t.name, t.flash // 1024, t.page))
+            return t
+    if part == 0xD21:                                  # nRF5340 application core: FICR at 0x00FF0000
+        if swd_word(f, 0x00FF020C) == 0x5340:
+            t = SwdTarget('nRF5340 (application core)', swd_word(f, 0x00FF021C) * 1024, swd_word(f, 0x00FF0220),
+                          'nrf53')
+            say('Chip:    %s, flash %d kbytes in %d-byte pages (the network core is not handled)' % (
+                t.name, t.flash // 1024, t.page))
+            return t
+    return None
+
+
+def samd_info(f, say, part):
+    did = swd_word(f, 0x41002018)                      # DSU DID
+    proc = did >> 28
+    if proc not in (1, 6):                             # 1: Cortex-M0+ (D2x / L2x / C2x), 6: Cortex-M4 (D5x / E5x)
+        return None
+    param = swd_word(f, 0x41004008)                    # NVMCTRL PARAM: number of pages and page size
+    pages, page = param & 0xffff, 8 << ((param >> 16) & 7)
+    if not pages:
+        return None
+    if proc == 1:
+        t = SwdTarget('SAM D2x/L2x/C2x (DID 0x%08x)' % did, pages * page, page, 'samd21',
+                      write_unit=page, erase_unit=4 * page)           # erased by rows of 4 pages
+    else:
+        t = SwdTarget('SAM D5x/E5x (DID 0x%08x)' % did, pages * page, page, 'samd51',
+                      write_unit=page, erase_unit=16 * page)          # erased by 8 k blocks
+    say('Chip:    %s, flash %d kbytes in %d-byte pages' % (t.name, t.flash // 1024, page))
+    return t
+
+
+def stm32_info(f, say, part=None):
+    dev = 0
+    for reg in (0xE0042000, 0x40015800, 0xE0044000):  # DBGMCU_IDCODE: M3/M4/M7/M33, M0/M0+, U5
+        try:
+            v = swd_word(f, reg)
+        except FlasherError:
+            continue
+        if v & 0xfff in STM32:
+            dev = v & 0xfff
+            break
+    if not dev:
+        return None
+    name, writer, page, size_reg, dual = STM32[dev]
+    try:
+        word = swd_word(f, size_reg & ~3)
+        kb = (word >> (8 * (size_reg & 2))) & 0xffff
+    except FlasherError:
+        kb = 0
+    size = kb * 1024 or None
+    bank2, sectors, sfam = 0, None, ''
+    if writer == 'stm32f4':
+        sectors = stm32_sectors_f4(size or 0, dual == 'f4dual' and kb == 2048)
+        bank2 = STM32_FLASH + size // 2 if dual == 'f4dual' and kb == 2048 else 0
+        sfam = ' 0 %d' % bank2
+    elif writer == 'stm32v2':
+        optr = swd_word(f, 0x40022020)
+        if dual == 'g4dbank':                          # DBANK: two banks of 2 k pages, else one bank of 4 k pages
+            if optr & (1 << 22):
+                bank2 = STM32_FLASH + size // 2
+            else:
+                page = 4096
+        elif dual == 'l4dualbank' and optr & (1 << 21) or dual == 'half':
+            bank2 = STM32_FLASH + size // 2
+        sfam = ' %d %d' % (page, bank2)
+    elif writer == 'stm32f1':
+        sfam = ' %d' % page
+    elif writer == 'stm32u5':
+        if swd_word(f, 0x40022040) & (1 << 31):
+            say('         TrustZone is on (TZEN): the secure flash cannot be written through the non-secure registers')
+            writer = None
+        bank2 = STM32_FLASH + size // 2
+        sfam = ' %d %d' % (page, bank2)
+    elif writer == 'stm32l0':
+        sfam = ' %d' % dual                            # the flash register base (0x40022000 / 0x40023C00)
+    label = name + (' (DEV_ID 0x%03x; GD32 / CH32 compatibles report the same)' if writer == 'stm32f1' else
+                    ' (DEV_ID 0x%03x)') % dev
+    t = SwdTarget(label, size, page or None, writer, STM32_FLASH, sfam, sectors)
+    say('Chip:    %s, flash %s%s' % (t.name, '%d kbytes' % kb if kb else 'size unknown',
+                                     ', second bank at 0x%08x' % bank2 if bank2 else ''))
+    if writer is None:
+        say('         identification only: this family has no flash routine yet')
+    # read protection
+    try:
+        if writer == 'stm32f1':
+            rdp = swd_word(f, 0x4002201C) & 2                         # FLASH_OBR.RDPRT
+        elif writer == 'stm32f4':
+            rdp = ((swd_word(f, 0x40023C14) >> 8) & 0xff) != 0xAA     # FLASH_OPTCR.RDP
+        elif writer == 'stm32v2':
+            rdp = (swd_word(f, 0x40022020) & 0xff) != 0xAA            # FLASH_OPTR.RDP
+        elif writer == 'stm32u5':
+            rdp = (swd_word(f, 0x40022040) & 0xff) != 0xAA
+        elif writer == 'stm32l0':
+            rdp = (swd_word(f, dual + 0x1C) & 0xff) != 0xAA          # OPTR / OBR
+        else:
+            rdp = 0
+        if rdp:
+            say('         READ PROTECTED (RDP): the flash cannot be read; removing it erases the chip')
+    except FlasherError:
+        pass
+    return t
+
+
+RP2040_TARGETSEL = 0x01002927      # core 0
+RP2040_CHIP_ID = 0x40000000
+
+
+def swd_connect_any(f):
+    """Plain SWD first, then the RP2040's multi-drop port. Returns (idcode, multidrop)."""
+    try:
+        return int(f.cmd('SC'), 16), False
+    except FlasherError as first:
+        try:
+            return int(f.cmd('SC md %d' % RP2040_TARGETSEL), 16), True
+        except FlasherError:
+            raise first
+
+
+def swd_info(f, quiet=False):
+    """Identify an Arm SWD target without changing it. family: the SFAM name for flash writing, or None."""
+    say = (lambda *a: None) if quiet else print
+    idcode, multidrop = swd_connect_any(f)
+    say('IDCODE:  0x%08x (designer 0x%03x, part 0x%04x, version %d)' % (
+        idcode, (idcode >> 1) & 0x7ff, (idcode >> 12) & 0xffff, idcode >> 28))
+    idrs = []
+    for ap in range(4):
+        try:
+            idr = int(f.cmd('SAR %d 0xfc' % ap), 16)
+        except FlasherError:
+            break
+        if idr == 0:
+            break
+        idrs.append(idr)
+        say('AP %d:    IDR 0x%08x %s' % (ap, idr, AP_IDR.get(idr, '')))
+    if not idrs or idrs[0] == 0x16E60001:
+        say('The memory AP is not reachable: the chip is probably debug locked (only a mass erase opens it).')
+        return SwdTarget()
+    cpuid = swd_word(f, CPUID)
+    part = (cpuid >> 4) & 0xfff
+    say('CPU:     %s (CPUID 0x%08x)' % (CORTEX.get(part, 'unknown'), cpuid))
+    say('Core:    %s' % ('halted' if swd_word(f, DHCSR) & (1 << 17) else 'running'))
+    if multidrop:
+        chip = swd_word(f, RP2040_CHIP_ID)
+        if (chip & 0x0fffffff) == 0x0002927:
+            t = SwdTarget('RP2040 (revision %d)' % (chip >> 28), None, 4096, 'rp2040', 0x10000000, rp2040=True)
+            say('Chip:    %s, external QSPI flash at 0x10000000 (size not read: give the size to rf)' % t.name)
+            return t
+    # each probe reads addresses that do not exist on other chips: a bus fault there just means "not this one"
+    for probe in (efr32_info, nrf_info, stm32_info, samd_info):
+        try:
+            t = probe(f, say, part)
+        except FlasherError:
+            t = None
+        if t is not None:
+            return t
+    say('Chip:    not recognised; reading works, writing needs a known chip')
+    return SwdTarget()
+
+
+def swd_read(f, addr, size, progress=True):
+    out = bytearray()
+    while len(out) < size:
+        n = min(READ_CHUNK, size - len(out))
+        if progress:
+            print('\rRead 0x%08x' % (addr + len(out)), end='', flush=True)
+        for attempt in range(3):
+            try:
+                answer = f.cmd('SM 0 %d %d' % (addr + len(out), n))
+                data = b'\xff' * n if answer == '*' else base64.b64decode(answer, validate=True)
+                if len(data) != n:
+                    raise FlasherError('short answer')
+                break
+            except (FlasherError, ValueError):
+                if attempt == 2:
+                    raise
+        out += data
+    if progress:
+        print('\r' + ' ' * 24 + '\r', end='')
+    return bytes(out)
+
+
 def main():
     ap = argparse.ArgumentParser(description='ESP32-C3 Telink TLSR825x SWire flasher')
     ap.add_argument('-p', '--port', default='/dev/ttyACM0')
@@ -258,6 +583,10 @@ def main():
     ap.add_argument('--burst', type=auto_int, default=0,
                     help='bytes read per burst, 1 = slow and safe (default 64)')
     ap.add_argument('-r', '--run', action='store_true', help='restart the target CPU at the end')
+    ap.add_argument('--swd', action='store_true',
+                    help='Arm SWD target (EFR32, nRF52, STM32): SWDIO on the SWS wire, SWCLK on GPIO 0; '
+                         'EFR32 Series 1/2, nRF52, STM32, RP2040 identified; info, rf')
+    ap.add_argument('--swd-khz', type=auto_int, default=1000, help='SWD clock in kHz (default 1000)')
     ap.add_argument('--wake', action='store_true',
                     help='after activation switch the clocks on and wake the flash from deep power-down '
                          '(for a flash that reads all zeros / JEDEC 000000)')
@@ -316,7 +645,7 @@ def main():
             fw = (0, 0)
         if fw < (0, 11):
             raise FlasherError('this script needs flasher firmware 0.11 or newer on the C3')
-        if args.op in ('bridge', 'power-off'):
+        if args.op in ('bridge', 'power-off') or args.swd:
             if fw < (0, 15):
                 raise FlasherError('this needs flasher firmware 0.15 or newer on the C3')
         if args.op == 'power-off':
@@ -330,6 +659,35 @@ def main():
             f.ser.close()
             print('The port is free for the target tool now. Do not let it toggle DTR / RTS (they reset the C3);')
             print('for example esptool --before no_reset --after no_reset. Leave with: bridge-exit')
+            return
+        if args.swd:
+            f.cmd('SWD')
+            f.cmd('SWCLK %d' % args.swd_khz)
+            t = None
+            if args.op == 'info':
+                t = swd_info(f)
+            elif args.op == 'rf':
+                os.makedirs(os.path.dirname(os.path.abspath(args.filename)), exist_ok=True)
+                t1 = time.time()
+                swd_connect_any(f)
+                data = swd_read(f, args.address, args.size)
+                print('Read in %.1f s' % (time.time() - t1))
+                if args.twice:
+                    print('Second pass...')
+                    again = swd_read(f, args.address, args.size)
+                    if again != data:
+                        bad = next(i for i in range(len(data)) if data[i] != again[i])
+                        with open(args.filename + '.pass1', 'wb') as fh:
+                            fh.write(data)
+                        raise FlasherError('the second read differs at 0x%08x; the first read was kept as %s.pass1'
+                                           % (args.address + bad, args.filename))
+                    print('Both reads are identical.')
+                with open(args.filename, 'wb') as fh:
+                    fh.write(data)
+                print('Saved %d bytes to %s' % (len(data), args.filename))
+            else:
+                raise FlasherError('over SWD (no flash writing yet): info, rf')
+            print('Done in %.1f s' % (time.time() - t0))
             return
         # always set the speeds: the flasher keeps the last values until it is powered off
         f.cmd('BAUD %d' % (args.baud or 921600))
