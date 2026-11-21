@@ -109,6 +109,7 @@ class Flasher:
         while True:
             kind = self._read_exact(1)
             if kind == b'Z':
+                self._read_exact(2)                    # the end frame carries a length too (0)
                 break
             if kind == b'E':
                 raise FlasherError('read at 0x%08x: %s' % (addr + len(out), self._stream_error()))

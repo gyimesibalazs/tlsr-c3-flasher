@@ -28,7 +28,7 @@ class FakeC3:
                     addr, n = int(a[2]), int(a[3]); self.out += b'OK %d\n' % n
                     while n:
                         k = min(4096, n); self.frame(b'D', bytes(self.mem[addr:addr + k])); addr += k; n -= k
-                    self.out += b'Z'
+                    self.out += b'Z\x00\x00'                       # as x_frame sends it: type, length
                 elif a[0] == 'XW':
                     self.state = [int(a[2]), int(a[3]), int(a[4]), a[5] == '1', 0]; self.out += b'OK\n'
                 else:
@@ -74,5 +74,8 @@ c3 = FakeC3(bytearray(1 << 20), fail_at=2); f = flasher(c3)
 try: f.stream_write('P', 0, os.urandom(40000), progress=False); print('FAIL no error')
 except T.FlasherError as e: print('error reported:', e, '| dropped bytes sent ahead:', c3.dropped)
 assert c3.state is None and not c3.inb
-assert f.cmd('V') == '' or True
+# nothing may be left over after a read stream: the next command must get its own answer
+f = flasher(FakeC3(bytearray(8192))); f.stream_read('P', 0, 8192, progress=False)
+assert f.rxbuf == b'' and f.ser.out == b'', (f.rxbuf, f.ser.out)
+assert f.cmd('V') == ''
 print('STREAM OK')
