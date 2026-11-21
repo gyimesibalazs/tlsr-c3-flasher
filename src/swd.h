@@ -37,4 +37,16 @@ int swd_core_reg_write(uint8_t reg, uint32_t v);
 // switches the memory / core functions above to its JTAG-DP. Returns the ICEPick IDCODE and the DAP IDCODE.
 int ti_cjtag_connect(uint32_t *icepick_id, uint32_t *dap_id);
 
+// Four-wire JTAG (TCK = SWCLK wire, TMS = PIN_JTAG_TMS, TDI = SWS wire, TDO = PIN_JTAG_TDO). jtag_begin switches
+// the pins; jtag_scan lists the chain from the TDO side (0 = a device in BYPASS without IDCODE) and the total
+// instruction length; jtag_select places the Arm DAP in it; jtag_dp_connect then switches the memory / core
+// functions above to that DAP's JTAG-DP. Raw scans end in Run-Test/Idle.
+void jtag_begin();
+void jtag_reset();
+int jtag_scan(uint32_t *ids, int max, int *count, int *ir_total);
+void jtag_select(int pre_ir_bits, int post_ir_bits, int pre_devices, int post_devices);
+int jtag_dp_connect(uint32_t *idcode);
+void jtag_ir_scan(const uint8_t *out, uint8_t *in, int nbits);
+void jtag_dr_scan(const uint8_t *out, uint8_t *in, int nbits);
+
 const char *swd_ack_name(int ack);

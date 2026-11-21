@@ -139,6 +139,28 @@ sector, and `es` over the last sector keeps the CCFG. CC13x4 / CC26x4 (Cortex-M3
 CC2538 are not handled. Not tested on hardware: the OScan1 timing, the ICEPick sequence on these chips and
 the ROM calls are all from the sources above.
 
+### Four-wire JTAG (firmware 0.19)
+
+| JTAG | Flasher wire |
+|---|---|
+| TCK | SWCLK wire (GPIO 0) |
+| TMS | GPIO 20 (its own wire) |
+| TDI | SWS wire (GPIO 4 drives it through the 1 k resistor) |
+| TDO | UART bridge TX wire (GPIO 21), an input here |
+| nRESET | reset wire (GPIO 6), as for SWD |
+
+    python3 tlsr_c3.py --jtag info                     # scans the chain
+    python3 tlsr_c3.py --jtag rf 0 0x10000 backup.bin  # an Arm chip: everything as over SWD
+
+`info` lists the chain from the TDO side (IDCODE, maker, total instruction length). When it holds an Arm
+JTAG-DP (IDCODE `xBA0x477`, 4-bit IR), the flasher puts every other device in BYPASS and uses that debug port
+with the same memory, core and flash code as SWD, so `rf`, `wf`, `es`, `ea` and `--run` work for the chips
+in the SWD table. The other devices' instruction lengths must be known: the STM32 boundary-scan TAP (5 bits)
+is, and a single unknown device gets the rest of the total. Before the scan the flasher sends the SWD-to-JTAG
+sequence on TMS, so an SWJ-DP left in SWD mode answers too. A chain without an Arm DAP is only listed; `JIR`
+and `JDR` do raw scans for anything else (RISC-V debug, EJTAG, boundary scan are not built on them yet).
+Tested against a simulated chain (`tests/jtag_sim`), not on hardware yet.
+
 ### SPI NOR flash, e.g. a router's (firmware 0.17)
 
 The 25-series SPI flash of a router, a dongle or any other board, on the flasher's existing wires:
@@ -311,6 +333,10 @@ SWD / cJTAG: `SWD`, `SWCLK khz`, `SC [reset|md sel]`, `TC` (cJTAG + ICEPick, `OK
 `SRST 0|1`, `SDR`/`SDW`/`SAR`/`SAW` (DP / AP registers), `SM`/`SMW` (memory), `SFAM name [p1 p2]`,
 `SHALT [reset]`, `SRUN`, `SCALL pc sp lr [r0..r3]`, `SFE addr`, `SFX`, `SFW addr hex`, `SFC addr len`.
 
+JTAG: `JTAG [khz]`, `JS` (chain scan: `OK <IR bits> <idcode> ...`, TDO side first, 0 = no IDCODE),
+`JSEL pre_ir post_ir pre_dr post_dr` (DAP position), `JC` (JTAG-DP connect, `OK <idcode>`), `JRST`,
+`JIR bits hex` / `JDR bits hex` (raw scans, LSB first, answer the captured bits).
+
 SPI flash: `SPI [khz]`, `PT hexout [nin]` (raw transaction), `PJ` (JEDEC id), `PA 3|4` (address width),
 `PB addr len` (base64), `PC addr len` (CRC-32), `PE addr [0x20|0x52|0xD8]`, `PX` (chip erase),
 `PW addr hex` (within one 256-byte page), `PS` (status 1).
@@ -336,6 +362,7 @@ L0 / L1, whose erased flash reads 0x00). The old text commands stay for single b
 
 - `src/main.cpp`, `src/config.h`, `platformio.ini`: the ESP32-C3 firmware.
 - `tlsr_c3.py`: the command line tool on the computer (Python 3, `pyserial`).
+- `tests/`: checks without hardware (stream protocol, SPI host logic, JTAG against a simulated chain).
 
 ## Credits
 

@@ -27,7 +27,7 @@
 #include "spiflash.h"
 
 #define FW_NAME "tlsr-c3-flasher"
-#define FW_VERSION "0.18"
+#define FW_VERSION "0.19"
 
 enum SwsMode { MODE_UART = 0, MODE_RMT = 1 };
 
@@ -366,6 +366,7 @@ static bool r_read(const uint8_t *head, uint8_t *out, int n) {
 // ================================================================ mode-independent SWire access
 
 static bool swd_on = false;
+static bool jtag_on = false;                 // swd_on is set too: the memory / flash commands work over JTAG
 static void bridge_end();
 
 static bool set_mode(SwsMode m) {
@@ -373,7 +374,7 @@ static bool set_mode(SwsMode m) {
   spif_end();
   if (swd_on) {
     swd_end();
-    swd_on = false;
+    swd_on = jtag_on = false;
   }
   uart_teardown();
   rmt_teardown();
@@ -814,7 +815,7 @@ static void bridge_end() {
 static void bridge_begin(uint32_t baud, int boot) {
   if (swd_on) {
     swd_end();
-    swd_on = false;
+    swd_on = jtag_on = false;
   }
   spif_end();
   uart_teardown();
@@ -1162,7 +1163,7 @@ static void handle(char *ln) {
       bridge_end();
       if (swd_on) {
         swd_end();
-        swd_on = false;
+        swd_on = jtag_on = false;
       }
       uart_teardown();
       rmt_teardown();
@@ -1229,9 +1230,62 @@ static void handle(char *ln) {
     rmt_teardown();
     swd_begin();
     swd_on = true;
+    jtag_on = false;
     target_power(true);
     digitalWrite(PIN_RST, HIGH);
     ok();
+  } else if (!strcmp(cmd, "JTAG")) {         // JTAG [kHz]: the pins to four-wire JTAG, target power on
+    bridge_end();
+    spif_end();
+    uart_teardown();
+    rmt_teardown();
+    jtag_begin();
+    if (argc > 1) {
+      if (a1 < 10 || a1 > 4000) return err("10..4000 kHz");
+      swd_set_khz(a1);
+    }
+    swd_on = jtag_on = true;
+    target_power(true);
+    digitalWrite(PIN_RST, HIGH);
+    Serial.printf("OK %u\n", (unsigned)swd_khz());
+  } else if (cmd[0] == 'J' && strcmp(cmd, "JTAG") && !jtag_on) {
+    err("not in JTAG mode (send JTAG first)");
+  } else if (!strcmp(cmd, "JS")) {           // JS: scan the chain, OK <total IR bits> <id> ... (TDO side first)
+    static uint32_t ids[32];
+    int n = 0, irlen = 0;
+    int r = jtag_scan(ids, 32, &n, &irlen);
+    if (r != SWD_OK) {
+      Serial.printf("ERR chain: %d devices, %s (TDO stuck? TMS / TCK wired?)\n", n,
+                    n >= 32 ? "no end found" : "no instruction register");
+      return;
+    }
+    Serial.printf("OK %d", irlen);
+    for (int i = 0; i < n; i++) Serial.printf(" %08x", (unsigned)ids[i]);
+    Serial.print("\n");
+  } else if (!strcmp(cmd, "JSEL")) {         // JSEL <pre IR bits> <post IR bits> <pre devices> <post devices>
+    if (argc < 5) return err("pre_ir post_ir pre_dr post_dr");
+    jtag_select(a1, a2, strtoul(argv[3], NULL, 0), strtoul(argv[4], NULL, 0));
+    ok();
+  } else if (!strcmp(cmd, "JC")) {           // JC: connect to the selected JTAG-DP, debug power-up, OK <idcode>
+    uint32_t id = 0;
+    int r = jtag_dp_connect(&id);
+    if (r == SWD_OK) r = swd_power_up();
+    if (!swd_check(r)) return;
+    Serial.printf("OK %08x\n", (unsigned)id);
+  } else if (!strcmp(cmd, "JRST")) {         // JRST: TAP reset (TMS high), then Run-Test/Idle
+    jtag_reset();
+    ok();
+  } else if (!strcmp(cmd, "JIR") || !strcmp(cmd, "JDR")) {   // JIR|JDR <bits> <hex, LSB first>: OK <captured>
+    int bits = (int)a1;
+    if (bits < 1 || bits > 2048 || argc < 3) return err("bits 1..2048, hex data");
+    static uint8_t out[256], in[256];
+    memset(out, 0, sizeof(out));
+    int n = parse_hex(argv[2], out, sizeof(out));
+    if (n < (bits + 7) / 8) return err("hex shorter than the bit count");
+    memset(in, 0, sizeof(in));
+    if (cmd[1] == 'I') jtag_ir_scan(out, in, bits);
+    else jtag_dr_scan(out, in, bits);
+    reply_hex(in, (bits + 7) / 8);
   } else if (!strcmp(cmd, "SWCLK")) {        // SWCLK <kHz>
     if (a1 < 10 || a1 > 4000) return err("10..4000 kHz");
     swd_set_khz(a1);

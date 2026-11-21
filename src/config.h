@@ -37,6 +37,10 @@
 // SWD clock in kHz at power-up (SWCLK command); the bit-banged clock reaches about 2000.
 #define SWD_KHZ_DEFAULT 1000
 
+// ---- four-wire JTAG: TCK = SWCLK wire, TDI = SWS wire (through the resistor), TDO = GPIO 21, TMS its own wire
+#define PIN_JTAG_TMS 20
+#define PIN_JTAG_TDO 21
+
 // ---- UART bridge
 // RX is the SWS wire (GPIO 5, GPIO 4 is switched to an input), TX has its own wire. GPIO 21 also carries
 // the C3's own boot messages for a moment after the flasher is plugged in.

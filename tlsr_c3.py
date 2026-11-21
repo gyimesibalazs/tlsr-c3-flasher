@@ -547,6 +547,49 @@ RP2040_TARGETSEL = 0x01002927      # core 0
 RP2040_CHIP_ID = 0x40000000
 
 
+# ---- four-wire JTAG: the chain is scanned, the Arm DAP found in it, then the SWD code above runs through it
+JEP106 = {0x23B: 'Arm', 0x020: 'STMicroelectronics', 0x017: 'Texas Instruments', 0x01F: 'Atmel / Microchip',
+          0x015: 'NXP', 0x00E: 'Freescale / NXP', 0x049: 'Xilinx', 0x06E: 'Altera / Intel', 0x0C8: 'GigaDevice',
+          0x029: 'Microchip', 0x093: 'Silicon Labs', 0x244: 'Nordic', 0x51E: 'Espressif', 0x489: 'SiFive',
+          0x612: 'Andes', 0x1F0: 'Lattice', 0x0BF: 'Broadcom', 0x31E: 'Cypress', 0x03A: 'Intel'}
+
+
+def jtag_ir_len(idcode):
+    """Instruction length of the devices whose length is known from the IDCODE, else None."""
+    if idcode & 0xfff == 0x477 and (idcode >> 12) & 0xff00 == 0xba00:
+        return 4                                      # Arm JTAG-DP (Cortex-M / -A debug port)
+    if idcode & 0xfff == 0x041:
+        return 5                                      # ST boundary-scan TAP of the STM32
+    return None
+
+
+def jtag_chain(f, say):
+    """Scan the chain and select its Arm DAP. Returns the device list (TDO side first) and the DAP index."""
+    answer = f.cmd('JS').split()
+    ir_total, ids = int(answer[0]), [int(x, 16) for x in answer[1:]]
+    say('Chain:   %d device(s), %d instruction bits in all (TDO side first)' % (len(ids), ir_total))
+    lens = [jtag_ir_len(i) if i else None for i in ids]
+    unknown = [k for k, n in enumerate(lens) if n is None]
+    if len(unknown) == 1:
+        lens[unknown[0]] = ir_total - sum(n for n in lens if n)
+    for k, i in enumerate(ids):
+        if i:
+            say('  %d:     0x%08x  %s, part 0x%04x, version %d, IR %s' % (
+                k, i, JEP106.get((i >> 1) & 0x7ff, 'maker 0x%03x' % ((i >> 1) & 0x7ff)), (i >> 12) & 0xffff,
+                i >> 28, lens[k] if lens[k] else '?'))
+        else:
+            say('  %d:     no IDCODE (BYPASS only), IR %s' % (k, lens[k] if lens[k] else '?'))
+    daps = [k for k, i in enumerate(ids) if i and jtag_ir_len(i) == 4]
+    if not daps:
+        return ids, None
+    if None in lens or sum(lens) != ir_total:
+        raise FlasherError('the instruction lengths of the other devices in the chain are not known '
+                           '(%d bits in all): cannot reach the Arm DAP' % ir_total)
+    k = daps[0]
+    f.cmd('JSEL %d %d %d %d' % (sum(lens[:k]), sum(lens[k + 1:]), k, len(ids) - k - 1))
+    return ids, k
+
+
 def swd_connect_any(f):
     """Plain SWD first, then the RP2040's multi-drop port. Returns (idcode, multidrop).
     With f.cjtag: cJTAG through the TI ICEPick router instead, idcode is then the JTAG-DP's."""
@@ -554,6 +597,8 @@ def swd_connect_any(f):
         icepick, dap = (int(x, 16) for x in f.cmd('TC').split())
         f.icepick = icepick
         return dap, False
+    if getattr(f, 'jtag', False):
+        return int(f.cmd('JC'), 16), False
     try:
         return int(f.cmd('SC'), 16), False
     except FlasherError as first:
@@ -1039,7 +1084,10 @@ def main():
     ap.add_argument('--swd', action='store_true',
                     help='Arm SWD target (EFR32, nRF52, STM32): SWDIO on the SWS wire, SWCLK on GPIO 0; '
                          'EFR32 Series 1/2, nRF52, STM32 F0/F1/F3/F4/G0/G4/L4/WB, RP2040; info, rf, wf, es, ea')
-    ap.add_argument('--swd-khz', type=auto_int, default=1000, help='SWD clock in kHz (default 1000)')
+    ap.add_argument('--swd-khz', type=auto_int, default=1000, help='SWD / JTAG clock in kHz (default 1000)')
+    ap.add_argument('--jtag', action='store_true',
+                    help='four-wire JTAG (TCK on GPIO 0, TMS on GPIO 20, TDI on the SWS wire, TDO on GPIO 21): '
+                         'info scans the chain; an Arm DAP in it is used like SWD: info, rf, wf, es, ea')
     ap.add_argument('--cjtag', action='store_true',
                     help='TI CC13xx / CC26xx over two-wire cJTAG (TMSC on the SWS wire, TCKC on GPIO 0) '
                          'instead of SWD: info, rf, wf, es, ea')
@@ -1113,6 +1161,20 @@ def main():
             spi_main(f, args)
             print('Done in %.1f s' % (time.time() - t0))
             return
+        if args.jtag:
+            if fw < (0, 19):
+                raise FlasherError('JTAG needs flasher firmware 0.19 or newer on the C3')
+            print('JTAG:    %s kHz' % f.cmd('JTAG %d' % args.swd_khz))
+            ids, dap = jtag_chain(f, print if args.op == 'info' else (lambda *a: None))
+            if dap is None:
+                if args.op == 'info':
+                    print('No Arm debug port in the chain: only the scan above (JIR / JDR for raw scans).')
+                    return
+                raise FlasherError('no Arm debug port (JTAG-DP) in the chain')
+            if args.op == 'info':
+                print('Arm DAP: device %d' % dap)
+            args.swd = True
+            f.jtag = True
         if args.cjtag:
             args.swd = True
             f.cjtag = True
@@ -1134,8 +1196,9 @@ def main():
             print('for example esptool --before no_reset --after no_reset. Leave with: bridge-exit')
             return
         if args.swd:
-            f.cmd('SWD')
-            f.cmd('SWCLK %d' % args.swd_khz)
+            if not args.jtag:
+                f.cmd('SWD')
+                f.cmd('SWCLK %d' % args.swd_khz)
             t = None
             if args.op == 'info':
                 t = swd_info(f)
