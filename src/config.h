@@ -45,3 +45,10 @@
 #define PIN_BRIDGE_TX 21
 // BOOT / strapping pin of the target, held at the level given to the BRIDGE command while the target starts
 #define PIN_BOOT 0
+
+// ---- SPI NOR flash (c3-usb boards only), on the wires above: no new pin
+#define PIN_SPI_CS PIN_RST        // chip select = the reset wire
+#define PIN_SPI_CLK PIN_SWCLK     // clock = the SWCLK wire
+#define PIN_SPI_DI PIN_SWS_TX     // flash DI (MOSI) = the SWS wire, driven through its resistor
+#define PIN_SPI_DO PIN_BRIDGE_TX  // flash DO (MISO) = the UART bridge TX wire, an input here
+#define SPI_KHZ_DEFAULT 4000

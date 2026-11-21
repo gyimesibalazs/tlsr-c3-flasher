@@ -24,9 +24,10 @@
 #include "config.h"
 #include "swd.h"
 #include "swdflash.h"
+#include "spiflash.h"
 
 #define FW_NAME "tlsr-c3-flasher"
-#define FW_VERSION "0.16"
+#define FW_VERSION "0.17"
 
 enum SwsMode { MODE_UART = 0, MODE_RMT = 1 };
 
@@ -369,6 +370,7 @@ static void bridge_end();
 
 static bool set_mode(SwsMode m) {
   bridge_end();
+  spif_end();
   if (swd_on) {
     swd_end();
     swd_on = false;
@@ -815,6 +817,7 @@ static bool bridge_begin(uint32_t baud, int boot) {
     swd_end();
     swd_on = false;
   }
+  spif_end();
   uart_teardown();
   rmt_teardown();
   pinMode(PIN_SWS_TX, INPUT);                // the resistor side of the SWS wire stays quiet
@@ -1005,8 +1008,76 @@ static void handle(char *ln) {
     if (n < 1) return err("data");
     if (!flash_write_page(a1, data_buf, n)) return err("write failed");
     ok();
+  } else if (!strcmp(cmd, "SPI")) {          // SPI [kHz]: the wires to an SPI NOR flash (no power switched)
+    uint32_t khz = argc > 1 ? a1 : SPI_KHZ_DEFAULT;
+    if (khz < 100 || khz > 20000) return err("100..20000 kHz");
+    if (!spif_active()) {
+      bridge_end();
+      if (swd_on) {
+        swd_end();
+        swd_on = false;
+      }
+      uart_teardown();
+      rmt_teardown();
+    }
+    if (!spif_begin(khz)) return err("SPI needs a c3-usb board (GPIO 21 is the host link here)");
+    Serial.printf("OK %u\n", (unsigned)spif_khz());
+  } else if (cmd[0] == 'P' && cmd[1] && !cmd[2] && strchr("TJABCEXWS", cmd[1]) && !spif_active()) {
+    err("not in SPI mode (send SPI first)");
+  } else if (!strcmp(cmd, "PT")) {           // PT <hex out> [n in]: one raw transaction, OK <hex in>
+    int n = parse_hex(argv[1] ? argv[1] : "", data_buf, 300);
+    int nin = argc > 2 ? (int)a2 : 0;
+    if (n < 1 || nin < 0 || nin > 256) return err("hex out (1..300 bytes), n in 0..256");
+    static uint8_t in[256];
+    spif_xfer(data_buf, n, in, nin);
+    if (!nin) return ok();
+    reply_hex(in, nin);
+  } else if (!strcmp(cmd, "PJ")) {           // PJ: wake from deep power-down, JEDEC id (3 bytes hex)
+    uint8_t c = 0xAB, id[3];
+    spif_xfer(&c, 1, NULL, 0);
+    delay(1);
+    c = 0x9F;
+    spif_xfer(&c, 1, id, 3);
+    reply_hex(id, 3);
+  } else if (!strcmp(cmd, "PA")) {           // PA 3|4: address width
+    if (a1 != 3 && a1 != 4) return err("3 or 4");
+    spif_addr4(a1 == 4);
+    ok();
+  } else if (!strcmp(cmd, "PB")) {           // PB <addr> <len>: read, base64 (* = all 0xff)
+    if (a2 < 1 || a2 > MAX_READ) return err("len");
+    spif_read(a1, data_buf, a2);
+    reply_b64(data_buf, a2);
+  } else if (!strcmp(cmd, "PC")) {           // PC <addr> <len>: CRC-32 of the range (len up to 16 Mbytes)
+    if (a2 < 1 || a2 > 0x1000000) return err("len 1..16 M");
+    uint32_t crc = 0;
+    for (uint32_t done = 0; done < a2;) {
+      int cnt = (int)min((uint32_t)MAX_READ, a2 - done);
+      spif_read(a1 + done, data_buf, cnt);
+      crc = crc32_update(crc, data_buf, cnt);
+      done += cnt;
+    }
+    Serial.printf("OK %08x\n", (unsigned)crc);
+  } else if (!strcmp(cmd, "PE")) {           // PE <addr> [opcode]: erase 0x20 = 4 k (default), 0x52 32 k, 0xD8 64 k
+    uint8_t op = argc > 2 ? (uint8_t)a2 : 0x20;
+    if (op != 0x20 && op != 0x52 && op != 0xD8) return err("opcode 0x20, 0x52 or 0xD8");
+    int r = spif_erase(a1, op, op == 0x20 ? 1000 : 4000);
+    if (r) return err(r == SPIF_ERR_WEL ? "write enable refused (WP pin or status protection)" : "timeout");
+    ok();
+  } else if (!strcmp(cmd, "PX")) {           // PX: chip erase (up to 400 s)
+    int r = spif_erase_chip(400000);
+    if (r) return err(r == SPIF_ERR_WEL ? "write enable refused (WP pin or status protection)" : "timeout");
+    ok();
+  } else if (!strcmp(cmd, "PW")) {           // PW <addr> <hex>: program, within one 256-byte page
+    int n = argc > 2 ? parse_hex(argv[2], data_buf, 256) : -1;
+    if (n < 1 || (a1 & 0xff) + n > 256) return err("data: 1..256 bytes inside one page");
+    int r = spif_program(a1, data_buf, n);
+    if (r) return err(r == SPIF_ERR_WEL ? "write enable refused (WP pin or status protection)" : "timeout");
+    ok();
+  } else if (!strcmp(cmd, "PS")) {           // PS: status register 1
+    Serial.printf("OK %02x\n", spif_status());
   } else if (!strcmp(cmd, "SWD")) {          // SWD: switch the pins to SWD, target power on
     bridge_end();
+    spif_end();
     uart_teardown();
     rmt_teardown();
     swd_begin();

@@ -777,6 +777,234 @@ def swd_read(f, addr, size, progress=True):
     return bytes(out)
 
 
+# ---- SPI NOR flash (25-series) on the flasher's wires: CS = reset, CLK = SWCLK, DI = SWS, DO = GPIO 21
+SPI_VENDORS = {0xEF: 'Winbond', 0xC8: 'GigaDevice', 0xC2: 'Macronix', 0x20: 'Micron / XMC', 0x1C: 'EON',
+               0xBF: 'SST / Microchip', 0x9D: 'ISSI', 0x68: 'Boya', 0x5E: 'Zbit', 0x85: 'Puya', 0x0B: 'XTX',
+               0xA1: 'Fudan', 0x01: 'Spansion / Cypress / Infineon', 0x1F: 'Adesto / Atmel / Renesas', 0xC4: 'GT',
+               0xCD: 'Paragon', 0x8C: 'ESMT', 0x4A: 'ESMT', 0xD8: 'Silicon Kaiser', 0xBA: 'Zetta'}
+
+
+class SpiFlash:
+    def __init__(self, jedec, size, erase=(0x1000, 0x20), sfdp=False):
+        self.jedec, self.size, self.sfdp = jedec, size, sfdp
+        self.erase_size, self.erase_op = erase
+
+
+def spi_tx(f, out, nin=0):
+    answer = f.cmd('PT %s %d' % (bytes(out).hex(), nin))
+    return bytes.fromhex(answer) if nin else b''
+
+
+SPI_SR23_VENDORS = (0xEF, 0xC8)   # Winbond, GigaDevice: 0x35 / 0x15 read status 2 / 3
+
+
+def spi_status(f, t):
+    """Status registers 1..3; 2 and 3 only where 0x35 / 0x15 read them (0xff otherwise): on Macronix and ISSI
+    0x35 enters QPI mode, after which the chip no longer answers on one wire."""
+    sr1 = spi_tx(f, [0x05], 1)[0]
+    if t.jedec[0] not in SPI_SR23_VENDORS:
+        return sr1, 0xff, 0xff
+    return sr1, spi_tx(f, [0x35], 1)[0], spi_tx(f, [0x15], 1)[0]
+
+
+def spi_sfdp(f):
+    """(size in bytes, (erase size, opcode)) from the SFDP basic table, or None."""
+    head = spi_tx(f, [0x5A, 0, 0, 0, 0], 16)
+    if head[:4] != b'SFDP':
+        return None
+    dwords, ptr = head[8 + 3], int.from_bytes(head[8 + 4:8 + 7], 'little')
+    if head[8] != 0x00 or head[8 + 7] != 0xFF or dwords < 9:
+        return None
+    t = spi_tx(f, [0x5A, ptr >> 16 & 0xff, ptr >> 8 & 0xff, ptr & 0xff, 0], min(dwords, 16) * 4)
+    dw = [int.from_bytes(t[i:i + 4], 'little') for i in range(0, len(t), 4)]
+    density = dw[1]
+    bits = (1 << (density & 0x7fffffff)) if density & 0x80000000 else density + 1
+    types = [((dw[7] >> 16 * i) & 0xff, (dw[7] >> (16 * i + 8)) & 0xff) for i in range(2)]
+    types += [((dw[8] >> 16 * i) & 0xff, (dw[8] >> (16 * i + 8)) & 0xff) for i in range(2)]
+    types = sorted((1 << n, op) for n, op in types if n and op in (0x20, 0x52, 0xD8))
+    erase = types[0] if types else ((0x1000, 0x20) if dw[0] & 3 == 1 else (0x10000, 0xD8))
+    return bits // 8, erase
+
+
+def spi_info(f, quiet=False):
+    say = (lambda *a: None) if quiet else print
+    jedec = bytes.fromhex(f.cmd('PJ'))
+    say('JEDEC:   %s (%s)' % (jedec.hex(), SPI_VENDORS.get(jedec[0], 'unknown maker')))
+    if jedec in (b'\x00\x00\x00', b'\xff\xff\xff'):
+        raise FlasherError('no answer from the flash: check the wires, its power, WP / HOLD (both high), and that the '
+                           'board\'s own processor is held in reset (it drives the same pins)')
+    sf = spi_sfdp(f)
+    if sf:
+        size, erase = sf
+    else:
+        if not 0x10 <= jedec[2] <= 0x22:
+            raise FlasherError('no SFDP, and the size byte 0x%02x of the id does not give a size' % jedec[2])
+        size, erase = 1 << jedec[2], (0x1000, 0x20)
+    t = SpiFlash(jedec, size, erase, bool(sf))
+    f.cmd('PA %d' % (4 if size > 0x1000000 else 3))
+    say('Size:    %d kbytes (%s), erased in %d k units (opcode 0x%02X)%s' % (
+        size // 1024, 'SFDP' if sf else 'from the id', erase[0] // 1024, erase[1],
+        ', 4-byte addresses' if size > 0x1000000 else ''))
+    sr = spi_status(f, t)
+    say('Status:  SR1 %02x' % sr[0] + ('  SR2 %02x  SR3 %02x' % sr[1:] if t.jedec[0] in SPI_SR23_VENDORS else ''))
+    if spi_protected(t, sr):
+        say('         block protection is set: writing needs --unprotect')
+    return t
+
+
+def spi_protected(t, sr):
+    sr1, sr2, _ = sr
+    if sr1 & 0x3C:                                  # BP0..BP3
+        return True
+    return t.jedec[0] in (0xEF, 0xC8) and sr1 & 0x40   # Winbond SEC / GigaDevice BP4
+
+
+def spi_unprotect(f, t):
+    sr1, sr2, _ = spi_status(f, t)
+    if not spi_protected(t, (sr1, sr2, 0)):
+        return
+    clear = 0x3C | (0x40 if t.jedec[0] in (0xEF, 0xC8) else 0)
+    new1 = sr1 & ~clear & 0xff
+    spi_tx(f, [0x06])
+    if t.jedec[0] in (0xEF, 0xC8) and sr2 != 0xff:
+        # two-byte write keeps status register 2 (QE must stay as it is); Winbond CMP (SR2 bit 6) is cleared too,
+        # because with CMP set, BP = 0 protects the whole chip
+        spi_tx(f, [0x01, new1, sr2 & ~0x40 & 0xff])
+    else:
+        spi_tx(f, [0x01, new1])
+    for _ in range(100):
+        if not int(f.cmd('PS'), 16) & 1:
+            break
+        time.sleep(0.01)
+    sr = spi_status(f, t)
+    if spi_protected(t, sr):
+        raise FlasherError('the protection bits did not clear (SR1 %02x): the WP pin is probably low with SRP set' % sr[0])
+    print('Block protection cleared (SR1 %02x -> %02x).' % (sr1, sr[0]))
+
+
+def spi_read(f, addr, size, progress=True):
+    out = bytearray()
+    while len(out) < size:
+        n = min(READ_CHUNK, size - len(out))
+        if progress:
+            print('\rRead 0x%08x' % (addr + len(out)), end='', flush=True)
+        answer = f.cmd('PB %d %d' % (addr + len(out), n))
+        data = b'\xff' * n if answer == '*' else base64.b64decode(answer, validate=True)
+        if len(data) != n:
+            raise FlasherError('short answer')
+        out += data
+    if progress:
+        print('\r' + ' ' * 24 + '\r', end='')
+    return bytes(out)
+
+
+def spi_crc(f, addr, size):
+    return int(f.cmd('PC %d %d' % (addr, size), timeout=10 + size / 200000), 16)
+
+
+def spi_write(f, t, addr, data, erase=True):
+    """Erase-unit by erase-unit: units whose CRC already matches are skipped, what the image does not cover
+    inside a unit is read first and kept."""
+    if addr + len(data) > t.size:
+        raise FlasherError('0x%x bytes at 0x%x do not fit into %d kbytes' % (len(data), addr, t.size // 1024))
+    u = t.erase_size
+    first = addr - addr % u
+    end = addr + len(data)
+    end += -end % u
+    skipped = 0
+    for a in range(first, end, u):
+        lo, hi = max(a, addr), min(a + u, addr + len(data))
+        part = data[lo - addr:hi - addr]
+        if lo > a or hi < a + u:
+            want = bytearray(spi_read(f, a, u, progress=False))
+            want[lo - a:hi - a] = part
+            want = bytes(want)
+        else:
+            want = part
+        if spi_crc(f, a, u) == zlib.crc32(want):
+            skipped += 1
+            continue
+        print('\rErase/write 0x%08x' % a, end='', flush=True)
+        if erase:
+            f.cmd('PE %d %d' % (a, t.erase_op), timeout=10)
+        for p in range(0, u, 256):
+            page = want[p:p + 256]
+            if page.count(0xff) != len(page):
+                f.cmd('PW %d %s' % (a + p, page.hex()))
+    print('\r' + ' ' * 28 + '\r', end='')
+    if skipped:
+        print('%d of %d erase units already held the data.' % (skipped, (end - first) // u))
+
+
+def spi_verify(f, addr, data):
+    step = 0x10000
+    for pos in range(0, len(data), step):
+        n = min(step, len(data) - pos)
+        print('\rVerify 0x%08x' % (addr + pos), end='', flush=True)
+        if spi_crc(f, addr + pos, n) != zlib.crc32(data[pos:pos + n]):
+            print()
+            return addr + pos
+    print('\r' + ' ' * 24 + '\r', end='')
+    return None
+
+
+def spi_main(f, args):
+    print('SPI:     %s kHz' % f.cmd('SPI %d' % args.spi_khz))
+    t = spi_info(f, quiet=args.op != 'info')
+    if args.op == 'info':
+        return
+    if args.op == 'rf':
+        size = args.size or t.size - args.address
+        os.makedirs(os.path.dirname(os.path.abspath(args.filename)), exist_ok=True)
+        t1 = time.time()
+        data = spi_read(f, args.address, size)
+        print('Read in %.1f s' % (time.time() - t1))
+        if args.twice:
+            bad = spi_verify(f, args.address, data)
+            if bad is not None:
+                with open(args.filename + '.pass1', 'wb') as fh:
+                    fh.write(data)
+                raise FlasherError('the flash reads differently the second time in the block at 0x%08x; '
+                                   'the read was kept as %s.pass1' % (bad, args.filename))
+            print('Second pass (CRC on the flasher) matches.')
+        with open(args.filename, 'wb') as fh:
+            fh.write(data)
+        print('Saved %d bytes to %s' % (len(data), args.filename))
+        return
+    if args.op not in ('wf', 'es', 'ea'):
+        raise FlasherError('SPI flash: info, rf, wf, es, ea')
+    if spi_protected(t, spi_status(f, t)):
+        if not args.unprotect:
+            raise FlasherError('the flash has block protection set: add --unprotect to clear it first')
+        spi_unprotect(f, t)
+    if args.op == 'wf':
+        with open(args.filename, 'rb') as fh:
+            data = fh.read()
+        if not data:
+            raise FlasherError('empty file')
+        print('Write 0x%08x..0x%08x' % (args.address, args.address + len(data)))
+        spi_write(f, t, args.address, data, erase=not args.no_erase)
+        if not args.no_verify:
+            bad = spi_verify(f, args.address, data)
+            if bad is not None:
+                raise FlasherError('verify failed in the block at 0x%08x' % bad)
+            print('Verified.')
+    elif args.op == 'es':
+        u = t.erase_size
+        start = args.address - args.address % u
+        end = args.address + max(args.size, 1)
+        end += -end % u
+        blank = zlib.crc32(b'\xff' * u)
+        for a in range(start, min(end, t.size), u):
+            if spi_crc(f, a, u) != blank:
+                print('\rErase 0x%08x' % a, end='', flush=True)
+                f.cmd('PE %d %d' % (a, t.erase_op), timeout=10)
+        print()
+    else:
+        print('Chip erase (up to a few minutes on big chips)...')
+        f.cmd('PX', timeout=420)
+
+
 def main():
     ap = argparse.ArgumentParser(description='ESP32-C3 Telink TLSR825x SWire flasher')
     ap.add_argument('-p', '--port', default='/dev/ttyACM0')
@@ -799,6 +1027,12 @@ def main():
     ap.add_argument('--cjtag', action='store_true',
                     help='TI CC13xx / CC26xx over two-wire cJTAG (TMSC on the SWS wire, TCKC on GPIO 0) '
                          'instead of SWD: info, rf, wf, es, ea')
+    ap.add_argument('--spi', action='store_true',
+                    help='SPI NOR flash (25-series, c3-usb boards): CS on the reset wire, CLK on GPIO 0, DI on the '
+                         'SWS wire, DO on GPIO 21; info, rf (size 0 = to the end), wf, es, ea')
+    ap.add_argument('--spi-khz', type=auto_int, default=4000, help='SPI clock in kHz (default 4000)')
+    ap.add_argument('--unprotect', action='store_true',
+                    help='SPI flash: clear the block protection bits before wf / es / ea')
     ap.add_argument('--wake', action='store_true',
                     help='after activation switch the clocks on and wake the flash from deep power-down '
                          '(for a flash that reads all zeros / JEDEC 000000)')
@@ -857,6 +1091,12 @@ def main():
             fw = (0, 0)
         if fw < (0, 11):
             raise FlasherError('this script needs flasher firmware 0.11 or newer on the C3')
+        if args.spi:
+            if fw < (0, 17):
+                raise FlasherError('SPI flash needs flasher firmware 0.17 or newer on the C3')
+            spi_main(f, args)
+            print('Done in %.1f s' % (time.time() - t0))
+            return
         if args.cjtag:
             args.swd = True
             f.cjtag = True

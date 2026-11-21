@@ -135,6 +135,36 @@ sector, and `es` over the last sector keeps the CCFG. CC13x4 / CC26x4 (Cortex-M3
 CC2538 are not handled. Not tested on hardware: the OScan1 timing, the ICEPick sequence on these chips and
 the ROM calls are all from the sources above.
 
+### SPI NOR flash, e.g. a router's (firmware 0.17, c3-usb boards only)
+
+The 25-series SPI flash of a router, a dongle or any other board, on the flasher's existing wires:
+
+| Flash pin | Flasher wire |
+|---|---|
+| /CS (1) | reset wire (GPIO 6) |
+| DO (2) | UART bridge TX wire (GPIO 21) |
+| DI (5) | SWS wire (GPIO 4 drives it through the 1 k resistor) |
+| CLK (6) | SWCLK wire (GPIO 0) |
+| GND (4) | GND |
+| /WP (3), /HOLD (7) | to 3.3 V if the board does not pull them up |
+
+    python3 tlsr_c3.py --spi info
+    python3 tlsr_c3.py --spi rf 0 0 backup.bin --twice        # size 0 = the whole chip
+    python3 tlsr_c3.py --spi wf 0x50000 firmware.bin --unprotect
+
+The size and the erase unit come from the chip's SFDP table (the id byte when it has none); chips over
+16 Mbytes are used with the 4-byte opcodes. `wf` works erase unit by erase unit: a unit whose CRC already
+matches is skipped, and what the image does not cover inside a unit is read first and kept, so a bootloader
+or a calibration partition next to the written range stays. `rf --twice` checks the read with a second pass
+computed on the flasher (CRC), and `wf` verifies the same way. Block protection (BP bits) is reported by
+`info`; `--unprotect` clears it and keeps the quad-enable bit. Status registers 2 / 3 are only read on
+Winbond and GigaDevice chips: on Macronix and ISSI the same command (0x35) switches the chip to QPI.
+
+In circuit, the board's own processor drives the same pins: keep it in reset (or its flash pins high
+impedance) while the flasher works, and power the board from its own supply. The flasher does not switch
+any power in SPI mode. Speed: about 40 kbytes/s reading (the USB link), clock 4 MHz by default
+(`--spi-khz`, the DI wire goes through 1 k). Not tested on hardware yet.
+
 UART bridge (c3-usb boards only; on c3-uart boards UART0 is the link to the computer):
 
     python3 tlsr_c3.py -p /dev/ttyACM0 bridge 115200 --boot hi     # restarts the target with BOOT high
@@ -274,6 +304,10 @@ One text line per command, answer `OK [payload]` or `ERR reason`; numbers decima
 SWD / cJTAG: `SWD`, `SWCLK khz`, `SC [reset|md sel]`, `TC` (cJTAG + ICEPick, `OK <icepick id> <dap id>`),
 `SRST 0|1`, `SDR`/`SDW`/`SAR`/`SAW` (DP / AP registers), `SM`/`SMW` (memory), `SFAM name [p1 p2]`,
 `SHALT [reset]`, `SRUN`, `SCALL pc sp lr [r0..r3]`, `SFE addr`, `SFX`, `SFW addr hex`, `SFC addr len`.
+
+SPI flash: `SPI [khz]`, `PT hexout [nin]` (raw transaction), `PJ` (JEDEC id), `PA 3|4` (address width),
+`PB addr len` (base64), `PC addr len` (CRC-32), `PE addr [0x20|0x52|0xD8]`, `PX` (chip erase),
+`PW addr hex` (within one 256-byte page), `PS` (status 1).
 
 The USB link is the slow part of a read (about 45 kbytes/s), so the host reads with `FB`, and the second
 pass of `rf --twice` and the verify after `wf` only compare CRCs (`FC`).
