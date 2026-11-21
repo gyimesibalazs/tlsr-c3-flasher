@@ -139,7 +139,7 @@ sector, and `es` over the last sector keeps the CCFG. CC13x4 / CC26x4 (Cortex-M3
 CC2538 are not handled. Not tested on hardware: the OScan1 timing, the ICEPick sequence on these chips and
 the ROM calls are all from the sources above.
 
-### SPI NOR flash, e.g. a router's (firmware 0.17, c3-usb boards only)
+### SPI NOR flash, e.g. a router's (firmware 0.17)
 
 The 25-series SPI flash of a router, a dongle or any other board, on the flasher's existing wires:
 
@@ -169,7 +169,7 @@ impedance) while the flasher works, and power the board from its own supply. The
 any power in SPI mode. Clock 4 MHz by default (`--spi-khz`, the DI wire goes through 1 k); the read and
 write speeds are printed (binary streams, see the host protocol). Not tested on hardware yet.
 
-UART bridge (c3-usb boards only; on c3-uart boards UART0 is the link to the computer):
+UART bridge:
 
     python3 tlsr_c3.py -p /dev/ttyACM0 bridge 115200 --boot hi     # restarts the target with BOOT high
     ... any serial tool on the same port, at the same baud ...
@@ -182,7 +182,9 @@ no_reset`). GPIO 21 carries the C3's own boot messages for a moment when the fla
 ## Build and upload
 
     pio run -e c3-usb -t upload      # USB connector wired straight to the C3 (Super Mini, XIAO)
-    pio run -e c3-uart -t upload     # board with a CH340 / CP2102 USB-UART chip
+
+Only boards that use the C3's own USB port are supported: UART0 (GPIO 20 / 21) belongs to the target
+(UART bridge, SPI flash), so a board with a separate CH340 / CP2102 chip on it cannot be the host link.
 
 Needs the Arduino core 3.x (ESP-IDF 5) for the RMT driver.
 

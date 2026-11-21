@@ -811,8 +811,7 @@ static void bridge_end() {
 }
 
 // boot: 1 = BOOT pin high, 0 = low, -1 = left open; the target is restarted with that level
-static bool bridge_begin(uint32_t baud, int boot) {
-#if ARDUINO_USB_CDC_ON_BOOT
+static void bridge_begin(uint32_t baud, int boot) {
   if (swd_on) {
     swd_end();
     swd_on = false;
@@ -834,7 +833,7 @@ static bool bridge_begin(uint32_t baud, int boot) {
   cfg.stop_bits = UART_STOP_BITS_1;
   cfg.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
   cfg.source_clk = UART_SCLK_DEFAULT;
-  if (uart_driver_install(BRIDGE_UART, 4096, 4096, 0, NULL, 0) != ESP_OK) return false;
+  if (uart_driver_install(BRIDGE_UART, 4096, 4096, 0, NULL, 0) != ESP_OK) return;
   uart_param_config(BRIDGE_UART, &cfg);
   uart_set_pin(BRIDGE_UART, PIN_BRIDGE_TX, PIN_SWS_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
   gpio_pullup_en((gpio_num_t)PIN_SWS_RX);
@@ -844,12 +843,6 @@ static bool bridge_begin(uint32_t baud, int boot) {
   esc_pos = -1;
   target_reset_pulse();                      // the target starts with the BOOT level applied
   uart_flush_input(BRIDGE_UART);
-  return true;
-#else
-  (void)baud;
-  (void)boot;
-  return false;
-#endif
 }
 
 static void bridge_pump() {
@@ -1174,7 +1167,7 @@ static void handle(char *ln) {
       uart_teardown();
       rmt_teardown();
     }
-    if (!spif_begin(khz)) return err("SPI needs a c3-usb board (GPIO 21 is the host link here)");
+    spif_begin(khz);
     Serial.printf("OK %u\n", (unsigned)spif_khz());
   } else if (cmd[0] == 'P' && cmd[1] && !cmd[2] && strchr("TJABCEXWS", cmd[1]) && !spif_active()) {
     err("not in SPI mode (send SPI first)");
@@ -1348,7 +1341,7 @@ static void handle(char *ln) {
     Serial.printf("OK bridge %u baud, boot %s; leave with a 1 s pause and %s\n", (unsigned)a1,
                   boot < 0 ? "open" : boot ? "high" : "low", ESCAPE);
     Serial.flush();
-    if (!bridge_begin(a1, boot)) return err("bridge needs a c3-usb board");
+    bridge_begin(a1, boot);
   } else if (!strcmp(cmd, "RUN")) {          // restart the target's CPU
     sws_write1(0x006f, 0x22);
     ok();
@@ -1362,7 +1355,7 @@ void setup() {
   // the receive buffer holds the frames of XW the host sends ahead, the transmit buffer those of XR
   Serial.setRxBufferSize(16384);
   Serial.setTxBufferSize(16384);
-  Serial.begin(HOST_BAUD);
+  Serial.begin();                            // the C3's own USB port: no baud rate
   gpio_set_level((gpio_num_t)PIN_RST, 1);    // preset the level, so enabling the output does not pulse reset
   pinMode(PIN_RST, OUTPUT_OPEN_DRAIN | PULLUP);
   digitalWrite(PIN_RST, HIGH);

@@ -1025,7 +1025,6 @@ def spi_main(f, args):
 def main():
     ap = argparse.ArgumentParser(description='ESP32-C3 Telink TLSR825x SWire flasher')
     ap.add_argument('-p', '--port', default='/dev/ttyACM0')
-    ap.add_argument('--host-baud', type=auto_int, default=460800, help='only for boards with a USB-UART chip')
     ap.add_argument('-t', '--tact', type=auto_int, default=100,
                     help='activation time in ms after the reset pulse (0 = no reset, default 100)')
     ap.add_argument('-m', '--mode', choices=['uart', 'rmt'], default='rmt',
@@ -1045,7 +1044,7 @@ def main():
                     help='TI CC13xx / CC26xx over two-wire cJTAG (TMSC on the SWS wire, TCKC on GPIO 0) '
                          'instead of SWD: info, rf, wf, es, ea')
     ap.add_argument('--spi', action='store_true',
-                    help='SPI NOR flash (25-series, c3-usb boards): CS on the reset wire, CLK on GPIO 0, DI on the '
+                    help='SPI NOR flash (25-series): CS on the reset wire, CLK on GPIO 0, DI on the '
                          'SWS wire, DO on GPIO 21; info, rf (size 0 = to the end), wf, es, ea')
     ap.add_argument('--spi-khz', type=auto_int, default=4000, help='SPI clock in kHz (default 4000)')
     ap.add_argument('--unprotect', action='store_true',
@@ -1093,14 +1092,14 @@ def main():
     t0 = time.time()
     if args.op == 'bridge-exit':
         # the flasher is in the bridge and does not answer commands: send the escape after a pause
-        with serial.Serial(args.port, args.host_baud, timeout=2, dsrdtr=False, rtscts=False) as s:
+        with serial.Serial(args.port, 115200, timeout=2, dsrdtr=False, rtscts=False) as s:
             time.sleep(1.2)
             s.write(b'~~~X')
             answer = s.read_until(b'\n', 200)
         print(answer.decode(errors='replace').strip() or 'no answer (was the bridge open?)')
         return
     try:
-        f = Flasher(args.port, args.host_baud)
+        f = Flasher(args.port)
         print('Flasher:', f.version)
         try:
             fw = tuple(int(x) for x in f.version.split()[1].split('.'))

@@ -15,21 +15,15 @@ uint32_t spif_khz() { return hz / 1000; }
 void spif_addr4(bool v) { addr4 = v; }
 bool spif_addr4_on() { return addr4; }
 
-bool spif_begin(uint32_t khz) {
-#if ARDUINO_USB_CDC_ON_BOOT
+void spif_begin(uint32_t khz) {
   hz = khz * 1000;
-  if (on) return true;
+  if (on) return;
   pinMode(PIN_SWS_RX, INPUT);                // the direct side of the SWS wire only listens
   pinMode(PIN_SPI_CS, OUTPUT);
   digitalWrite(PIN_SPI_CS, HIGH);
   spi.begin(PIN_SPI_CLK, PIN_SPI_DO, PIN_SPI_DI, -1);
   on = true;
   addr4 = false;
-  return true;
-#else
-  (void)khz;
-  return false;                              // GPIO 21 is the link to the computer on these boards
-#endif
 }
 
 void spif_end() {

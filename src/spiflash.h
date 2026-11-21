@@ -1,9 +1,9 @@
 // SPI NOR flash (25-series) on the flasher's existing wires: CS = reset wire, CLK = SWCLK wire,
-// DI = SWS wire (driven through its resistor), DO = UART bridge TX wire (GPIO 21, c3-usb boards only).
+// DI = SWS wire (driven through its resistor), DO = UART bridge TX wire (GPIO 21).
 #pragma once
 #include <stdint.h>
 
-bool spif_begin(uint32_t khz);              // pins to SPI, CS high; false on c3-uart boards
+void spif_begin(uint32_t khz);              // pins to SPI, CS high
 void spif_end();                            // every pin back to its idle state (inputs, reset wire released)
 bool spif_active();
 uint32_t spif_khz();

@@ -1,4 +1,5 @@
-// Wiring of the flasher. Avoid the strapping pins (2, 8, 9), USB (18, 19) and UART0 (20, 21).
+// Wiring of the flasher (ESP32-C3 boards with the C3's own USB port). Avoid the strapping pins (2, 8, 9)
+// and USB (18, 19); UART0 (20, 21) is free for the target because the host link is the USB port.
 #pragma once
 
 // SWS line: PIN_SWS_RX goes straight to the target's SWS pad,
@@ -21,9 +22,6 @@
 // (3.3 V pad on the 3V3 pin, no reset wire). 0 = off.
 #define AUTO_ACTIVATE_MS 3000
 
-// Speed of the link to the computer (only matters on boards with a USB-UART chip).
-#define HOST_BAUD 460800
-
 // Mode at power-up: 0 = UART emulation (pvvx's method), 1 = RMT (real pulse timing, faster).
 #define SWS_MODE_DEFAULT 1
 
@@ -39,14 +37,14 @@
 // SWD clock in kHz at power-up (SWCLK command); the bit-banged clock reaches about 2000.
 #define SWD_KHZ_DEFAULT 1000
 
-// ---- UART bridge (c3-usb boards only: UART0 is the link to the computer on c3-uart boards)
+// ---- UART bridge
 // RX is the SWS wire (GPIO 5, GPIO 4 is switched to an input), TX has its own wire. GPIO 21 also carries
 // the C3's own boot messages for a moment after the flasher is plugged in.
 #define PIN_BRIDGE_TX 21
 // BOOT / strapping pin of the target, held at the level given to the BRIDGE command while the target starts
 #define PIN_BOOT 0
 
-// ---- SPI NOR flash (c3-usb boards only), on the wires above: no new pin
+// ---- SPI NOR flash, on the wires above: no new pin
 #define PIN_SPI_CS PIN_RST        // chip select = the reset wire
 #define PIN_SPI_CLK PIN_SWCLK     // clock = the SWCLK wire
 #define PIN_SPI_DI PIN_SWS_TX     // flash DI (MOSI) = the SWS wire, driven through its resistor
