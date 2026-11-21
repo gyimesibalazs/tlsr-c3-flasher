@@ -32,3 +32,10 @@
 
 // RMT mode: SWire bit rate in bit/s. Range 30000 ... 2000000 (the chip's own default is about 960000).
 #define SWS_RATE_DEFAULT 1000000
+
+// ---- UART bridge (c3-usb boards only: UART0 is the link to the computer on c3-uart boards)
+// RX is the SWS wire (GPIO 5, GPIO 4 is switched to an input), TX has its own wire. GPIO 21 also carries
+// the C3's own boot messages for a moment after the flasher is plugged in.
+#define PIN_BRIDGE_TX 21
+// BOOT / strapping pin of the target, held at the level given to the BRIDGE command while the target starts
+#define PIN_BOOT 0

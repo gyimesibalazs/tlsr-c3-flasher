@@ -24,7 +24,7 @@
 #include "config.h"
 
 #define FW_NAME "tlsr-c3-flasher"
-#define FW_VERSION "0.14"
+#define FW_VERSION "0.15"
 
 enum SwsMode { MODE_UART = 0, MODE_RMT = 1 };
 
@@ -362,7 +362,10 @@ static bool r_read(const uint8_t *head, uint8_t *out, int n) {
 
 // ================================================================ mode-independent SWire access
 
+static void bridge_end();
+
 static bool set_mode(SwsMode m) {
+  bridge_end();
   uart_teardown();
   rmt_teardown();
   mode = m;
@@ -400,10 +403,15 @@ static void sws_flush_in() { if (mode == MODE_UART) u_flush_in(); }
 static const uint8_t pwr_pins[] = PWR_PINS;
 static uint32_t pwr_mask = 0;
 
-// all power pins change with one register write: joined pins must never drive against each other
+// all power pins change with one register write: joined pins must never drive against each other.
+// They are inputs until the target is powered the first time (an unused pin touching something must not
+// short it), and again after PWR z.
 static void target_power(bool on) {
   REG_WRITE(on ? GPIO_OUT_W1TS_REG : GPIO_OUT_W1TC_REG, pwr_mask);
+  REG_WRITE(GPIO_ENABLE_W1TS_REG, pwr_mask);
 }
+
+static void target_power_release() { REG_WRITE(GPIO_ENABLE_W1TC_REG, pwr_mask); }
 
 // reset wire and power pins together: a target wired to either of them restarts
 static void target_reset_pulse() {
@@ -774,6 +782,89 @@ static void selftest() {
                 (unsigned)r_unit, r_unit * 12.5, (unsigned)r_rxsym[0].duration0);
 }
 
+// ================================================================ UART bridge
+// The computer talks straight to the target's UART (bootloaders of BL702, Beken, ESP chips; serial consoles).
+// RX is the SWS wire, TX the PIN_BRIDGE_TX wire. Leave it by sending ESCAPE after a pause of a second.
+
+static const uart_port_t BRIDGE_UART = UART_NUM_1;
+static const char ESCAPE[] = "~~~X";
+static bool bridge_on = false;
+static uint32_t bridge_last_ms = 0;
+static int esc_pos = -1;
+static SwsMode mode_before_bridge = MODE_RMT;
+
+static void bridge_end() {
+  if (!bridge_on) return;
+  bridge_on = false;
+  if (uart_is_driver_installed(BRIDGE_UART)) uart_driver_delete(BRIDGE_UART);
+  pinMode(PIN_BRIDGE_TX, INPUT);
+  pinMode(PIN_BOOT, INPUT);
+}
+
+// boot: 1 = BOOT pin high, 0 = low, -1 = left open; the target is restarted with that level
+static bool bridge_begin(uint32_t baud, int boot) {
+#if ARDUINO_USB_CDC_ON_BOOT
+  uart_teardown();
+  rmt_teardown();
+  pinMode(PIN_SWS_TX, INPUT);                // the resistor side of the SWS wire stays quiet
+  if (boot >= 0) {
+    pinMode(PIN_BOOT, OUTPUT);
+    digitalWrite(PIN_BOOT, boot ? HIGH : LOW);
+  } else {
+    pinMode(PIN_BOOT, INPUT);
+  }
+  uart_config_t cfg = {};
+  cfg.baud_rate = (int)baud;
+  cfg.data_bits = UART_DATA_8_BITS;
+  cfg.parity = UART_PARITY_DISABLE;
+  cfg.stop_bits = UART_STOP_BITS_1;
+  cfg.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
+  cfg.source_clk = UART_SCLK_DEFAULT;
+  if (uart_driver_install(BRIDGE_UART, 4096, 4096, 0, NULL, 0) != ESP_OK) return false;
+  uart_param_config(BRIDGE_UART, &cfg);
+  uart_set_pin(BRIDGE_UART, PIN_BRIDGE_TX, PIN_SWS_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+  gpio_pullup_en((gpio_num_t)PIN_SWS_RX);
+  mode_before_bridge = mode;
+  bridge_on = true;
+  bridge_last_ms = millis();
+  esc_pos = -1;
+  target_reset_pulse();                      // the target starts with the BOOT level applied
+  uart_flush_input(BRIDGE_UART);
+  return true;
+#else
+  (void)baud;
+  (void)boot;
+  return false;
+#endif
+}
+
+static void bridge_pump() {
+  static uint8_t buf[512];
+  int n = Serial.available();
+  if (n > 0) {
+    n = Serial.readBytes(buf, min(n, (int)sizeof(buf)));
+    uint32_t now = millis();
+    for (int i = 0; i < n; i++) {
+      if (esc_pos < 0 && i == 0 && now - bridge_last_ms >= 1000) esc_pos = 0;
+      if (esc_pos >= 0) esc_pos = buf[i] == (uint8_t)ESCAPE[esc_pos] ? esc_pos + 1 : -1;
+      if (esc_pos == (int)sizeof(ESCAPE) - 1) {
+        bridge_end();
+        set_mode(mode_before_bridge);
+        Serial.print("OK bridge closed\n");
+        return;
+      }
+    }
+    bridge_last_ms = now;
+    uart_write_bytes(BRIDGE_UART, buf, n);
+  }
+  size_t avail = 0;
+  uart_get_buffered_data_len(BRIDGE_UART, &avail);
+  if (avail) {
+    int got = uart_read_bytes(BRIDGE_UART, buf, min(avail, sizeof(buf)), 0);
+    if (got > 0) Serial.write(buf, got);
+  }
+}
+
 static void handle(char *ln) {
   char *argv[4] = {NULL, NULL, NULL, NULL};
   int argc = 0;
@@ -810,6 +901,10 @@ static void handle(char *ln) {
     ok();
   } else if (!strcmp(cmd, "SELFTEST")) {
     selftest();
+  } else if (!strcmp(cmd, "PWR")) {          // PWR 1 | 0 | z: power pins high, low, or inputs (not driven)
+    if (argc > 1 && argv[1][0] == 'z') target_power_release();
+    else target_power(a1 != 0);
+    ok();
   } else if (!strcmp(cmd, "RST")) {
     target_reset_pulse();
     ok();
@@ -891,6 +986,14 @@ static void handle(char *ln) {
     if (n < 1) return err("data");
     if (!flash_write_page(a1, data_buf, n)) return err("write failed");
     ok();
+  } else if (!strcmp(cmd, "BRIDGE")) {       // BRIDGE <baud> [hi|lo|z]: transparent UART bridge
+    int boot = -1;
+    if (argc > 2) boot = !strcmp(argv[2], "hi") ? 1 : !strcmp(argv[2], "lo") ? 0 : -1;
+    if (a1 < 1200 || a1 > 3000000) return err("baud 1200..3000000");
+    Serial.printf("OK bridge %u baud, boot %s; leave with a 1 s pause and %s\n", (unsigned)a1,
+                  boot < 0 ? "open" : boot ? "high" : "low", ESCAPE);
+    Serial.flush();
+    if (!bridge_begin(a1, boot)) return err("bridge needs a c3-usb board");
   } else if (!strcmp(cmd, "RUN")) {          // restart the target's CPU
     sws_write1(0x006f, 0x22);
     ok();
@@ -907,12 +1010,13 @@ void setup() {
   pinMode(PIN_RST, OUTPUT_OPEN_DRAIN | PULLUP);
   digitalWrite(PIN_RST, HIGH);
   for (uint8_t pin : pwr_pins) pwr_mask |= 1u << pin;
-  target_power(false);                       // level first, so that all pins start low
   for (uint8_t pin : pwr_pins) {
-    pinMode(pin, OUTPUT);
+    pinMode(pin, INPUT);                     // GPIO function, not driven until the target is powered
     gpio_set_drive_capability((gpio_num_t)pin, GPIO_DRIVE_CAP_3);
   }
-  target_power(false);
+  REG_WRITE(GPIO_OUT_W1TC_REG, pwr_mask);    // the level they will have when they become outputs
+  pinMode(PIN_BOOT, INPUT);
+  pinMode(PIN_BRIDGE_TX, INPUT);
   set_mode(SWS_MODE_DEFAULT ? MODE_RMT : MODE_UART);
 #if AUTO_ACTIVATE_MS > 0
   activate(AUTO_ACTIVATE_MS);                // leaves the target's CPU stopped, if it was caught
@@ -921,6 +1025,10 @@ void setup() {
 
 void loop() {
   static int len = 0;
+  if (bridge_on) {
+    bridge_pump();
+    return;
+  }
   while (Serial.available()) {
     char c = (char)Serial.read();
     if (c == '\n') {

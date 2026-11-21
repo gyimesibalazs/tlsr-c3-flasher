@@ -52,6 +52,33 @@ this is early enough depends on the target's firmware; the power pins are the re
 **Mains powered modules:** their supply is usually not isolated (logic ground = neutral). Disconnect both
 mains wires before connecting the flasher, and power the board from the flasher only.
 
+## UART bridge (firmware 0.15)
+
+The same board works as a USB–UART bridge to a target's serial port (bootloaders, consoles), on the
+same wires:
+
+| ESP32-C3 | SWS (Telink) | UART bridge |
+|---|---|---|
+| GPIO 4 –1 k– GPIO 5 (the SWS wire) | SWS | target TX → flasher RX (GPIO 4 is an input) |
+| GPIO 0 | – | BOOT (`--boot hi` / `lo`, open by default) |
+| GPIO 21 | – | flasher TX → target RX |
+| GPIO 6 | RST | RESET |
+| GPIO 7 (+ 10, 3, 1) | target power | target power |
+
+A pin is only an output while its mode needs it; otherwise it is an input, so a loose wire touching
+something does not short it. The power pins stay inputs until the target is powered the first time;
+`power-off` switches them off and back to inputs.
+
+UART bridge (c3-usb boards only; on c3-uart boards UART0 is the link to the computer):
+
+    python3 tlsr_c3.py -p /dev/ttyACM0 bridge 115200 --boot hi     # restarts the target with BOOT high
+    ... any serial tool on the same port, at the same baud ...
+    python3 tlsr_c3.py -p /dev/ttyACM0 bridge-exit
+
+The baud rate is fixed by the `bridge` command: the C3's USB port does not pass on the host's setting.
+Tools must not toggle DTR / RTS, because those reset the C3 itself (`esptool --before no_reset --after
+no_reset`). GPIO 21 carries the C3's own boot messages for a moment when the flasher is plugged in.
+
 ## Build and upload
 
     pio run -e c3-usb -t upload      # USB connector wired straight to the C3 (Super Mini, XIAO)

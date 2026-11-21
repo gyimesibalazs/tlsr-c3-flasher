@@ -7,6 +7,8 @@ Examples:
     python3 tlsr_c3.py -p /dev/ttyACM0 wf 0 firmware.bin
     python3 tlsr_c3.py -p /dev/ttyACM0 --rate 1500000 rf 0 0x80000 stock.bin --twice
     python3 tlsr_c3.py -p /dev/ttyACM0 --mode uart info
+    python3 tlsr_c3.py -p /dev/ttyACM0 bridge 115200 --boot hi        # UART bridge, BOOT pin high
+    python3 tlsr_c3.py -p /dev/ttyACM0 bridge-exit
 """
 import argparse
 import base64
@@ -276,6 +278,13 @@ def main():
     p.add_argument('address', type=auto_int)
     p.add_argument('size', type=auto_int)
     sub.add_parser('ea', help='erase the whole flash')
+    p = sub.add_parser('bridge', help='make the flasher a UART bridge to the target (RX = SWS wire, TX = GPIO 21), '
+                                      'then use another tool on the same port')
+    p.add_argument('baud', type=auto_int)
+    p.add_argument('--boot', choices=['hi', 'lo', 'z'], default='z',
+                   help='level of the BOOT pin (GPIO 0) while the target is restarted (default: left open)')
+    sub.add_parser('bridge-exit', help='leave the UART bridge')
+    sub.add_parser('power-off', help='switch the target power pins off and make them inputs')
     p = sub.add_parser('led', help='drive every free pin low and then high for a moment, one after the other, '
                                    'to find the pin of an LED on an unknown board')
     p.add_argument('--skip', default='A1,D4,D7',
@@ -290,6 +299,14 @@ def main():
     args = ap.parse_args()
 
     t0 = time.time()
+    if args.op == 'bridge-exit':
+        # the flasher is in the bridge and does not answer commands: send the escape after a pause
+        with serial.Serial(args.port, args.host_baud, timeout=2, dsrdtr=False, rtscts=False) as s:
+            time.sleep(1.2)
+            s.write(b'~~~X')
+            answer = s.read_until(b'\n', 200)
+        print(answer.decode(errors='replace').strip() or 'no answer (was the bridge open?)')
+        return
     try:
         f = Flasher(args.port, args.host_baud)
         print('Flasher:', f.version)
@@ -299,6 +316,21 @@ def main():
             fw = (0, 0)
         if fw < (0, 11):
             raise FlasherError('this script needs flasher firmware 0.11 or newer on the C3')
+        if args.op in ('bridge', 'power-off'):
+            if fw < (0, 15):
+                raise FlasherError('this needs flasher firmware 0.15 or newer on the C3')
+        if args.op == 'power-off':
+            f.cmd('PWR 0')
+            time.sleep(0.2)
+            f.cmd('PWR z')
+            print('Target power off, power pins are inputs.')
+            return
+        if args.op == 'bridge':
+            print(f.cmd('BRIDGE %d %s' % (args.baud, args.boot)))
+            f.ser.close()
+            print('The port is free for the target tool now. Do not let it toggle DTR / RTS (they reset the C3);')
+            print('for example esptool --before no_reset --after no_reset. Leave with: bridge-exit')
+            return
         # always set the speeds: the flasher keeps the last values until it is powered off
         f.cmd('BAUD %d' % (args.baud or 921600))
         f.cmd('RATE %d' % (args.rate or 1000000))
