@@ -27,7 +27,7 @@
 #include "spiflash.h"
 
 #define FW_NAME "tlsr-c3-flasher"
-#define FW_VERSION "0.19"
+#define FW_VERSION "0.20"
 
 enum SwsMode { MODE_UART = 0, MODE_RMT = 1 };
 
@@ -976,6 +976,9 @@ static void x_read_cmd(char src, uint32_t addr, uint32_t len) {
   if (src == 'S' && ((addr | len) & 3)) return err("SWD: address and length in whole words");
   Serial.printf("OK %u\n", (unsigned)len);
   while (len > 0) {
+    // anything from the host stops the stream: a client that was interrupted (Ctrl-C) leaves it running,
+    // and the next one must get an answer; its bytes stay for the command parser
+    if (Serial.available()) return x_error("aborted by the host");
     int n = (int)min((uint32_t)XBLK, len);
     why = x_read(src, addr, xbuf, n);
     if (why) return x_error(why);
@@ -1117,6 +1120,7 @@ static void handle(char *ln) {
     uint32_t crc = 0;
     read_dbg[0] = 0;
     for (uint32_t done = 0; done < a2;) {
+      if (Serial.available()) return err("aborted by the host");
       int cnt = (int)min((uint32_t)MAX_READ, a2 - done);
       if (!flash_read(a1 + done, data_buf, cnt)) return err(read_dbg[0] ? read_dbg : "read failed");
       crc = crc32_update(crc, data_buf, cnt);
@@ -1199,6 +1203,7 @@ static void handle(char *ln) {
     if (a2 < 1 || a2 > 0x1000000) return err("len 1..16 M");
     uint32_t crc = 0;
     for (uint32_t done = 0; done < a2;) {
+      if (Serial.available()) return err("aborted by the host");
       int cnt = (int)min((uint32_t)MAX_READ, a2 - done);
       spif_read(a1 + done, data_buf, cnt);
       crc = crc32_update(crc, data_buf, cnt);
@@ -1382,6 +1387,7 @@ static void handle(char *ln) {
     if ((a1 | a2) & 3 || a2 < 4 || a2 > 65536) return err("addr and len: multiples of 4, len <= 65536");
     uint32_t crc = 0;
     for (uint32_t done = 0; done < a2;) {
+      if (Serial.available()) return err("aborted by the host");
       int cnt = (int)min((uint32_t)MAX_READ, a2 - done);
       if (!swd_check(swd_mem_read(0, a1 + done, data_buf, cnt))) return;
       crc = crc32_update(crc, data_buf, cnt);

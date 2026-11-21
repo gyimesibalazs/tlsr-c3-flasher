@@ -44,17 +44,29 @@ class Flasher:
         self.ser.rts = False
         self.ser.open()
         time.sleep(1.5)
-        self.ser.reset_input_buffer()
         last = None
-        for _ in range(5):
+        for _ in range(8):
+            # an empty line stops a stream an interrupted client left running (firmware 0.20) and is
+            # otherwise ignored; then drop whatever that stream had still sent
+            self.ser.write(b'\n')
+            time.sleep(0.3)
+            self.ser.reset_input_buffer()
+            self.rxbuf = b''
             try:
                 self.version = self.cmd('V', timeout=1)
                 return
             except FlasherError as e:
                 last = e
-                self.ser.reset_input_buffer()
-                self.rxbuf = b''
-        raise FlasherError('the flasher does not answer on %s (%s)' % (port, last))
+        raise FlasherError('the flasher does not answer on %s (%s); if it was left in the UART bridge, '
+                           'run bridge-exit, otherwise unplug it and plug it in again' % (port, last))
+
+    def stop(self):
+        """After Ctrl-C: tell the flasher to stop a stream it may still be sending."""
+        try:
+            self.ser.write(b'\n')
+            self.ser.flush()
+        except serial.SerialException:
+            pass
 
     def readline(self, timeout=5):
         """Like serial.readline(), but takes everything that has arrived in one call: reading a long
@@ -1147,6 +1159,7 @@ def main():
             answer = s.read_until(b'\n', 200)
         print(answer.decode(errors='replace').strip() or 'no answer (was the bridge open?)')
         return
+    f = None
     try:
         f = Flasher(args.port)
         print('Flasher:', f.version)
@@ -1392,6 +1405,11 @@ def main():
     except (FlasherError, serial.SerialException) as e:
         print('\nError:', e)
         sys.exit(1)
+    except KeyboardInterrupt:
+        if f is not None:
+            f.stop()
+        print('\nInterrupted.')
+        sys.exit(130)
     print('Done in %.1f s' % (time.time() - t0))
 
 
