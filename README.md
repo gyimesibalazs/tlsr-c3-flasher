@@ -166,8 +166,8 @@ Winbond and GigaDevice chips: on Macronix and ISSI the same command (0x35) switc
 
 In circuit, the board's own processor drives the same pins: keep it in reset (or its flash pins high
 impedance) while the flasher works, and power the board from its own supply. The flasher does not switch
-any power in SPI mode. Speed: about 40 kbytes/s reading (the USB link), clock 4 MHz by default
-(`--spi-khz`, the DI wire goes through 1 k). Not tested on hardware yet.
+any power in SPI mode. Clock 4 MHz by default (`--spi-khz`, the DI wire goes through 1 k); the read and
+write speeds are printed (binary streams, see the host protocol). Not tested on hardware yet.
 
 UART bridge (c3-usb boards only; on c3-uart boards UART0 is the link to the computer):
 
@@ -313,8 +313,16 @@ SPI flash: `SPI [khz]`, `PT hexout [nin]` (raw transaction), `PJ` (JEDEC id), `P
 `PB addr len` (base64), `PC addr len` (CRC-32), `PE addr [0x20|0x52|0xD8]`, `PX` (chip erase),
 `PW addr hex` (within one 256-byte page), `PS` (status 1).
 
-The USB link is the slow part of a read (about 45 kbytes/s), so the host reads with `FB`, and the second
-pass of `rf --twice` and the verify after `wf` only compare CRCs (`FC`).
+Bulk data moves in binary streams (firmware 0.18), not in text answers: `XR <src> <addr> <len>` answers
+`OK <len>` and then frames `D <n:u16> <data> <crc32>` of up to 4 k (`E <n:u16> <text>` on an error, `Z` at
+the end); `XW <dst> <addr> <len> <unit> <skip>` answers `OK`, then takes frames `<n:u16> <data> <crc32>` and
+answers each with `K` once it is written. The host keeps up to three frames on their way, so the next ones
+wait in the C3's 16 k receive buffer while one is programmed. After an error the C3 drops everything until
+the line has been quiet for 300 ms, so frames sent ahead never reach the command parser. Sources and
+destinations: `F` Telink flash, `S` SWD flash (write) / memory (read), `M` SWD memory, `P` SPI flash; `unit`
+is the boundary no single flash write crosses, `skip 1` leaves out parts that are all 0xff (not on STM32
+L0 / L1, whose erased flash reads 0x00). The old text commands stay for single blocks. The second pass of
+`rf --twice` and the verify after `wf` only compare CRCs (`FC`, `SFC`, `PC`).
 
 ## Not done
 

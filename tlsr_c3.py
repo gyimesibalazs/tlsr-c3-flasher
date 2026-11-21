@@ -84,28 +84,84 @@ class Flasher:
     def activate(self, tact_ms):
         return self.cmd('A %d' % tact_ms, timeout=tact_ms / 1000 + 10)
 
-    def read_flash(self, addr, size, progress=True):
+    # ---- binary streams (firmware 0.18): a whole range per command, 4 k frames with a CRC-32 each
+    def _read_exact(self, n, timeout=10):
+        deadline = time.time() + timeout
+        while len(self.rxbuf) < n:
+            chunk = self.ser.read(max(1, self.ser.in_waiting))
+            if chunk:
+                self.rxbuf += chunk
+                deadline = time.time() + timeout
+            elif time.time() >= deadline:
+                raise FlasherError('the flasher stopped sending (%d of %d bytes)' % (len(self.rxbuf), n))
+        out, self.rxbuf = self.rxbuf[:n], self.rxbuf[n:]
+        return out
+
+    def _stream_error(self):
+        n = int.from_bytes(self._read_exact(2), 'little')
+        return self._read_exact(n).decode(errors='replace')
+
+    def stream_read(self, src, addr, size, label='Read', progress=True):
+        """XR: src F = Telink flash, S = SWD memory, P = SPI flash."""
+        self.cmd('XR %s %d %d' % (src, addr, size))
         out = bytearray()
-        while len(out) < size:
-            n = min(READ_CHUNK, size - len(out))
-            if progress:
-                print('\rRead 0x%06x' % (addr + len(out)), end='', flush=True)
-            for attempt in range(3):
-                try:
-                    answer = self.cmd('FB %d %d' % (addr + len(out), n))
-                    data = b'\xff' * n if answer == '*' else base64.b64decode(answer, validate=True)
-                    if len(data) != n:
-                        raise FlasherError('short answer')
-                    break
-                except (FlasherError, ValueError):
-                    if attempt == 2:
-                        if progress:
-                            print()
-                        raise
+        t0 = time.time()
+        while True:
+            kind = self._read_exact(1)
+            if kind == b'Z':
+                break
+            if kind == b'E':
+                raise FlasherError('read at 0x%08x: %s' % (addr + len(out), self._stream_error()))
+            if kind != b'D':
+                raise FlasherError('bad frame %r in the read stream' % kind)
+            n = int.from_bytes(self._read_exact(2), 'little')
+            data = self._read_exact(n)
+            if zlib.crc32(data) != int.from_bytes(self._read_exact(4), 'little'):
+                raise FlasherError('CRC error in the read stream at 0x%08x' % (addr + len(out)))
             out += data
+            if progress:
+                dt = max(time.time() - t0, 1e-3)
+                print('\r%s 0x%08x  %4.0f kB/s' % (label, addr + len(out), len(out) / dt / 1000), end='', flush=True)
         if progress:
-            print('\r' + ' ' * 20 + '\r', end='')
+            print('\r' + ' ' * 40 + '\r', end='')
+        if len(out) != size:
+            raise FlasherError('short read stream: %d of %d bytes' % (len(out), size))
+        self.last_rate = len(out) / max(time.time() - t0, 1e-3)
         return bytes(out)
+
+    def stream_write(self, dst, addr, data, unit=256, skip=True, label='Write', progress=True, window=3):
+        """XW: dst F = Telink flash, P = SPI flash, S = SWD flash, M = SWD memory. The flash must be erased.
+        Frames end on 4 k address boundaries; up to `window` frames are on their way while one is written."""
+        frames, pos = [], 0
+        while pos < len(data):
+            n = min(4096 - (addr + pos) % 4096, len(data) - pos)
+            frames.append(data[pos:pos + n])
+            pos += n
+        self.cmd('XW %s %d %d %d %d' % (dst, addr, len(data), unit, 1 if skip else 0))
+        sent = acked = done = 0
+        t0 = time.time()
+        while acked < len(frames):
+            while sent < len(frames) and sent - acked < window:
+                fr = frames[sent]
+                self.ser.write(len(fr).to_bytes(2, 'little') + fr + zlib.crc32(fr).to_bytes(4, 'little'))
+                sent += 1
+            kind = self._read_exact(1, timeout=30)
+            if kind == b'E':
+                why = self._stream_error()
+                raise FlasherError('write at 0x%08x: %s' % (addr + done, why))
+            if kind != b'K':
+                raise FlasherError('bad answer %r in the write stream' % kind)
+            done += len(frames[acked])
+            acked += 1
+            if progress:
+                dt = max(time.time() - t0, 1e-3)
+                print('\r%s 0x%08x  %4.0f kB/s' % (label, addr + done, done / dt / 1000), end='', flush=True)
+        if progress:
+            print('\r' + ' ' * 40 + '\r', end='')
+        self.last_rate = len(data) / max(time.time() - t0, 1e-3)
+
+    def read_flash(self, addr, size, progress=True):
+        return self.stream_read('F', addr, size, progress=progress)
 
     def compare_flash(self, addr, data, label='Compare'):
         """Check the flash against data by CRC, block by block; returns the address of the first bad block."""
@@ -123,24 +179,14 @@ class Flasher:
 
     def write_flash(self, addr, data, erase=True):
         self.cmd('FU')
-        erased = None
-        if erase and addr % SECTOR:
-            erased = addr - addr % SECTOR   # as in pvvx's tool: a partly covered first sector is kept
-        pos = 0
-        while pos < len(data):
-            a = addr + pos
-            n = min(PAGE - a % PAGE, len(data) - pos)
-            page = data[pos:pos + n]
-            sector = a - a % SECTOR
-            if erase and sector != erased:
+        if erase:
+            # as in pvvx's tool: a partly covered first sector is not erased, only written
+            first = addr if addr % SECTOR == 0 else addr - addr % SECTOR + SECTOR
+            for sector in range(first, addr + len(data), SECTOR):
                 print('\rErase 0x%06x' % sector, end='', flush=True)
                 self.cmd('FE %d' % sector)
-                erased = sector
-            if page.count(0xff) != len(page):
-                print('\rWrite 0x%06x' % a, end='', flush=True)
-                self.cmd('FW %d %s' % (a, page.hex()))
-            pos += n
-        print('\r' + ' ' * 20 + '\r', end='')
+            print('\r' + ' ' * 20 + '\r', end='')
+        self.stream_write('F', addr, data, unit=PAGE, skip=True)
 
 
 def auto_int(x):
@@ -629,8 +675,7 @@ def ti_write(f, t, addr, data):
             part = sector[k:k + 0x1000]
             if part.count(0xff) == len(part):
                 continue
-            for j in range(0, len(part), SWD_WRITE_CHUNK):
-                f.cmd('SMW 0 %d %s' % (TI_BUF + j, part[j:j + SWD_WRITE_CHUNK].hex()))
+            f.stream_write('M', TI_BUF, part, unit=4096, skip=False, progress=False)
             call(program, TI_BUF, a + k, len(part))
     print()
 
@@ -681,8 +726,7 @@ def rp2040_write(f, offset, data):
         part = data[pos:pos + step]
         print('\rErase/write 0x%08x' % (0x10000000 + offset + pos), end='', flush=True)
         call('RE', offset + pos, len(part), RP_BLOCK, 0xD8)
-        for k in range(0, len(part), SWD_WRITE_CHUNK):
-            f.cmd('SMW 0 %d %s' % (RP_BUF + k, part[k:k + SWD_WRITE_CHUNK].hex()))
+        f.stream_write('M', RP_BUF, part, unit=4096, skip=False, progress=False)
         call('RP', offset + pos, RP_BUF, len(part))
     call('FC')
     call('CX')
@@ -732,21 +776,13 @@ def swd_write(f, t, addr, data, erase=True):
             print('\rErase 0x%08x' % a, end='', flush=True)
             f.cmd('SFE %d' % a, timeout=10)
         print()
-    unit = min(SWD_WRITE_CHUNK, t.write_unit or SWD_WRITE_CHUNK)
+    unit = min(SWD_WRITE_CHUNK, t.write_unit or SWD_WRITE_CHUNK)   # one flash call never crosses this
     if t.family == 'stm32u5':
         if addr % 16:
             raise FlasherError('STM32 U5: the address must be a multiple of 16')
         data += b'\xff' * (-len(data) % 16)
-    pos = 0
-    while pos < len(data):
-        a = addr + pos
-        n = min(unit - a % unit, len(data) - pos)
-        chunk = data[pos:pos + n]
-        if chunk.count(0xff) != len(chunk):
-            print('\rWrite 0x%08x' % a, end='', flush=True)
-            f.cmd('SFW %d %s' % (a, chunk.hex()), timeout=20)
-        pos += n
-    print()
+    # STM32 L0 / L1 flash reads 0x00 when erased: nothing may be skipped there
+    f.stream_write('S', addr, data, unit=unit, skip=t.family != 'stm32l0')
 
 
 def swd_verify(f, addr, data):
@@ -764,25 +800,7 @@ def swd_verify(f, addr, data):
 
 
 def swd_read(f, addr, size, progress=True):
-    out = bytearray()
-    while len(out) < size:
-        n = min(READ_CHUNK, size - len(out))
-        if progress:
-            print('\rRead 0x%08x' % (addr + len(out)), end='', flush=True)
-        for attempt in range(3):
-            try:
-                answer = f.cmd('SM 0 %d %d' % (addr + len(out), n))
-                data = b'\xff' * n if answer == '*' else base64.b64decode(answer, validate=True)
-                if len(data) != n:
-                    raise FlasherError('short answer')
-                break
-            except (FlasherError, ValueError):
-                if attempt == 2:
-                    raise
-        out += data
-    if progress:
-        print('\r' + ' ' * 24 + '\r', end='')
-    return bytes(out)
+    return f.stream_read('S', addr, size, progress=progress)
 
 
 # ---- SPI NOR flash (25-series) on the flasher's wires: CS = reset, CLK = SWCLK, DI = SWS, DO = GPIO 21
@@ -891,19 +909,7 @@ def spi_unprotect(f, t):
 
 
 def spi_read(f, addr, size, progress=True):
-    out = bytearray()
-    while len(out) < size:
-        n = min(READ_CHUNK, size - len(out))
-        if progress:
-            print('\rRead 0x%08x' % (addr + len(out)), end='', flush=True)
-        answer = f.cmd('PB %d %d' % (addr + len(out), n))
-        data = b'\xff' * n if answer == '*' else base64.b64decode(answer, validate=True)
-        if len(data) != n:
-            raise FlasherError('short answer')
-        out += data
-    if progress:
-        print('\r' + ' ' * 24 + '\r', end='')
-    return bytes(out)
+    return f.stream_read('P', addr, size, progress=progress)
 
 
 def spi_crc(f, addr, size):
@@ -911,16 +917,17 @@ def spi_crc(f, addr, size):
 
 
 def spi_write(f, t, addr, data, erase=True):
-    """Erase-unit by erase-unit: units whose CRC already matches are skipped, what the image does not cover
-    inside a unit is read first and kept."""
+    """Erase unit by erase unit: units whose CRC already matches are skipped, what the image does not cover
+    inside a unit is read first and kept; each run of changed units is erased, then streamed in one go."""
     if addr + len(data) > t.size:
         raise FlasherError('0x%x bytes at 0x%x do not fit into %d kbytes' % (len(data), addr, t.size // 1024))
     u = t.erase_size
     first = addr - addr % u
     end = addr + len(data)
     end += -end % u
-    skipped = 0
+    runs, skipped = [], 0                 # [start, bytes] of consecutive units that need writing
     for a in range(first, end, u):
+        print('\rCompare 0x%08x' % a, end='', flush=True)
         lo, hi = max(a, addr), min(a + u, addr + len(data))
         part = data[lo - addr:hi - addr]
         if lo > a or hi < a + u:
@@ -931,18 +938,20 @@ def spi_write(f, t, addr, data, erase=True):
             want = part
         if spi_crc(f, a, u) == zlib.crc32(want):
             skipped += 1
-            continue
-        print('\rErase/write 0x%08x' % a, end='', flush=True)
-        if erase:
-            f.cmd('PE %d %d' % (a, t.erase_op), timeout=10)
-        for p in range(0, u, 256):
-            page = want[p:p + 256]
-            if page.count(0xff) != len(page):
-                f.cmd('PW %d %s' % (a + p, page.hex()))
+        elif runs and runs[-1][0] + len(runs[-1][1]) == a:
+            runs[-1][1] += want
+        else:
+            runs.append([a, bytearray(want)])
     print('\r' + ' ' * 28 + '\r', end='')
+    for start, buf in runs:
+        if erase:
+            for a in range(start, start + len(buf), u):
+                print('\rErase 0x%08x' % a, end='', flush=True)
+                f.cmd('PE %d %d' % (a, t.erase_op), timeout=10)
+            print('\r' + ' ' * 28 + '\r', end='')
+        f.stream_write('P', start, bytes(buf))
     if skipped:
         print('%d of %d erase units already held the data.' % (skipped, (end - first) // u))
-
 
 def spi_verify(f, addr, data):
     step = 0x10000
@@ -966,7 +975,7 @@ def spi_main(f, args):
         os.makedirs(os.path.dirname(os.path.abspath(args.filename)), exist_ok=True)
         t1 = time.time()
         data = spi_read(f, args.address, size)
-        print('Read in %.1f s' % (time.time() - t1))
+        print('Read in %.1f s (%.0f kB/s)' % (time.time() - t1, f.last_rate / 1000))
         if args.twice:
             bad = spi_verify(f, args.address, data)
             if bad is not None:
@@ -1097,8 +1106,8 @@ def main():
             fw = tuple(int(x) for x in f.version.split()[1].split('.'))
         except (IndexError, ValueError):
             fw = (0, 0)
-        if fw < (0, 11):
-            raise FlasherError('this script needs flasher firmware 0.11 or newer on the C3')
+        if fw < (0, 18):
+            raise FlasherError('this script needs flasher firmware 0.18 or newer on the C3 (binary streams)')
         if args.spi:
             if fw < (0, 17):
                 raise FlasherError('SPI flash needs flasher firmware 0.17 or newer on the C3')
@@ -1203,7 +1212,7 @@ def main():
                 t1 = time.time()
                 swd_connect_any(f)
                 data = swd_read(f, args.address, args.size)
-                print('Read in %.1f s' % (time.time() - t1))
+                print('Read in %.1f s (%.0f kB/s)' % (time.time() - t1, f.last_rate / 1000))
                 if args.twice:
                     print('Second pass...')
                     again = swd_read(f, args.address, args.size)

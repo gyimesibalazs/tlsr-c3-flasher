@@ -27,7 +27,7 @@
 #include "spiflash.h"
 
 #define FW_NAME "tlsr-c3-flasher"
-#define FW_VERSION "0.17"
+#define FW_VERSION "0.18"
 
 enum SwsMode { MODE_UART = 0, MODE_RMT = 1 };
 
@@ -879,6 +879,153 @@ static void bridge_pump() {
   }
 }
 
+// ================================================================ binary streams (XR / XW)
+// The text commands answer one block per request; these move a whole range in one command, in binary
+// frames of up to 4 k with a CRC-32 each, so the USB link is never idle waiting for the next request.
+//   XR <src> <addr> <len>: "OK <len>\n", then frames 'D' <n:u16> <data> <crc32>, an error is
+//                          'E' <n:u16> <text>, the end 'Z'.
+//   XW <dst> <addr> <len> <unit> <skip>: "OK\n", then the host sends frames <n:u16> <data> <crc32>; every frame
+//                          is answered with 'K' after it is written, or 'E' <n:u16> <text>. The host sends
+//                          ahead: the next frames wait in the receive buffer while one is programmed.
+// src / dst: F = Telink flash over SWS, S = SWD flash (write) / memory (read), M = SWD memory (write),
+// P = SPI flash. unit: the write is split at these boundaries (flash page); skip 1: parts that are all 0xff
+// are not written (erased flash).
+
+static const int XBLK = 4096;
+static uint8_t xbuf[XBLK + 8];
+
+static bool x_send(const uint8_t *d, int n) {
+  uint32_t t0 = millis();
+  while (n > 0) {
+    int w = Serial.write(d, n);
+    d += w;
+    n -= w;
+    if (w > 0) t0 = millis();
+    else if (millis() - t0 > 3000) return false;   // the host stopped reading
+  }
+  return true;
+}
+
+static void x_frame(char type, const uint8_t *d, int n) {
+  uint8_t h[3] = {(uint8_t)type, (uint8_t)n, (uint8_t)(n >> 8)};
+  x_send(h, 3);
+  x_send(d, n);
+  if (type == 'D') {
+    uint32_t crc = crc32_update(0, d, n);
+    x_send((const uint8_t *)&crc, 4);
+  }
+}
+
+static void x_error(const char *why) { x_frame('E', (const uint8_t *)why, strlen(why)); }
+
+// after a failed XW the frames the host sent ahead must not reach the command parser: drop everything
+// until the line has been quiet for 300 ms, then report
+static void x_write_error(const char *why) {
+  uint32_t last = millis();
+  while (millis() - last < 300) {
+    if (Serial.available()) {
+      while (Serial.available()) Serial.read();
+      last = millis();
+    }
+    delay(1);
+  }
+  x_error(why);
+}
+
+static const char *x_read(char src, uint32_t addr, uint8_t *buf, int n) {
+  switch (src) {
+    case 'F':
+      read_dbg[0] = 0;
+      return flash_read(addr, buf, n) ? NULL : (read_dbg[0] ? read_dbg : "read failed");
+    case 'S': {
+      int r = swd_mem_read(0, addr, buf, n);
+      return r == SWD_OK ? NULL : swdf_err_name(r);
+    }
+    case 'P':
+      spif_read(addr, buf, n);
+      return NULL;
+  }
+  return "source";
+}
+
+static const char *x_write_part(char dst, uint32_t addr, const uint8_t *d, int n) {
+  switch (dst) {
+    case 'F':
+      return flash_write_page(addr, d, n) ? NULL : "write failed";
+    case 'P': {
+      int r = spif_program(addr, d, n);
+      return r == SPIF_OK ? NULL : r == SPIF_ERR_WEL ? "write enable refused (WP pin or status protection)"
+                                                     : "timeout";
+    }
+    case 'S': {
+      int r = swdf_write(addr, d, n);
+      return r == SWD_OK ? NULL : swdf_err_name(r);
+    }
+    case 'M': {
+      int r = swd_mem_write(0, addr, d, n);
+      return r == SWD_OK ? NULL : swdf_err_name(r);
+    }
+  }
+  return "destination";
+}
+
+static const char *x_mode_check(char c) {
+  if (c == 'F') return swd_on || spif_active() ? "not in SWire mode" : NULL;
+  if (c == 'S' || c == 'M') return swd_on ? NULL : "not in SWD mode";
+  if (c == 'P') return spif_active() ? NULL : "not in SPI mode";
+  return "source / destination: F, S, M or P";
+}
+
+static void x_read_cmd(char src, uint32_t addr, uint32_t len) {
+  const char *why = x_mode_check(src);
+  if (why) return err(why);
+  if (src == 'S' && ((addr | len) & 3)) return err("SWD: address and length in whole words");
+  Serial.printf("OK %u\n", (unsigned)len);
+  while (len > 0) {
+    int n = (int)min((uint32_t)XBLK, len);
+    why = x_read(src, addr, xbuf, n);
+    if (why) return x_error(why);
+    x_frame('D', xbuf, n);
+    addr += n;
+    len -= n;
+  }
+  x_frame('Z', NULL, 0);
+}
+
+static void x_write_cmd(char dst, uint32_t addr, uint32_t len, uint32_t unit, bool skip) {
+  const char *why = x_mode_check(dst);
+  if (why) return err(why);
+  if (dst == 'F' || dst == 'P') unit = 256;
+  if (unit < 4 || unit > XBLK || (unit & (unit - 1))) return err("unit: power of two, 4..4096");
+  if ((dst == 'S' || dst == 'M') && ((addr | len) & 3)) return err("SWD: address and length in whole words");
+  ok();
+  while (len > 0) {
+    uint8_t h[2];
+    if (Serial.readBytes(h, 2) != 2) return x_write_error("frame header timeout");
+    int n = h[0] | (h[1] << 8);
+    if (n < 1 || n > XBLK || (uint32_t)n > len) return x_write_error("frame length");
+    if (Serial.readBytes(xbuf, n + 4) != (size_t)(n + 4)) return x_write_error("frame data timeout");
+    uint32_t crc;
+    memcpy(&crc, xbuf + n, 4);
+    if (crc != crc32_update(0, xbuf, n)) return x_write_error("frame CRC");
+    for (int pos = 0; pos < n;) {
+      uint32_t a = addr + pos;
+      int k = (int)min((uint32_t)(n - pos), unit - a % unit);
+      bool blank = skip;
+      for (int i = 0; i < k && blank; i++) blank = xbuf[pos + i] == 0xff;
+      if (!blank) {
+        why = x_write_part(dst, a, xbuf + pos, k);
+        if (why) return x_write_error(why);
+      }
+      pos += k;
+    }
+    addr += n;
+    len -= n;
+    uint8_t k = 'K';
+    x_send(&k, 1);
+  }
+}
+
 // ================================================================ SWD commands
 
 static bool swd_check(int r) {
@@ -1008,6 +1155,13 @@ static void handle(char *ln) {
     if (n < 1) return err("data");
     if (!flash_write_page(a1, data_buf, n)) return err("write failed");
     ok();
+  } else if (!strcmp(cmd, "XR")) {           // XR <src> <addr> <len>: binary stream read (see above)
+    if (argc < 4) return err("src addr len");
+    x_read_cmd(argv[1][0], strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));
+  } else if (!strcmp(cmd, "XW")) {           // XW <dst> <addr> <len> <unit> <skip>: binary stream write
+    if (argc < 6) return err("dst addr len unit skip");
+    x_write_cmd(argv[1][0], strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0), strtoul(argv[4], NULL, 0),
+                atoi(argv[5]) != 0);
   } else if (!strcmp(cmd, "SPI")) {          // SPI [kHz]: the wires to an SPI NOR flash (no power switched)
     uint32_t khz = argc > 1 ? a1 : SPI_KHZ_DEFAULT;
     if (khz < 100 || khz > 20000) return err("100..20000 kHz");
@@ -1205,7 +1359,9 @@ static void handle(char *ln) {
 
 void setup() {
   // a page write is one line of about 530 characters; the default 256-byte receive buffer drops part of it
-  Serial.setRxBufferSize(4096);
+  // the receive buffer holds the frames of XW the host sends ahead, the transmit buffer those of XR
+  Serial.setRxBufferSize(16384);
+  Serial.setTxBufferSize(16384);
   Serial.begin(HOST_BAUD);
   gpio_set_level((gpio_num_t)PIN_RST, 1);    // preset the level, so enabling the output does not pulse reset
   pinMode(PIN_RST, OUTPUT_OPEN_DRAIN | PULLUP);
