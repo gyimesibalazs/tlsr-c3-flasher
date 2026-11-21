@@ -546,6 +546,129 @@ def swd_info(f, quiet=False):
     return SwdTarget()
 
 
+SWD_WRITE_CHUNK = 512          # bytes per SFW line: the flasher's command line holds about 1400 characters
+
+
+# ---- RP2040: the flash is written by the boot ROM's own routines, run on core 0
+RP_BKPT, RP_BUF, RP_STACK = 0x20000000, 0x20001000, 0x20040000
+RP_SECTOR, RP_BLOCK = 4096, 65536
+
+
+def rp2040_rom_funcs(f):
+    table = swd_word(f, 0x14) & 0xffff                  # pointer to the ROM function table
+    funcs, a = {}, table
+    while True:
+        w = swd_word(f, a & ~3)
+        entry = (w >> (8 * (a & 2))) & 0xffff
+        w2 = swd_word(f, (a + 2) & ~3)
+        ptr = (w2 >> (8 * ((a + 2) & 2))) & 0xffff
+        if entry == 0:
+            break
+        funcs[chr(entry & 0xff) + chr(entry >> 8)] = ptr
+        a += 4
+    need = ('IF', 'EX', 'RE', 'RP', 'FC', 'CX')
+    missing = [k for k in need if k not in funcs]
+    if missing:
+        raise FlasherError('RP2040 boot ROM functions not found: %s' % ', '.join(missing))
+    return funcs
+
+
+def rp2040_write(f, offset, data):
+    """offset: from the start of the flash; data: whole 4 k sectors."""
+    f.cmd('SHALT')
+    # core 1 off while the flash is out of XIP mode (it may run from flash); the watchdog reset of --run
+    # or a power cycle brings it back
+    f.cmd('SMW 0 %d %s' % (0x40010004, (1 << 16).to_bytes(4, 'little').hex()))    # PSM_FRCE_OFF.proc1
+    f.cmd('SMW 0 %d %s' % (RP_BKPT, (0xBE00BE00).to_bytes(4, 'little').hex()))   # bkpt; bkpt
+    fn = rp2040_rom_funcs(f)
+
+    def call(name, *args, timeout=20):
+        return int(f.cmd('SCALL %d %d %d %s' % (fn[name], RP_STACK, RP_BKPT, ' '.join(str(a) for a in args)),
+                         timeout=timeout), 16)
+    call('IF')
+    call('EX')
+    step = 0x8000                                       # 32 k through the RAM buffer at a time
+    for pos in range(0, len(data), step):
+        part = data[pos:pos + step]
+        print('\rErase/write 0x%08x' % (0x10000000 + offset + pos), end='', flush=True)
+        call('RE', offset + pos, len(part), RP_BLOCK, 0xD8)
+        for k in range(0, len(part), SWD_WRITE_CHUNK):
+            f.cmd('SMW 0 %d %s' % (RP_BUF + k, part[k:k + SWD_WRITE_CHUNK].hex()))
+        call('RP', offset + pos, RP_BUF, len(part))
+    call('FC')
+    call('CX')
+    print()
+
+
+def rp2040_run(f):
+    f.cmd('SMW 0 %d %s' % (DHCSR, (0xA05F0000).to_bytes(4, 'little').hex()))
+    try:
+        f.cmd('SMW 0 %d %s' % (0x40058000, (0x80000000).to_bytes(4, 'little').hex()))   # watchdog: reset now
+    except FlasherError:
+        pass                                            # the chip resets before it answers
+
+
+def swd_write(f, t, addr, data, erase=True):
+    if t.rp2040:
+        offset = addr - 0x10000000 if addr >= 0x10000000 else addr
+        # whole sectors: keep what is already there around the new data
+        first = offset - offset % RP_SECTOR
+        end = offset + len(data)
+        end += -end % RP_SECTOR
+        old = bytearray(swd_read(f, 0x10000000 + first, end - first, progress=False))
+        old[offset - first:offset - first + len(data)] = data
+        rp2040_write(f, first, bytes(old))
+        return
+    if t.family is None:
+        raise FlasherError('writing needs a recognised chip (EFR32 Series 1 / 2, nRF52)')
+    if addr % 4 or len(data) % 4:
+        data += b'\xff' * (-len(data) % 4)
+        if addr % 4:
+            raise FlasherError('the address must be a multiple of 4')
+    if t.flash and addr + len(data) > t.flash:
+        raise FlasherError('0x%x bytes at 0x%x do not fit into %d kbytes of flash' % (len(data), addr, t.flash // 1024))
+    if t.family == 'stm32v2' and (addr % 8 or len(data) % 8):
+        if addr % 8:
+            raise FlasherError('STM32 G0/G4/L4/WB: the address must be a multiple of 8')
+        data += b'\xff' * (-len(data) % 8)
+    f.cmd('SFAM ' + t.family + t.sfam_args)
+    f.cmd('SHALT reset')
+    if erase:
+        for a, n in t.erase_units(addr, addr + len(data)):
+            print('\rErase 0x%08x' % a, end='', flush=True)
+            f.cmd('SFE %d' % a, timeout=10)
+        print()
+    unit = min(SWD_WRITE_CHUNK, t.write_unit or SWD_WRITE_CHUNK)
+    if t.family == 'stm32u5':
+        if addr % 16:
+            raise FlasherError('STM32 U5: the address must be a multiple of 16')
+        data += b'\xff' * (-len(data) % 16)
+    pos = 0
+    while pos < len(data):
+        a = addr + pos
+        n = min(unit - a % unit, len(data) - pos)
+        chunk = data[pos:pos + n]
+        if chunk.count(0xff) != len(chunk):
+            print('\rWrite 0x%08x' % a, end='', flush=True)
+            f.cmd('SFW %d %s' % (a, chunk.hex()), timeout=20)
+        pos += n
+    print()
+
+
+def swd_verify(f, addr, data):
+    pos = 0
+    while pos < len(data):
+        n = min(CRC_CHUNK, len(data) - pos)
+        print('\rVerify 0x%08x' % (addr + pos), end='', flush=True)
+        crc = int(f.cmd('SFC %d %d' % (addr + pos, n), timeout=20), 16)
+        if crc != zlib.crc32(data[pos:pos + n]):
+            print()
+            return addr + pos
+        pos += n
+    print('\r' + ' ' * 24 + '\r', end='')
+    return None
+
+
 def swd_read(f, addr, size, progress=True):
     out = bytearray()
     while len(out) < size:
@@ -585,7 +708,7 @@ def main():
     ap.add_argument('-r', '--run', action='store_true', help='restart the target CPU at the end')
     ap.add_argument('--swd', action='store_true',
                     help='Arm SWD target (EFR32, nRF52, STM32): SWDIO on the SWS wire, SWCLK on GPIO 0; '
-                         'EFR32 Series 1/2, nRF52, STM32, RP2040 identified; info, rf')
+                         'EFR32 Series 1/2, nRF52, STM32 F0/F1/F3/F4/G0/G4/L4/WB, RP2040; info, rf, wf, es, ea')
     ap.add_argument('--swd-khz', type=auto_int, default=1000, help='SWD clock in kHz (default 1000)')
     ap.add_argument('--wake', action='store_true',
                     help='after activation switch the clocks on and wake the flash from deep power-down '
@@ -666,6 +789,49 @@ def main():
             t = None
             if args.op == 'info':
                 t = swd_info(f)
+            elif args.op == 'wf':
+                with open(args.filename, 'rb') as fh:
+                    data = fh.read()
+                if not data:
+                    raise FlasherError('empty file')
+                data += b'\xff' * (-len(data) % 4)
+                t = swd_info(f, quiet=True)
+                if t.base and args.address < t.base:
+                    args.address += t.base                 # STM32 0x08000000, RP2040 0x10000000
+                print('Target:  %s' % (t.name or 'unknown'))
+                print('Write 0x%08x..0x%08x' % (args.address, args.address + len(data)))
+                swd_write(f, t, args.address, data, erase=not args.no_erase)
+                if not args.no_verify:
+                    bad = swd_verify(f, args.address, data)
+                    if bad is not None:
+                        raise FlasherError('verify failed in the block at 0x%08x' % bad)
+                    print('Verified.')
+            elif args.op in ('es', 'ea'):
+                t = swd_info(f, quiet=True)
+                if t.family is None:
+                    raise FlasherError('erasing needs a recognised chip')
+                if t.rp2040:
+                    if args.op == 'ea':
+                        raise FlasherError('RP2040: give the range with es (the flash size is not known)')
+                    start = args.address - 0x10000000 if args.address >= 0x10000000 else args.address
+                    start -= start % RP_SECTOR
+                    end = args.address + max(args.size, 1) - (0x10000000 if args.address >= 0x10000000 else 0)
+                    end += -end % RP_SECTOR
+                    rp2040_write(f, start, b'\xff' * (end - start))
+                else:
+                    f.cmd('SFAM ' + t.family + t.sfam_args)
+                    f.cmd('SHALT reset')
+                    if args.op == 'ea' and t.family in ('efr32s1', 'nrf52', 'nrf53', 'stm32f1', 'stm32f4', 'stm32v2',
+                                                        'stm32u5', 'samd21', 'samd51'):
+                        print('Mass erase %s...' % t.name)
+                        f.cmd('SFX', timeout=60)
+                    else:
+                        addr = args.address + (t.base if args.address < t.base else 0) if args.op == 'es' else t.base
+                        end = addr + max(args.size, 1) if args.op == 'es' else t.base + t.flash
+                        for a, n in t.erase_units(addr, end):
+                            print('\rErase 0x%08x' % a, end='', flush=True)
+                            f.cmd('SFE %d' % a, timeout=10)
+                        print()
             elif args.op == 'rf':
                 os.makedirs(os.path.dirname(os.path.abspath(args.filename)), exist_ok=True)
                 t1 = time.time()
@@ -686,7 +852,13 @@ def main():
                     fh.write(data)
                 print('Saved %d bytes to %s' % (len(data), args.filename))
             else:
-                raise FlasherError('over SWD (no flash writing yet): info, rf')
+                raise FlasherError('over SWD: info, rf, wf, es, ea')
+            if args.run:
+                if t is not None and t.rp2040:
+                    rp2040_run(f)
+                else:
+                    f.cmd('SRUN')
+                print('Target restarted.')
             print('Done in %.1f s' % (time.time() - t0))
             return
         # always set the speeds: the flasher keeps the last values until it is powered off

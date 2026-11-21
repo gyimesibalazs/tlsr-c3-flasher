@@ -73,14 +73,41 @@ SWD:
 
     python3 tlsr_c3.py -p /dev/ttyACM0 --swd info
     python3 tlsr_c3.py -p /dev/ttyACM0 --swd rf 0 0x40000 backup.bin --twice
+    python3 tlsr_c3.py -p /dev/ttyACM0 --swd wf 0 firmware.bin --run
+    python3 tlsr_c3.py -p /dev/ttyACM0 --swd es 0x3e000 0x2000
+    python3 tlsr_c3.py -p /dev/ttyACM0 --swd ea
 
 `info` reads the IDCODE, the access ports, the CPU type and, for Silicon Labs EFR32 (Series 1 and 2) and
 Nordic nRF52, the device information (part, flash size, page size). `--swd-khz` sets the clock (default 1000).
 
+The flash routines run on the flasher (`SFAM`, `SFE`, `SFW`, `SFX`, `SFC`): the core is stopped at its reset
+vector, the touched pages are erased, the data goes in 512-byte pieces, and the verify compares CRCs computed
+on the flasher. Register maps from the Silicon Labs device headers and Nordic's NVMC description:
+
+| Chip | Flash controller | Page | Mass erase (`ea`) |
+|---|---|---|---|
+| EFR32 Series 1 (MG1, MG12, MG13, MG14) | MSC at 0x400E0000, word by word with WRITEONCE | 2 k (from DEVINFO) | ERASEMAIN0 |
+| EFR32 Series 2 (xG21 … xG29) | MSC at 0x40030000, WDATA stream, WRITEEND; MSC clock bit 16 or 17 in CMU_CLKEN1 per family (none on xG21) | 8 k | page by page |
+| nRF52 | NVMC at 0x4001E000 | 4 k | CTRL-AP ERASEALL (also clears APPROTECT) |
+| nRF5340 application core | NVMC at 0x50039000; a page is erased by writing 0xFFFFFFFF into it | 4 k | CTRL-AP (AP 2) ERASEALL |
+| SAM D2x / L2x / C2x | NVMCTRL at 0x41004000: page buffer, WP; ADDR in half-words | 64 B pages, 256 B rows | DSU chip erase (also clears the security bit) |
+| SAM D5x / E5x | NVMCTRL at 0x41004000: page buffer, WP | 512 B pages, 8 k blocks | DSU chip erase |
+
+| STM32 F0, F1, F3 | FLASH at 0x40022000, half-word programming | 1 k / 2 k | MER |
+| STM32 F4 (F401 … F446, F42x/43x with two banks) | FLASH at 0x40023C00, 32-bit programming (needs 2.7–3.6 V) | 16 k / 64 k / 128 k sectors | MER (+ MER1) |
+| STM32 G0, G4, L4, WB, C0 | FLASH at 0x40022000, double-word programming, second bank from the option bytes | 2 k / 4 k | MER1 (+ MER2) |
+| STM32 L0, L1 | PECR at 0x40022000 / 0x40023C00, word programming; a page is erased by writing a word with ERASE + PROG | 128 / 256 B | page by page |
+| STM32 U5 | non-secure registers (NSCR) at 0x40022000, quad-word programming, two banks | 8 k | MER1 + MER2 (TrustZone off only) |
+| RP2040 | external QSPI flash, written by the boot ROM's own routines run on core 0 | 4 k | – (give the range to `es`) |
+
+STM32 addresses may be given from 0 (taken as 0x08000000), RP2040 ones from 0 (taken as 0x10000000). The
+RP2040 is reached through its multi-drop port (core 0); `info` cannot read the size of its external flash,
+so `rf` needs it given. While its flash is written, core 1 is switched off; `--run` restarts the chip with the
+watchdog. STM32 F7, H7 and the F1 XL-density parts have no flash routine yet. GD32 and CH32 parts that report an STM32F1 device ID are written with the F1 routine.
+
 A debug-locked EFR32 shows only its AAP and cannot be read or written: Series 1 opens with the AAP mass
 erase, Series 2 through the Secure Engine; neither is implemented yet. A read-protected STM32 (RDP) is
 reported by `info`; removing the protection erases the chip and is not implemented either.
-Flash writing over SWD is not done yet.
 Nothing of the SWD part is tested on hardware yet.
 
 UART bridge (c3-usb boards only; on c3-uart boards UART0 is the link to the computer):

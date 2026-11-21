@@ -23,6 +23,7 @@
 #include "driver/uart.h"
 #include "config.h"
 #include "swd.h"
+#include "swdflash.h"
 
 #define FW_NAME "tlsr-c3-flasher"
 #define FW_VERSION "0.15"
@@ -879,7 +880,7 @@ static void bridge_pump() {
 
 static bool swd_check(int r) {
   if (r == SWD_OK) return true;
-  Serial.printf("ERR swd %s\n", swd_ack_name(r));
+  Serial.printf("ERR swd %s\n", swdf_err_name(r));
   return false;
 }
 
@@ -1055,6 +1056,46 @@ static void handle(char *ln) {
     int n = argc > 3 ? parse_hex(argv[3], data_buf, MAX_READ) : -1;
     if (n < 4 || (n & 3) || (a2 & 3)) return err("data: whole words at a word address");
     if (!swd_check(swd_mem_write(a1, a2, data_buf, n))) return;
+    ok();
+  } else if (!strcmp(cmd, "SFAM")) {         // SFAM <family> [p1] [p2] (see swdflash.h)
+    static const struct { const char *name; SwdFlashFamily fam; } fams[] = {
+        {"efr32s1", SWDF_EFR32S1}, {"efr32s2", SWDF_EFR32S2}, {"nrf52", SWDF_NRF52},   {"nrf53", SWDF_NRF53},
+        {"stm32f1", SWDF_STM32F1}, {"stm32f4", SWDF_STM32F4}, {"stm32v2", SWDF_STM32V2}, {"stm32u5", SWDF_STM32U5},
+        {"stm32l0", SWDF_STM32L0}, {"samd21", SWDF_SAMD21},   {"samd51", SWDF_SAMD51}};
+    if (argc < 2) return err("family");
+    bool found = false;
+    for (auto &f : fams) {
+      if (!strcmp(argv[1], f.name)) {
+        swdf_set_family(f.fam, a2, argc > 3 ? strtoul(argv[3], NULL, 0) : 0);
+        found = true;
+      }
+    }
+    if (!found) return err("unknown family");
+    ok();
+  } else if (!strcmp(cmd, "SHALT")) {        // SHALT [reset]: stop the core
+    if (!swd_check(swdf_halt(argc > 1 && !strcmp(argv[1], "reset")))) return;
+    ok();
+  } else if (!strcmp(cmd, "SCALL")) {        // SCALL <pc> <sp> <lr> [r0..r3]: run a function, OK <r0>
+    if (argc < 4) return err("pc sp lr [args]");
+    uint32_t args[4] = {0, 0, 0, 0};
+    int nargs = 0;
+    for (int i = 4; i < argc && nargs < 4; i++) args[nargs++] = strtoul(argv[i], NULL, 0);
+    uint32_t r0 = 0;
+    if (!swd_check(swdf_call(a1, a2, strtoul(argv[3], NULL, 0), args, nargs, 20000, &r0))) return;
+    Serial.printf("OK %08x\n", (unsigned)r0);
+  } else if (!strcmp(cmd, "SRUN")) {         // SRUN: debug off, reset, run
+    if (!swd_check(swdf_run())) return;
+    ok();
+  } else if (!strcmp(cmd, "SFE")) {          // SFE <addr>: erase the flash page at addr
+    if (!swd_check(swdf_erase_page(a1))) return;
+    ok();
+  } else if (!strcmp(cmd, "SFX")) {          // SFX: mass erase (EFR32 Series 1, nRF52)
+    if (!swd_check(swdf_mass_erase())) return;
+    ok();
+  } else if (!strcmp(cmd, "SFW")) {          // SFW <addr> <hex>: program whole words within one page
+    int n = argc > 2 ? parse_hex(argv[2], data_buf, MAX_READ) : -1;
+    if (n < 4 || (n & 3) || (a1 & 3)) return err("data: whole words at a word address");
+    if (!swd_check(swdf_write(a1, data_buf, n))) return;
     ok();
   } else if (!strcmp(cmd, "SFC")) {          // SFC <addr> <len>: CRC-32 of target memory (verify without upload)
     if ((a1 | a2) & 3 || a2 < 4 || a2 > 65536) return err("addr and len: multiples of 4, len <= 65536");
