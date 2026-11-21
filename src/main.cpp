@@ -27,7 +27,7 @@
 #include "spiflash.h"
 
 #define FW_NAME "tlsr-c3-flasher"
-#define FW_VERSION "0.20"
+#define FW_VERSION "0.21"
 
 enum SwsMode { MODE_UART = 0, MODE_RMT = 1 };
 
@@ -1160,7 +1160,10 @@ static void handle(char *ln) {
     if (argc < 6) return err("dst addr len unit skip");
     x_write_cmd(argv[1][0], strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0), strtoul(argv[4], NULL, 0),
                 atoi(argv[5]) != 0);
-  } else if (!strcmp(cmd, "SPI")) {          // SPI [kHz]: the wires to an SPI NOR flash (no power switched)
+  } else if (!strcmp(cmd, "SPI") && argc > 1 && !strcmp(argv[1], "0")) {   // SPI 0: leave, reset released
+    spif_end();
+    ok();
+  } else if (!strcmp(cmd, "SPI")) {          // SPI [kHz]: the wires to an SPI NOR flash, target held in reset
     uint32_t khz = argc > 1 ? a1 : SPI_KHZ_DEFAULT;
     if (khz < 100 || khz > 20000) return err("100..20000 kHz");
     if (!spif_active()) {

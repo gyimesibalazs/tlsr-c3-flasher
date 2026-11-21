@@ -49,7 +49,8 @@
 #define PIN_BOOT 0
 
 // ---- SPI NOR flash, on the wires above: no new pin
-#define PIN_SPI_CS PIN_RST        // chip select = the reset wire
+#define PIN_SPI_CS PIN_JTAG_TMS   // chip select = the JTAG TMS wire (GPIO 20); the reset wire holds the board's
+                                  // own processor in reset meanwhile, so that it keeps off the flash
 #define PIN_SPI_CLK PIN_SWCLK     // clock = the SWCLK wire
 #define PIN_SPI_DI PIN_SWS_TX     // flash DI (MOSI) = the SWS wire, driven through its resistor
 #define PIN_SPI_DO PIN_BRIDGE_TX  // flash DO (MISO) = the UART bridge TX wire, an input here

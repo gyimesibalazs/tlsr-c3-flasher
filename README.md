@@ -62,13 +62,13 @@ bridge. Only one mode is active at a time, so they share the wires. Every wire i
 | GPIO 4 –1 k– GPIO 5 (the SWS wire) | SWS | SWDIO | TMSC | TDI | DI (flash pin 5) | target TX → flasher RX (GPIO 4 is an input) |
 | GPIO 0 | – | SWCLK | TCKC | TCK | CLK (pin 6) | BOOT (`--boot hi` / `lo`, open by default) |
 | GPIO 21 | – | – | – | TDO | DO (pin 2) | flasher TX → target RX |
-| GPIO 20 | – | – | – | TMS | – | – |
-| GPIO 6 | RST | nRESET | nRESET | nRESET | /CS (pin 1) | RESET |
-| GPIO 7 (+ 10, 3, 1) | target power | target power | target power | target power | – (not switched) | target power |
+| GPIO 20 | – | – | – | TMS | /CS (pin 1) | – |
+| GPIO 6 | RST | nRESET | nRESET | nRESET | RESET of the board's processor, held low | RESET |
+| GPIO 7 (+ 10, 3, 1) | target power | target power | target power | target power | target power with `--power` only | target power |
 | GND | GND | GND | GND | GND | GND (pin 4) | GND |
 
 In the SPI mode the flash's /WP (pin 3) and /HOLD (pin 7) must be high (3.3 V) if the board does not pull them
-up, and the board's own processor has to be kept off the bus (in reset). In the UART bridge GPIO 0 is the
+up, and the reset wire holds the board's own processor in reset, so that it keeps off the bus. In the UART bridge GPIO 0 is the
 target's BOOT pin, which is the SWCLK / TCK wire of the other modes. Only boards with the C3's own USB port are
 supported, because GPIO 20 / 21 (UART0) are target wires here.
 
@@ -168,22 +168,24 @@ sequence on TMS, so an SWJ-DP left in SWD mode answers too. A chain without an A
 and `JDR` do raw scans for anything else (RISC-V debug, EJTAG, boundary scan are not built on them yet).
 Tested against a simulated chain (`tests/jtag_sim`), not on hardware yet.
 
-### SPI NOR flash, e.g. a router's (firmware 0.17)
+### SPI NOR flash, e.g. a router's (firmware 0.21)
 
-The 25-series SPI flash of a router, a dongle or any other board, on the flasher's existing wires:
+The 25-series SPI flash of a router, a dongle or any other board:
 
 | Flash pin | Flasher wire |
 |---|---|
-| /CS (1) | reset wire (GPIO 6) |
+| /CS (1) | GPIO 20 (the JTAG TMS wire) |
 | DO (2) | UART bridge TX wire (GPIO 21) |
 | DI (5) | SWS wire (GPIO 4 drives it through the 1 k resistor) |
 | CLK (6) | SWCLK wire (GPIO 0) |
 | GND (4) | GND |
 | /WP (3), /HOLD (7) | to 3.3 V if the board does not pull them up |
+| – | reset wire (GPIO 6) to the RESET of the board's processor, if there is one |
 
     python3 tlsr_c3.py --spi info
     python3 tlsr_c3.py --spi rf 0 0 backup.bin --twice        # size 0 = the whole chip
     python3 tlsr_c3.py --spi wf 0x50000 firmware.bin --unprotect
+    python3 tlsr_c3.py --spi --power info                     # a flash out of circuit, powered by the flasher
 
 The size and the erase unit come from the chip's SFDP table (the id byte when it has none); chips over
 16 Mbytes are used with the 4-byte opcodes. `wf` works erase unit by erase unit: a unit whose CRC already
@@ -193,10 +195,13 @@ computed on the flasher (CRC), and `wf` verifies the same way. Block protection 
 `info`; `--unprotect` clears it and keeps the quad-enable bit. Status registers 2 / 3 are only read on
 Winbond and GigaDevice chips: on Macronix and ISSI the same command (0x35) switches the chip to QPI.
 
-In circuit, the board's own processor drives the same pins: keep it in reset (or its flash pins high
-impedance) while the flasher works, and power the board from its own supply. The flasher does not switch
-any power in SPI mode. Clock 4 MHz by default (`--spi-khz`, the DI wire goes through 1 k); the read and
-write speeds are printed (binary streams, see the host protocol). Not tested on hardware yet.
+In circuit, the board's own processor drives the same pins. While the SPI mode is on, the reset wire holds it
+in reset (open drain, released at the end, also after an error or Ctrl-C), so that its pins let go of the
+flash. Without `--power` the board runs from its own supply; that is the way for a router, whose current the
+power pins cannot give, and which would be powered backwards through the flash otherwise. `--power` switches
+the power pins on after the reset is down and off at the end: for a flash out of circuit (adapter, socket) or
+a small module. Clock 4 MHz by default (`--spi-khz`, the DI wire goes through 1 k); the read and write speeds
+are printed (binary streams, see the host protocol). Not tested on hardware yet.
 
 UART bridge:
 
@@ -344,7 +349,7 @@ JTAG: `JTAG [khz]`, `JS` (chain scan: `OK <IR bits> <idcode> ...`, TDO side firs
 `JSEL pre_ir post_ir pre_dr post_dr` (DAP position), `JC` (JTAG-DP connect, `OK <idcode>`), `JRST`,
 `JIR bits hex` / `JDR bits hex` (raw scans, LSB first, answer the captured bits).
 
-SPI flash: `SPI [khz]`, `PT hexout [nin]` (raw transaction), `PJ` (JEDEC id), `PA 3|4` (address width),
+SPI flash: `SPI [khz]` (reset held low), `SPI 0` (leave, reset released), `PT hexout [nin]` (raw transaction), `PJ` (JEDEC id), `PA 3|4` (address width),
 `PB addr len` (base64), `PC addr len` (CRC-32), `PE addr [0x20|0x52|0xD8]`, `PX` (chip erase),
 `PW addr hex` (within one 256-byte page), `PS` (status 1).
 

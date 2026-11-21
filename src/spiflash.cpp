@@ -18,7 +18,9 @@ bool spif_addr4_on() { return addr4; }
 void spif_begin(uint32_t khz) {
   hz = khz * 1000;
   if (on) return;
+  digitalWrite(PIN_RST, LOW);                // the board's processor in reset: its flash pins let go
   pinMode(PIN_SWS_RX, INPUT);                // the direct side of the SWS wire only listens
+  gpio_set_level((gpio_num_t)PIN_SPI_CS, 1); // level first: no select pulse when it becomes an output
   pinMode(PIN_SPI_CS, OUTPUT);
   digitalWrite(PIN_SPI_CS, HIGH);
   spi.begin(PIN_SPI_CLK, PIN_SPI_DO, PIN_SPI_DI, -1);
@@ -33,10 +35,8 @@ void spif_end() {
   pinMode(PIN_SPI_CLK, INPUT);
   pinMode(PIN_SPI_DI, INPUT);
   pinMode(PIN_SPI_DO, INPUT);
-  // the CS wire is the reset wire: back to open drain, released
-  gpio_set_level((gpio_num_t)PIN_SPI_CS, 1);
-  pinMode(PIN_SPI_CS, OUTPUT_OPEN_DRAIN | PULLUP);
-  digitalWrite(PIN_SPI_CS, HIGH);
+  pinMode(PIN_SPI_CS, INPUT);
+  digitalWrite(PIN_RST, HIGH);               // reset released (open drain)
 }
 
 void spif_xfer(const uint8_t *out, int nout, uint8_t *in, int nin) {

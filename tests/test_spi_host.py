@@ -6,6 +6,7 @@ class FakeSpi:
     def __init__(self, size=16 << 20, sr1=0x1C, sr2=0x02, jedec=b'\xef\x40\x18'):
         self.mem = bytearray(b'\xff' * size); self.size = size
         self.sr1, self.sr2, self.jedec = sr1, sr2, jedec; self.wel = False; self.log = []
+        self.ser = types.SimpleNamespace(reset_input_buffer=lambda: None); self.rxbuf = b''; self.power = 0
         bfpt = [0] * 16
         bfpt[0] = 0xFFF920E5; bfpt[1] = size * 8 - 1
         bfpt[7] = 0x520F200C; bfpt[8] = 0x0000D810
@@ -19,11 +20,13 @@ class FakeSpi:
         assert dst == 'P'; self.log.append('XW')
         if self.protected(): return
         for i, b in enumerate(data): self.mem[addr + i] &= b
+    def stop(self): self.log.append('STOP')
     def protected(self): return self.sr1 & 0x3C or self.sr2 & 0x40
     def cmd(self, text, timeout=5):
         a = text.split(); c = a[0]; self.log.append(c)
         n = lambda i: int(a[i], 0)
-        if c == 'SPI': return '4000'
+        if c == 'SPI': return '' if a[1:] == ['0'] else '4000'
+        if c == 'PWR': self.power = a[1]; return ''
         if c == 'PJ': return self.jedec.hex()
         if c == 'PA': return ''
         if c == 'PS': return '%02x' % self.sr1
@@ -63,7 +66,7 @@ os.chdir(tempfile.mkdtemp())          # img.bin and out/ go to a scratch folder
 
 
 def args(**k):
-    d = dict(spi_khz=4000, op='info', unprotect=False, address=0, size=0, filename='', twice=False,
+    d = dict(spi_khz=4000, op='info', unprotect=False, power=False, address=0, size=0, filename='', twice=False,
              no_erase=False, no_verify=False); d.update(k); return types.SimpleNamespace(**d)
 
 f = FakeSpi(); T.spi_main(f, args())
@@ -83,4 +86,12 @@ T.spi_main(f, args(op='es', address=0x1000, size=0x2000)); assert f.mem[0x1000:0
 T.spi_main(f, args(op='rf', address=0x3000, size=0x1000, filename='out/r.bin', twice=True))
 assert open('out/r.bin','rb').read() == bytes(f.mem[0x3000:0x4000])
 big = FakeSpi(size=32 << 20, sr1=0, jedec=b'\xc2\x20\x19'); T.spi_main(big, args())
+# --power: on before the work, off and released at the end, also when the work fails
+f = FakeSpi(); f.log.clear()
+T.spi_main(f, args(power=True))
+assert f.log[:2] == ['SPI', 'PWR'] and f.log[-3:] == ['PWR', 'PWR', 'SPI'] and f.power == 'z', f.log
+f = FakeSpi(jedec=b'\x00\x00\x00')
+try: T.spi_main(f, args(power=True)); print('FAIL no error')
+except T.FlasherError: pass
+assert f.power == 'z' and f.log[-1] == 'SPI', f.log
 print('ALL OK')

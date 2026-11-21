@@ -861,7 +861,8 @@ def swd_read(f, addr, size, progress=True):
     return f.stream_read('S', addr, size, progress=progress)
 
 
-# ---- SPI NOR flash (25-series) on the flasher's wires: CS = reset, CLK = SWCLK, DI = SWS, DO = GPIO 21
+# ---- SPI NOR flash (25-series) on the flasher's wires: CS = GPIO 20, CLK = SWCLK, DI = SWS, DO = GPIO 21,
+#      the reset wire holds the board's processor in reset
 SPI_VENDORS = {0xEF: 'Winbond', 0xC8: 'GigaDevice', 0xC2: 'Macronix', 0x20: 'Micron / XMC', 0x1C: 'EON',
                0xBF: 'SST / Microchip', 0x9D: 'ISSI', 0x68: 'Boya', 0x5E: 'Zbit', 0x85: 'Puya', 0x0B: 'XTX',
                0xA1: 'Fudan', 0x01: 'Spansion / Cypress / Infineon', 0x1F: 'Adesto / Atmel / Renesas', 0xC4: 'GT',
@@ -1024,7 +1025,32 @@ def spi_verify(f, addr, data):
 
 
 def spi_main(f, args):
-    print('SPI:     %s kHz' % f.cmd('SPI %d' % args.spi_khz))
+    """SPI mode: the board's processor is held in reset meanwhile; with --power the flasher also powers the
+    board (after the reset is down) and switches it off at the end."""
+    print('SPI:     %s kHz, target held in reset' % f.cmd('SPI %d' % args.spi_khz))
+    try:
+        if args.power:
+            f.cmd('PWR 1')
+            time.sleep(0.1)                   # the flash needs a moment after power-up
+            print('Power:   on')
+        spi_ops(f, args)
+    finally:
+        # also after Ctrl-C or an error: stop a stream that may still run, then power off and release
+        f.stop()
+        time.sleep(0.3)
+        f.ser.reset_input_buffer()
+        f.rxbuf = b''
+        try:
+            if args.power:
+                f.cmd('PWR 0')
+                time.sleep(0.2)
+                f.cmd('PWR z')
+            f.cmd('SPI 0')
+        except FlasherError:
+            pass
+
+
+def spi_ops(f, args):
     t = spi_info(f, quiet=args.op != 'info')
     if args.op == 'info':
         return
@@ -1105,9 +1131,12 @@ def main():
                     help='TI CC13xx / CC26xx over two-wire cJTAG (TMSC on the SWS wire, TCKC on GPIO 0) '
                          'instead of SWD: info, rf, wf, es, ea')
     ap.add_argument('--spi', action='store_true',
-                    help='SPI NOR flash (25-series): CS on the reset wire, CLK on GPIO 0, DI on the '
+                    help='SPI NOR flash (25-series): CS on GPIO 20, CLK on GPIO 0, DI on the '
                          'SWS wire, DO on GPIO 21; info, rf (size 0 = to the end), wf, es, ea')
     ap.add_argument('--spi-khz', type=auto_int, default=4000, help='SPI clock in kHz (default 4000)')
+    ap.add_argument('--power', action='store_true',
+                    help='SPI flash: power the board from the power pins (only for a flash out of circuit or a small '
+                         'module, not for a router), switched off at the end')
     ap.add_argument('--unprotect', action='store_true',
                     help='SPI flash: clear the block protection bits before wf / es / ea')
     ap.add_argument('--wake', action='store_true',
@@ -1170,8 +1199,9 @@ def main():
         if fw < (0, 18):
             raise FlasherError('this script needs flasher firmware 0.18 or newer on the C3 (binary streams)')
         if args.spi:
-            if fw < (0, 17):
-                raise FlasherError('SPI flash needs flasher firmware 0.17 or newer on the C3')
+            if fw < (0, 21):
+                raise FlasherError('SPI flash needs flasher firmware 0.21 or newer on the C3 (chip select moved '
+                                   'to GPIO 20, the reset wire holds the board in reset)')
             spi_main(f, args)
             print('Done in %.1f s' % (time.time() - t0))
             return

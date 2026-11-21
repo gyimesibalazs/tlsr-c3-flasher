@@ -1,10 +1,11 @@
-// SPI NOR flash (25-series) on the flasher's existing wires: CS = reset wire, CLK = SWCLK wire,
-// DI = SWS wire (driven through its resistor), DO = UART bridge TX wire (GPIO 21).
+// SPI NOR flash (25-series) on the flasher's wires: CS = JTAG TMS wire (GPIO 20), CLK = SWCLK wire,
+// DI = SWS wire (driven through its resistor), DO = UART bridge TX wire (GPIO 21). The reset wire holds the
+// board's own processor in reset while the mode is on.
 #pragma once
 #include <stdint.h>
 
 void spif_begin(uint32_t khz);              // pins to SPI, CS high
-void spif_end();                            // every pin back to its idle state (inputs, reset wire released)
+void spif_end();                            // every pin back to its idle state (inputs, reset released)
 bool spif_active();
 uint32_t spif_khz();
 
