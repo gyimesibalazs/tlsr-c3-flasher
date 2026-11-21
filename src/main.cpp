@@ -26,7 +26,7 @@
 #include "swdflash.h"
 
 #define FW_NAME "tlsr-c3-flasher"
-#define FW_VERSION "0.15"
+#define FW_VERSION "0.16"
 
 enum SwsMode { MODE_UART = 0, MODE_RMT = 1 };
 
@@ -1018,8 +1018,8 @@ static void handle(char *ln) {
     if (a1 < 10 || a1 > 4000) return err("10..4000 kHz");
     swd_set_khz(a1);
     Serial.printf("OK %u\n", (unsigned)swd_khz());
-  } else if (!swd_on && cmd[0] == 'S' && cmd[1] && strchr("CDAMFHR", cmd[1]) && strcmp(cmd, "SELFTEST") &&
-             strcmp(cmd, "STAT") && strcmp(cmd, "SRST")) {
+  } else if (!swd_on && ((cmd[0] == 'S' && cmd[1] && strchr("CDAMFHR", cmd[1]) && strcmp(cmd, "SELFTEST") &&
+                           strcmp(cmd, "STAT") && strcmp(cmd, "SRST")) || !strcmp(cmd, "TC"))) {
     err("not in SWD mode (send SWD first)");
   } else if (!strcmp(cmd, "SC")) {           // SC [reset | md <targetsel>]: connect, IDCODE, debug power-up
     if (argc > 1 && !strcmp(argv[1], "reset")) digitalWrite(PIN_RST, LOW);
@@ -1029,6 +1029,15 @@ static void handle(char *ln) {
     if (r == SWD_OK) r = swd_power_up();
     if (!swd_check(r)) return;
     Serial.printf("OK %08x\n", (unsigned)id);
+  } else if (!strcmp(cmd, "TC")) {           // TC: cJTAG (OScan1) through a TI ICEPick, then JTAG-DP power-up
+    uint32_t icepick = 0, dap = 0;
+    int r = ti_cjtag_connect(&icepick, &dap);
+    if (r == SWD_OK) r = swd_power_up();
+    if (r != SWD_OK) {
+      Serial.printf("ERR cjtag %s (ICEPick id %08x)\n", swd_ack_name(r), (unsigned)icepick);
+      return;
+    }
+    Serial.printf("OK %08x %08x\n", (unsigned)icepick, (unsigned)dap);
   } else if (!strcmp(cmd, "SRST")) {         // SRST 0|1: release or hold the reset wire
     digitalWrite(PIN_RST, a1 ? HIGH : LOW);
     ok();

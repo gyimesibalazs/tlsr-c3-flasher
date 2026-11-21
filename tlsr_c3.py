@@ -267,7 +267,7 @@ def swd_word(f, addr, ap=0):
 
 class SwdTarget:
     def __init__(self, name='', flash=None, page=None, family=None, base=0, sfam_args='', sectors=None, rp2040=False,
-                 write_unit=None, erase_unit=None):
+                 write_unit=None, erase_unit=None, ti=False):
         self.name, self.flash, self.page, self.family = name, flash, page, family
         self.write_unit = write_unit     # one SFW may not cross this (the SAM page buffer); None = any
         self.erase_unit = erase_unit or page
@@ -275,6 +275,7 @@ class SwdTarget:
         self.sfam_args = sfam_args       # extra SFAM arguments (STM32 page size, second bank)
         self.sectors = sectors           # erase units as (start, size), for chips with uneven sectors
         self.rp2040 = rp2040
+        self.ti = ti                     # TI CC13xx / CC26xx: written by the ROM routines, over cJTAG
 
     def erase_units(self, start, end):
         """(address, size) of every erase unit that overlaps start..end-1."""
@@ -495,7 +496,12 @@ RP2040_CHIP_ID = 0x40000000
 
 
 def swd_connect_any(f):
-    """Plain SWD first, then the RP2040's multi-drop port. Returns (idcode, multidrop)."""
+    """Plain SWD first, then the RP2040's multi-drop port. Returns (idcode, multidrop).
+    With f.cjtag: cJTAG through the TI ICEPick router instead, idcode is then the JTAG-DP's."""
+    if getattr(f, 'cjtag', False):
+        icepick, dap = (int(x, 16) for x in f.cmd('TC').split())
+        f.icepick = icepick
+        return dap, False
     try:
         return int(f.cmd('SC'), 16), False
     except FlasherError as first:
@@ -509,6 +515,8 @@ def swd_info(f, quiet=False):
     """Identify an Arm SWD target without changing it. family: the SFAM name for flash writing, or None."""
     say = (lambda *a: None) if quiet else print
     idcode, multidrop = swd_connect_any(f)
+    if getattr(f, 'cjtag', False):
+        say('ICEPick: 0x%08x' % f.icepick)
     say('IDCODE:  0x%08x (designer 0x%03x, part 0x%04x, version %d)' % (
         idcode, (idcode >> 1) & 0x7ff, (idcode >> 12) & 0xffff, idcode >> 28))
     idrs = []
@@ -534,6 +542,10 @@ def swd_info(f, quiet=False):
             t = SwdTarget('RP2040 (revision %d)' % (chip >> 28), None, 4096, 'rp2040', 0x10000000, rp2040=True)
             say('Chip:    %s, external QSPI flash at 0x10000000 (size not read: give the size to rf)' % t.name)
             return t
+    if getattr(f, 'cjtag', False):
+        t = ti_info(f, say)
+        if t is not None:
+            return t
     # each probe reads addresses that do not exist on other chips: a bus fault there just means "not this one"
     for probe in (efr32_info, nrf_info, stm32_info, samd_info):
         try:
@@ -544,6 +556,77 @@ def swd_info(f, quiet=False):
             return t
     say('Chip:    not recognised; reading works, writing needs a known chip')
     return SwdTarget()
+
+
+# ---- TI CC13xx / CC26xx (cJTAG): identified from FCFG1, written by the boot ROM's flash routines (HAPI)
+TI_ICEPICK = {0x0b99a02f: ('CC26x0', 0x1000), 0x0b9bd02f: ('CC26x1', 0x1000), 0x0b9be02f: ('CC13x0', 0x1000),
+              0x0bb4102f: ('CC26x2 / CC13x2', 0x2000)}
+TI_FCFG1_ICEPICK_ID, TI_FCFG1_USER_ID, TI_FLASH_SIZE = 0x50001318, 0x50001294, 0x4003002C
+TI_HAPI = 0x10000048                    # ROM table: [3] sector erase (addr), [5] program (buf, addr, count)
+TI_BKPT, TI_BUF, TI_STACK = 0x20000000, 0x20000100, 0x20003000
+TI_DAP_ENABLE = 0xC5                    # CCFG_TAP_DAP_0.CPU_DAP_ENABLE: any other value locks the debug port
+
+
+def ti_info(f, say):
+    ice = swd_word(f, TI_FCFG1_ICEPICK_ID)
+    known = TI_ICEPICK.get(ice & 0x0fffffff)
+    if known is None:
+        say('Chip:    TI, ICEPick id 0x%08x in FCFG1 is not known' % ice)
+        return None
+    name, sector = known
+    if ice & 0x0fffffff == 0x0bb4102f:
+        name = 'CC13x2' if swd_word(f, TI_FCFG1_USER_ID) & 0x00800000 else 'CC26x2'
+    elif ice & 0x0fffffff == 0x0b99a02f and swd_word(f, TI_FCFG1_USER_ID) & 0x00800000:
+        name = 'CC13x0'
+    size = (swd_word(f, TI_FLASH_SIZE) & 0xff) * sector
+    t = SwdTarget('%s (revision %d)' % (name, ice >> 28), size, sector, 'ti', ti=True)
+    say('Chip:    %s, %d k flash in %d k sectors, the last one holds the CCFG' % (t.name, size // 1024, sector // 1024))
+    return t
+
+
+def ti_ccfg_check(t, last_sector):
+    """The CCFG sits at the end of the last sector: refuse an image that would lock the debug port."""
+    off = t.page - 0x1C + 2             # CCFG_TAP_DAP_0, bits 23:16
+    if last_sector[off] != TI_DAP_ENABLE:
+        raise FlasherError('the CCFG in this image disables the debug port (CPU_DAP_ENABLE 0x%02x, not 0x%02x): '
+                           'the chip could not be written over cJTAG again' % (last_sector[off], TI_DAP_ENABLE))
+
+
+def ti_write(f, t, addr, data):
+    """Whole sectors through the ROM: what the image does not cover is read back first and kept."""
+    first = addr - addr % t.page
+    end = addr + len(data)
+    end += -end % t.page
+    if end > t.flash:
+        raise FlasherError('0x%x bytes at 0x%x do not fit into %d kbytes of flash' % (len(data), addr, t.flash // 1024))
+    old = bytearray(swd_read(f, first, end - first, progress=False))
+    old[addr - first:addr - first + len(data)] = data
+    if end == t.flash:
+        ti_ccfg_check(t, old[-t.page:])
+    f.cmd('SHALT')                       # no reset: a system reset drops the cJTAG connection
+    f.cmd('SMW 0 %d %s' % (TI_BKPT, (0xBE00BE00).to_bytes(4, 'little').hex()))   # bkpt; bkpt
+    erase = swd_word(f, TI_HAPI + 3 * 4)
+    program = swd_word(f, TI_HAPI + 5 * 4)
+
+    def call(fn, *args):
+        r = int(f.cmd('SCALL %d %d %d %s' % (fn, TI_STACK, TI_BKPT, ' '.join(str(a) for a in args)), timeout=25), 16)
+        if r:
+            raise FlasherError('ROM flash routine failed with status 0x%x at 0x%08x' % (r, args[-2] if len(args) > 1
+                                                                                        else args[0]))
+    for a in range(first, end, t.page):
+        sector = bytes(old[a - first:a - first + t.page])
+        print('\rErase/write 0x%08x' % a, end='', flush=True)
+        call(erase, a)
+        if sector.count(0xff) == len(sector):
+            continue
+        for k in range(0, t.page, 0x1000):            # 4 k through the RAM buffer at a time
+            part = sector[k:k + 0x1000]
+            if part.count(0xff) == len(part):
+                continue
+            for j in range(0, len(part), SWD_WRITE_CHUNK):
+                f.cmd('SMW 0 %d %s' % (TI_BUF + j, part[j:j + SWD_WRITE_CHUNK].hex()))
+            call(program, TI_BUF, a + k, len(part))
+    print()
 
 
 SWD_WRITE_CHUNK = 512          # bytes per SFW line: the flasher's command line holds about 1400 characters
@@ -618,6 +701,9 @@ def swd_write(f, t, addr, data, erase=True):
         old = bytearray(swd_read(f, 0x10000000 + first, end - first, progress=False))
         old[offset - first:offset - first + len(data)] = data
         rp2040_write(f, first, bytes(old))
+        return
+    if t.ti:
+        ti_write(f, t, addr, data)
         return
     if t.family is None:
         raise FlasherError('writing needs a recognised chip (EFR32 Series 1 / 2, nRF52)')
@@ -710,6 +796,9 @@ def main():
                     help='Arm SWD target (EFR32, nRF52, STM32): SWDIO on the SWS wire, SWCLK on GPIO 0; '
                          'EFR32 Series 1/2, nRF52, STM32 F0/F1/F3/F4/G0/G4/L4/WB, RP2040; info, rf, wf, es, ea')
     ap.add_argument('--swd-khz', type=auto_int, default=1000, help='SWD clock in kHz (default 1000)')
+    ap.add_argument('--cjtag', action='store_true',
+                    help='TI CC13xx / CC26xx over two-wire cJTAG (TMSC on the SWS wire, TCKC on GPIO 0) '
+                         'instead of SWD: info, rf, wf, es, ea')
     ap.add_argument('--wake', action='store_true',
                     help='after activation switch the clocks on and wake the flash from deep power-down '
                          '(for a flash that reads all zeros / JEDEC 000000)')
@@ -768,6 +857,11 @@ def main():
             fw = (0, 0)
         if fw < (0, 11):
             raise FlasherError('this script needs flasher firmware 0.11 or newer on the C3')
+        if args.cjtag:
+            args.swd = True
+            f.cjtag = True
+            if fw < (0, 16):
+                raise FlasherError('cJTAG needs flasher firmware 0.16 or newer on the C3')
         if args.op in ('bridge', 'power-off') or args.swd:
             if fw < (0, 15):
                 raise FlasherError('this needs flasher firmware 0.15 or newer on the C3')
@@ -818,6 +912,24 @@ def main():
                     end = args.address + max(args.size, 1) - (0x10000000 if args.address >= 0x10000000 else 0)
                     end += -end % RP_SECTOR
                     rp2040_write(f, start, b'\xff' * (end - start))
+                elif t.ti:
+                    # the last sector holds the CCFG (debug port enable): ea keeps it, es keeps its contents
+                    if args.op == 'ea':
+                        print('Erasing everything but the last sector (CCFG)...')
+                        start, end = 0, t.flash - t.page
+                    else:
+                        start, end = args.address, args.address + max(args.size, 1)
+                        start -= start % t.page
+                        end += -end % t.page
+                    last = None
+                    if end > t.flash - t.page:
+                        last = bytearray(swd_read(f, t.flash - t.page, t.page, progress=False))
+                        keep = 0x58                 # the CCFG at the end of the sector stays
+                        last[:-keep] = b'\xff' * (t.page - keep)
+                    if start < min(end, t.flash - t.page):
+                        ti_write(f, t, start, b'\xff' * (min(end, t.flash - t.page) - start))
+                    if last is not None:
+                        ti_write(f, t, t.flash - t.page, bytes(last))
                 else:
                     f.cmd('SFAM ' + t.family + t.sfam_args)
                     f.cmd('SHALT reset')
@@ -856,6 +968,11 @@ def main():
             if args.run:
                 if t is not None and t.rp2040:
                     rp2040_run(f)
+                elif t is not None and t.ti:
+                    try:
+                        f.cmd('SRUN')
+                    except FlasherError:
+                        pass                    # the system reset drops the cJTAG link before the answer
                 else:
                     f.cmd('SRUN')
                 print('Target restarted.')

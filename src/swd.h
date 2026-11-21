@@ -32,4 +32,9 @@ int swd_mem_write16(uint8_t ap, uint32_t addr, uint16_t v);
 int swd_core_reg_read(uint8_t reg, uint32_t *v);
 int swd_core_reg_write(uint8_t reg, uint32_t v);
 
+// cJTAG (IEEE 1149.7, two wires: TCKC = SWCLK wire, TMSC = SWDIO wire, OScan1 format) to a TI ICEPick-C
+// router (CC13xx / CC26xx): brings the TAP online, enables the Cortex-M debug TAP behind the router and
+// switches the memory / core functions above to its JTAG-DP. Returns the ICEPick IDCODE and the DAP IDCODE.
+int ti_cjtag_connect(uint32_t *icepick_id, uint32_t *dap_id);
+
 const char *swd_ack_name(int ack);

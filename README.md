@@ -110,6 +110,31 @@ erase, Series 2 through the Secure Engine; neither is implemented yet. A read-pr
 reported by `info`; removing the protection erases the chip and is not implemented either.
 Nothing of the SWD part is tested on hardware yet.
 
+### TI CC13xx / CC26xx over two-wire cJTAG (firmware 0.16)
+
+These chips have no SWD: their debug port is IEEE 1149.7 cJTAG on two pins (TMSC, TCKC) behind TI's ICEPick
+router. The same two wires are used as for SWD: TMSC on the SWS wire (GPIO 4 – 1 k – GPIO 5), TCKC on
+GPIO 0, plus GND and, if wanted, the reset pin.
+
+    python3 tlsr_c3.py --cjtag info
+    python3 tlsr_c3.py --cjtag rf 0 0x58000 backup.bin
+    python3 tlsr_c3.py --cjtag wf 0 firmware.bin --run
+
+The flasher brings the TAP online in the OScan1 format (escape sequences and activation code as in
+OpenOCD's `ftdi.c`), enables the Cortex-M debug TAP behind the ICEPick (the router writes of OpenOCD's
+`icepick_c_tapenable`, port 0) and then uses that TAP's JTAG-DP with the same memory / core layer as SWD.
+The chip is identified from FCFG1 (ICEPick id, user id) and the flash size register: CC26x0, CC26x1, CC13x0
+(4 k sectors), CC26x2 / CC13x2 (8 k sectors). Writing runs the boot ROM's own routines (HAPI table at
+0x10000048: sector erase, program) on the halted core, sector by sector; what an image does not cover
+inside a sector is read first and written back. The core is halted without a reset, because a system reset
+drops the cJTAG link.
+
+The last sector ends with the CCFG, which among others enables the debug port (`CCFG_TAP_DAP_0`,
+`CPU_DAP_ENABLE` = 0xC5). An image whose CCFG would switch it off is refused, `ea` erases everything but that
+sector, and `es` over the last sector keeps the CCFG. CC13x4 / CC26x4 (Cortex-M33, different ROM) and
+CC2538 are not handled. Not tested on hardware: the OScan1 timing, the ICEPick sequence on these chips and
+the ROM calls are all from the sources above.
+
 UART bridge (c3-usb boards only; on c3-uart boards UART0 is the link to the computer):
 
     python3 tlsr_c3.py -p /dev/ttyACM0 bridge 115200 --boot hi     # restarts the target with BOOT high
@@ -245,6 +270,10 @@ One text line per command, answer `OK [payload]` or `ERR reason`; numbers decima
 `A ms` (activate), `G addr len` (read registers / RAM), `S addr hex` (write registers / RAM),
 `FJ`, `FS`, `FR addr len` (hex), `FB addr len` (base64, `*` = all 0xff), `FC addr len` (CRC-32 of the range),
 `FU`, `FE addr`, `FA`, `FW addr hex`, `RUN`.
+
+SWD / cJTAG: `SWD`, `SWCLK khz`, `SC [reset|md sel]`, `TC` (cJTAG + ICEPick, `OK <icepick id> <dap id>`),
+`SRST 0|1`, `SDR`/`SDW`/`SAR`/`SAW` (DP / AP registers), `SM`/`SMW` (memory), `SFAM name [p1 p2]`,
+`SHALT [reset]`, `SRUN`, `SCALL pc sp lr [r0..r3]`, `SFE addr`, `SFX`, `SFW addr hex`, `SFC addr len`.
 
 The USB link is the slow part of a read (about 45 kbytes/s), so the host reads with `FB`, and the second
 pass of `rf --twice` and the verify after `wf` only compare CRCs (`FC`).

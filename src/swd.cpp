@@ -139,7 +139,11 @@ static int transfer(bool ap, bool read, uint8_t addr, uint32_t *data) {
   return SWD_NOACK;
 }
 
+static bool use_jtag = false;               // memory / core access goes through the JTAG-DP (cJTAG)
+static int jtag_xfer(bool ap, bool read, uint8_t addr, uint32_t *data);
+
 static int xfer(bool ap, bool read, uint8_t addr, uint32_t *data) {
+  if (use_jtag) return jtag_xfer(ap, read, addr, data);
   int r = SWD_WAIT;
   for (int i = 0; i < WAIT_RETRIES && r == SWD_WAIT; i++) r = transfer(ap, read, addr, data);
   if (r == SWD_FAULT) {
@@ -185,6 +189,7 @@ int swd_ap_write(uint8_t ap, uint8_t addr, uint32_t v) {
 
 int swd_connect(uint32_t *idcode) {
   sel_ap = sel_bank = -1;
+  use_jtag = false;
   // SWJ-DP: line reset, JTAG-to-SWD switch, line reset, idle
   line_reset();
   write_bits(0xe79e, 16);
@@ -205,6 +210,7 @@ int swd_connect(uint32_t *idcode) {
 
 int swd_connect_multidrop(uint32_t targetsel, uint32_t *idcode) {
   sel_ap = sel_bank = -1;
+  use_jtag = false;
   dio_drive();
   for (int i = 0; i < 8; i++) write_bit(1);
   static const uint32_t alert[4] = {0x6209f392, 0x86852d95, 0xe3ddafe9, 0x19bc0ea2};
@@ -248,6 +254,19 @@ int swd_mem_read(uint8_t ap, uint32_t addr, uint8_t *out, int len) {
   int r = swd_ap_write(ap, 0x00, CSW_WORD_INC);
   if (r != SWD_OK) return r;
   int words = len / 4;
+  if (use_jtag) {                            // the JTAG-DP returns every read itself: no pipelining here
+    for (int i = 0; i < words; i++) {
+      uint32_t a = addr + 4 * i, v;
+      if (i == 0 || (a & 0x3ff) == 0) {
+        r = swd_ap_write(ap, 0x04, a);
+        if (r != SWD_OK) return r;
+      }
+      r = swd_ap_read(ap, 0x0c, &v);
+      if (r != SWD_OK) return r;
+      memcpy(out + 4 * i, &v, 4);
+    }
+    return SWD_OK;
+  }
   int i = 0;
   while (i < words) {
     // the address auto-increment wraps at 1 kbyte boundaries: set TAR for every such block
@@ -332,6 +351,181 @@ int swd_core_reg_read(uint8_t reg, uint32_t *v) {
   r = reg_ready();
   if (r != SWD_OK) return r;
   return swd_mem_read(0, DCRDR, (uint8_t *)v, 4);
+}
+
+// ================================================================ cJTAG (OScan1) and JTAG-DP
+// Activation as in OpenOCD's ftdi.c (cjtag_reset_online_activate); the TI ICEPick-C router sequence as in
+// OpenOCD's tcl/target/ti/icepick.cfg (icepick_c_tapenable, port 0) used by its cc26x0 / cc26x2 configurations.
+
+enum JState { J_RTI, J_PAUSE };
+static JState jstate = J_RTI;
+static int cur_ir = -1;                      // DAP instruction loaded (-1: unknown)
+static const int ICEPICK_IR_LEN = 6, DAP_IR_LEN = 4;
+static const uint8_t IR_ABORT = 0x8, IR_DPACC = 0xA, IR_APACC = 0xB, IR_IDCODE = 0xE;
+
+// one OScan1 bit cell: the inverted TDI, then TMS, then TDO driven by the target
+static uint32_t oscan1(uint32_t tdi, uint32_t tms) {
+  dio_drive();
+  write_bit(!tdi);
+  write_bit(tms);
+  dio_release();
+  return read_bit();                         // the next cell drives TMSC again before its falling edge
+}
+
+// TMSC edges while TCKC is high: 8 = reset, 6 = select (IEEE 1149.7 escape sequences)
+static void escape(int edges) {
+  dio_drive();
+  dio_set(0);
+  clk_lo();
+  dly();
+  clk_hi();
+  dly();
+  for (int i = 0; i < edges; i++) {
+    dio_set(!(i & 1));
+    dly();
+    dly();
+  }
+  dio_set(0);
+  clk_lo();
+  dly();
+}
+
+static void goto_shift(bool ir) {
+  if (jstate == J_PAUSE) {                   // Pause -> Exit2 -> Update
+    oscan1(0, 1);
+    oscan1(0, 1);
+  }
+  oscan1(0, 1);                              // Select-DR
+  if (ir) oscan1(0, 1);                      // Select-IR
+  oscan1(0, 0);                              // Capture
+  oscan1(0, 0);                              // Shift
+}
+
+// shift n bits (LSB first); leaves Shift through Exit1 into Pause or (Update) Run-Test/Idle
+static uint64_t shift(uint64_t out, int n, bool to_pause) {
+  uint64_t in = 0;
+  for (int i = 0; i < n; i++) in |= (uint64_t)oscan1((out >> i) & 1, i == n - 1) << i;
+  if (to_pause) {
+    oscan1(0, 0);                            // Exit1 -> Pause
+    jstate = J_PAUSE;
+  } else {
+    oscan1(0, 1);                            // Exit1 -> Update
+    oscan1(0, 0);                            // -> Run-Test/Idle
+    jstate = J_RTI;
+  }
+  return in;
+}
+
+static void run_idle(int n) {
+  if (jstate == J_PAUSE) {                   // Pause -> Exit2 -> Update -> Run-Test/Idle
+    oscan1(0, 1);
+    oscan1(0, 1);
+    oscan1(0, 0);
+    jstate = J_RTI;
+  }
+  for (int i = 0; i < n; i++) oscan1(0, 0);
+}
+
+// a scan of the router alone (before the DAP is in the chain)
+static uint64_t jrc_ir(uint8_t ir, bool to_pause) {
+  goto_shift(true);
+  return shift(ir, ICEPICK_IR_LEN, to_pause);
+}
+static uint64_t jrc_dr(uint64_t v, int n, bool to_pause) {
+  goto_shift(false);
+  return shift(v, n, to_pause);
+}
+static void icepick_router(uint32_t rw, uint32_t block, uint32_t reg, uint32_t payload) {
+  jrc_ir(0x02, true);                        // ROUTER
+  jrc_dr(((rw & 1) << 31) | ((block & 7) << 28) | ((reg & 0xf) << 24) | (payload & 0xffffff), 32, true);
+}
+
+// with the DAP enabled the chain is TDI -> ICEPick -> DAP -> TDO: the DAP gets the first bits, the router
+// (kept in BYPASS) the last
+static void dap_ir(uint8_t ir) {
+  if (cur_ir == ir) return;
+  goto_shift(true);
+  shift((uint64_t)ir | (0x3Full << DAP_IR_LEN), DAP_IR_LEN + ICEPICK_IR_LEN, false);
+  cur_ir = ir;
+}
+
+static int dp_scan(uint8_t ir, uint8_t addr, bool read, uint32_t wdata, uint32_t *prev) {
+  dap_ir(ir);
+  uint64_t out = (read ? 1 : 0) | (((uint64_t)(addr >> 2) & 3) << 1) | ((uint64_t)wdata << 3);
+  goto_shift(false);
+  uint64_t in = shift(out, 35 + 1, false);   // 35-bit DPACC / APACC + the router's bypass bit
+  run_idle(2);
+  if (prev) *prev = (uint32_t)(in >> 3);
+  uint32_t ack = in & 7;
+  return ack == 2 ? SWD_OK : ack == 1 ? SWD_WAIT : SWD_NOACK;
+}
+
+static int dp_scan_retry(uint8_t ir, uint8_t addr, bool read, uint32_t wdata, uint32_t *prev) {
+  int r = SWD_WAIT;
+  for (int i = 0; i < WAIT_RETRIES && r == SWD_WAIT; i++) r = dp_scan(ir, addr, read, wdata, prev);
+  return r;
+}
+
+// SWD semantics on top of the JTAG-DP: an AP read is posted (it returns the result of the scan before,
+// exactly as SWD does, and DP RDBUFF gives its own result); a DP read returns its own value (one more scan)
+static int jtag_xfer(bool ap, bool read, uint8_t addr, uint32_t *data) {
+  if (!ap && addr == 0x0) {
+    if (!read) {
+      // the SWD sticky-clear bits of ABORT are reserved on JTAG: there CTRL/STAT clears them (write 1)
+      if (*data & 0x1e) {
+        int r = dp_scan_retry(IR_DPACC, 0x4, false, 0x50000032, NULL);
+        if (r != SWD_OK) return r;
+      }
+      if (*data & 1) dp_scan(IR_ABORT, 0x0, false, 1, NULL);
+      return SWD_OK;
+    }
+    dap_ir(IR_IDCODE);
+    goto_shift(false);
+    *data = (uint32_t)shift(0, 32 + 1, false);
+    return SWD_OK;
+  }
+  uint32_t prev = 0;
+  int r = dp_scan_retry(ap ? IR_APACC : IR_DPACC, addr, read, read ? 0 : *data, &prev);
+  if (r != SWD_OK || !read) return r;
+  if (ap) {
+    *data = prev;
+    return SWD_OK;
+  }
+  r = dp_scan_retry(IR_DPACC, 0xC, true, 0, &prev);   // RDBUFF: the result of the read above
+  if (r == SWD_OK) *data = prev;
+  return r;
+}
+
+int ti_cjtag_connect(uint32_t *icepick_id, uint32_t *dap_id) {
+  use_jtag = false;
+  sel_ap = sel_bank = -1;
+  cur_ir = -1;
+  // TAP reset escape, three clocks, selection escape, then OAC 1100 (OScan1), EC 1000, CP 0000 (LSB first)
+  escape(8);
+  dio_drive();
+  for (int i = 0; i < 3; i++) write_bit(0);
+  escape(6);
+  static const uint8_t act[12] = {0, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0};
+  for (uint8_t b : act) write_bit(b);
+  // OScan1 from here: Test-Logic-Reset, then Run-Test/Idle
+  for (int i = 0; i < 6; i++) oscan1(0, 1);
+  oscan1(0, 0);
+  jstate = J_RTI;
+  jrc_ir(0x04, false);                       // ICEPick IDCODE
+  *icepick_id = (uint32_t)jrc_dr(0, 32, false);
+  if (!(*icepick_id & 1) || *icepick_id == 0xffffffff) return SWD_NOACK;
+  // icepick_c_tapenable, port 0 (the Cortex-M debug TAP)
+  jrc_ir(0x07, true);                        // CONNECT
+  jrc_dr(0x89, 8, true);
+  icepick_router(1, 0x0, 0x1, 0x001000);
+  icepick_router(1, 0x2, 0x0, 0x110048);
+  icepick_router(1, 0x2, 0x0, 0x112048);
+  icepick_router(1, 0x2, 0x0, 0x112148);
+  jrc_ir(0x00, false);
+  run_idle(10);
+  use_jtag = true;
+  cur_ir = -1;
+  return jtag_xfer(false, true, 0x0, dap_id);
 }
 
 const char *swd_ack_name(int ack) {
