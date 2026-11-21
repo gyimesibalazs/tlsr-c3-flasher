@@ -54,16 +54,23 @@ mains wires before connecting the flasher, and power the board from the flasher 
 
 ## Other targets: Arm SWD and a UART bridge (firmware 0.15)
 
-The same board also talks Arm Serial Wire Debug and works as a USB–UART bridge. Only one of them is active at a
-time, so they share the wires:
+The same board also talks Arm SWD, two-wire cJTAG, four-wire JTAG and SPI flash, and works as a USB–UART
+bridge. Only one mode is active at a time, so they share the wires. Every wire in every mode:
 
-| ESP32-C3 | SWS (Telink) | SWD (EFR32, nRF52, STM32, …) | UART bridge |
-|---|---|---|---|
-| GPIO 4 –1 k– GPIO 5 (the SWS wire) | SWS | SWDIO | target TX → flasher RX (GPIO 4 is an input) |
-| GPIO 0 | – | SWCLK | BOOT (`--boot hi` / `lo`, open by default) |
-| GPIO 21 | – | – | flasher TX → target RX |
-| GPIO 6 | RST | nRESET | RESET |
-| GPIO 7 (+ 10, 3, 1) | target power | target power | target power |
+| ESP32-C3 wire | SWS (Telink) | SWD (EFR32, nRF5x, STM32, …) | cJTAG (TI CC13xx / CC26xx) | JTAG | SPI flash | UART bridge |
+|---|---|---|---|---|---|---|
+| GPIO 4 –1 k– GPIO 5 (the SWS wire) | SWS | SWDIO | TMSC | TDI | DI (flash pin 5) | target TX → flasher RX (GPIO 4 is an input) |
+| GPIO 0 | – | SWCLK | TCKC | TCK | CLK (pin 6) | BOOT (`--boot hi` / `lo`, open by default) |
+| GPIO 21 | – | – | – | TDO | DO (pin 2) | flasher TX → target RX |
+| GPIO 20 | – | – | – | TMS | – | – |
+| GPIO 6 | RST | nRESET | nRESET | nRESET | /CS (pin 1) | RESET |
+| GPIO 7 (+ 10, 3, 1) | target power | target power | target power | target power | – (not switched) | target power |
+| GND | GND | GND | GND | GND | GND (pin 4) | GND |
+
+In the SPI mode the flash's /WP (pin 3) and /HOLD (pin 7) must be high (3.3 V) if the board does not pull them
+up, and the board's own processor has to be kept off the bus (in reset). In the UART bridge GPIO 0 is the
+target's BOOT pin, which is the SWCLK / TCK wire of the other modes. Only boards with the C3's own USB port are
+supported, because GPIO 20 / 21 (UART0) are target wires here.
 
 A pin is only an output while its mode needs it; otherwise it is an input, so a loose wire touching
 something does not short it. The power pins stay inputs until the target is powered the first time;
