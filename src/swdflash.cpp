@@ -21,6 +21,8 @@ static const uint32_t WREN = 1;
 static const uint32_t CMD_LADDRIM = 1 << 0, CMD_ERASEPAGE = 1 << 1, CMD_WRITEEND = 1 << 2, CMD_WRITEONCE = 1 << 3,
                       CMD_ERASEMAIN0 = 1 << 8;
 static const uint32_t ST_BUSY = 1 << 0, ST_LOCKED = 1 << 1, ST_INVADDR = 1 << 2, ST_WDATAREADY = 1 << 3;
+static const uint32_t ST_S2_PENDING = 1 << 5;  // Series 2 only (bit 5 is ERASEABORTED on Series 1)
+static uint32_t msc_busy() { return fam == SWDF_EFR32S2 ? ST_BUSY | ST_S2_PENDING : ST_BUSY; }
 static const uint32_t CMU_S_CLKEN1_SET = 0x40008000 + 0x1068;
 
 // nRF52 NVMC and CTRL-AP
@@ -150,7 +152,8 @@ static int st_unlock(const StFlash &f) {
     TRY(rd(f.base + f.cr, &cr));
     if (cr & f.lock) return SWDF_ERR_LOCKED;
   }
-  return wr(f.base + f.sr, f.errors | 1);    // clear old error flags and EOP (write 1 to clear)
+  // clear old error flags and EOP (write 1 to clear; EOP is bit 5 on F0 / F1 / F3, bit 0 elsewhere)
+  return wr(f.base + f.sr, f.errors | (fam == SWDF_STM32F1 ? 1u << 5 : 1u));
 }
 
 static int st_wait(const StFlash &f, uint32_t timeout_ms) {
@@ -437,7 +440,7 @@ int swdf_erase_page(uint32_t addr) {
     const Msc &m = fam == SWDF_EFR32S1 ? MSC_S1 : MSC_S2;
     TRY(msc_prepare(m, addr, fam == SWDF_EFR32S1));
     TRY(wr(m.base + m.writecmd, CMD_ERASEPAGE));
-    int r = msc_wait(m, ST_BUSY, 0, 200);
+    int r = msc_wait(m, msc_busy(), 0, 200);
     if (r != SWD_OK) return r;
     return msc_check(m);
   }
@@ -504,7 +507,7 @@ int swdf_write(uint32_t addr, const uint8_t *data, int len) {
       TRY(wr(m.base + m.wdata, w));
     }
     TRY(wr(m.base + m.writecmd, CMD_WRITEEND));
-    TRY(msc_wait(m, ST_BUSY, 0, 50));
+    TRY(msc_wait(m, msc_busy(), 0, 50));
     return msc_check(m);
   }
   if (fam == SWDF_NRF52) {
@@ -530,6 +533,10 @@ int swdf_mass_erase() {
       if (millis() - t0 > 10000) return SWDF_ERR_TIMEOUT;
       delay(10);
     }
+    // as OpenOCD's nRF recover: pulse the CTRL-AP RESET, then release ERASEALL
+    TRY(swd_ap_write(N53_CTRL_AP, 0x00, 1));
+    delay(1);
+    TRY(swd_ap_write(N53_CTRL_AP, 0x00, 0));
     return swd_ap_write(N53_CTRL_AP, 0x04, 0);
   }
   if (fam == SWDF_EFR32S1) {

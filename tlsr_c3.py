@@ -370,13 +370,15 @@ def efr32_info(f, say, part):
                 t.name, t.flash // 1024, t.page, msize >> 16))
             return t
     if part == 0xD21:                                  # Series 2 (Cortex-M33), DEVINFO at 0x0FE08000
-        part_reg, msize, meminfo = swd_word(f, 0x0FE08010), swd_word(f, 0x0FE08018), swd_word(f, 0x0FE08014)
-        letters = {0: 'FG', 1: 'MG', 2: 'BG'}
+        # DEVINFO_TypeDef: INFO, PART, MEMINFO, MSIZE (efr32mg2x_devinfo.h)
+        part_reg, meminfo, msize = swd_word(f, 0x0FE08004), swd_word(f, 0x0FE08008), swd_word(f, 0x0FE0800C)
+        letters = {0: 'FG', 1: 'MG', 2: 'BG', 3: 'ZG', 5: 'PG', 8: 'SG'}
         famnum = (part_reg >> 16) & 0x3f
         if famnum in EFR32S2_MSC_CLOCK:
             letter = letters.get((part_reg >> 24) & 0x3f, '?%d' % ((part_reg >> 24) & 0x3f))
             t = SwdTarget('EFR32%s%d (device %d)' % (letter, famnum, part_reg & 0xffff), (msize & 0xffff) * 1024,
-                          1 << (((meminfo & 0xff) + 10) & 0xff), 'efr32s2', sfam_args=' %d' % EFR32S2_MSC_CLOCK[famnum])
+                          1 << (((meminfo & 0xff) + 10) & 0xff), 'efr32s2', sfam_args=' %d' % EFR32S2_MSC_CLOCK[famnum],
+                          base=0x08000000 if famnum >= 23 else 0)   # FLASH_BASE: xG21 / xG22 at 0
             say('Chip:    %s (Silicon Labs Series 2), flash %d kbytes in %d-byte pages, RAM %d kbytes' % (
                 t.name, t.flash // 1024, t.page, (msize >> 16) & 0x7ff))
             return t
@@ -432,6 +434,10 @@ def stm32_info(f, say, part=None):
     if not dev:
         return None
     name, writer, page, size_reg, dual = STM32[dev]
+    if dev == 0x410 and v >> 16 == 0x1909:
+        name, writer = 'GD32E23x (word programming, not handled)', None
+    elif dev == 0x410 and v >> 16 in (0x1303, 0x1704):
+        name = 'GD32F1x0' if v >> 16 == 0x1303 else 'GD32F3x0'
     try:
         word = swd_word(f, size_reg & ~3)
         kb = (word >> (8 * (size_reg & 2))) & 0xffff
@@ -713,6 +719,8 @@ def swd_write(f, t, addr, data, erase=True):
             raise FlasherError('the address must be a multiple of 4')
     if t.flash and addr + len(data) > t.flash:
         raise FlasherError('0x%x bytes at 0x%x do not fit into %d kbytes of flash' % (len(data), addr, t.flash // 1024))
+    if t.family == 'stm32f1' and addr + len(data) > STM32_FLASH + 0x80000:
+        raise FlasherError('above 512 k: GD32F10x / F30x bank 1 has its own registers, not handled yet')
     if t.family == 'stm32v2' and (addr % 8 or len(data) % 8):
         if addr % 8:
             raise FlasherError('STM32 G0/G4/L4/WB: the address must be a multiple of 8')
@@ -1177,6 +1185,12 @@ def main():
                                                         'stm32u5', 'samd21', 'samd51'):
                         print('Mass erase %s...' % t.name)
                         f.cmd('SFX', timeout=60)
+                        if t.family == 'nrf53':
+                            # an erased UICR.APPROTECT / SECUREAPPROTECT means protected on current nRF5340
+                            # silicon: keep the debug port open after the next reset
+                            for a in (0x00FF8000, 0x00FF801C):
+                                f.cmd('SFW %d %s' % (a, (0x50FA50FA).to_bytes(4, 'little').hex()))
+                            print('UICR APPROTECT / SECUREAPPROTECT set to unprotected (0x50FA50FA).')
                     else:
                         addr = args.address + (t.base if args.address < t.base else 0) if args.op == 'es' else t.base
                         end = addr + max(args.size, 1) if args.op == 'es' else t.base + t.flash

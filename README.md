@@ -103,7 +103,11 @@ on the flasher. Register maps from the Silicon Labs device headers and Nordic's 
 STM32 addresses may be given from 0 (taken as 0x08000000), RP2040 ones from 0 (taken as 0x10000000). The
 RP2040 is reached through its multi-drop port (core 0); `info` cannot read the size of its external flash,
 so `rf` needs it given. While its flash is written, core 1 is switched off; `--run` restarts the chip with the
-watchdog. STM32 F7, H7 and the F1 XL-density parts have no flash routine yet. GD32 and CH32 parts that report an STM32F1 device ID are written with the F1 routine.
+watchdog. STM32 F7, H7 and the F1 XL-density parts have no flash routine yet. GD32 and CH32 parts that report an STM32F1 device ID are written with the F1 routine, up to 512 k
+(the second bank of the bigger GD32F10x / F30x has its own registers, not handled); GD32E23x is only
+identified (word programming). After a mass erase of an nRF5340 the flasher writes UICR.APPROTECT and
+SECUREAPPROTECT to 0x50FA50FA, otherwise current silicon locks the debug port again at the next reset; the
+firmware written there must keep it open as well (nrfx `nrf53_handle_approtect`).
 
 A debug-locked EFR32 shows only its AAP and cannot be read or written: Series 1 opens with the AAP mass
 erase, Series 2 through the Secure Engine; neither is implemented yet. A read-protected STM32 (RDP) is
