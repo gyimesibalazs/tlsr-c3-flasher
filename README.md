@@ -1,15 +1,92 @@
-# ESP32-C3 as a Telink TLSR825x flasher
+# ESP32-C3 flasher: Telink SWS, Arm SWD, cJTAG, JTAG and SPI flash
 
-Reads, erases and writes the flash of a Telink TLSR825x chip (TLSR8251 / 8253 / 8258, Tuya "Z2") over its
-single-wire debug pin (SWS), with an ESP32-C3 board instead of a USB-UART adapter.
+An ESP32-C3 board as a flasher for small boards' chips: Telink TLSR825x over its single-wire debug pin (SWS,
+where it started), Arm Cortex-M chips over SWD or JTAG, TI CC13xx / CC26xx over two-wire cJTAG and 25-series
+SPI NOR flash. It also works as a USB–UART bridge. All modes use the same few wires; one is active at a time.
 
-**Status (2026-11-15):** used on three kinds of TLSR8258 boards:
+**What is tested (2026-11-23).** Only the Telink mode has been used on real boards. The other modes are
+written from the vendors' documentation and headers and checked without hardware (see `tests/`); expect to
+find bugs on the first real chip, and keep a backup.
+
+| Mode | Option | Targets | Tested |
+|---|---|---|---|
+| [Telink SWS](#telink-tlsr825x-over-sws) | (default) | TLSR8251 / 8253 / 8258 (Tuya "Z2", ZT2S, ZTU …) | on hardware: five kinds of boards |
+| [Arm SWD](#arm-swd) | `--swd` | EFR32, nRF52 / nRF5340, STM32, SAM D / E, RP2040, GD32 / CH32 (F1 compatible) | no |
+| [cJTAG](#ti-cc13xx--cc26xx-over-two-wire-cjtag) | `--cjtag` | TI CC13xx / CC26xx | no |
+| [JTAG](#four-wire-jtag) | `--jtag` | chain scan; Arm chips behind a JTAG-DP as over SWD | against a simulated chain |
+| [SPI flash](#spi-nor-flash-eg-a-routers) | `--spi` | 25-series SPI NOR (routers, dongles, modules) | host logic against simulated chips |
+| [UART bridge](#uart-bridge) | `bridge` | any 3.3 V UART, with a BOOT pin | no |
+
+## Board, build and upload
+
+    pio run -e c3-usb -t upload      # USB connector wired straight to the C3 (Super Mini, XIAO)
+
+Only boards that use the C3's own USB port are supported: UART0 (GPIO 20 / 21) belongs to the target
+(UART bridge, SPI flash), so a board with a separate CH340 / CP2102 chip on it cannot be the host link.
+
+Needs the Arduino core 3.x (ESP-IDF 5) for the RMT driver.
+
+## Wiring
+
+One table for every mode; the wires are shared:
+
+| ESP32-C3 wire | SWS (Telink) | SWD (EFR32, nRF5x, STM32, …) | cJTAG (TI CC13xx / CC26xx) | JTAG | SPI flash | UART bridge |
+|---|---|---|---|---|---|---|
+| GPIO 4 –1 k– GPIO 5 (the SWS wire) | SWS | SWDIO | TMSC | TDI | DI (flash pin 5) | target TX → flasher RX (GPIO 4 is an input) |
+| GPIO 0 | – | SWCLK | TCKC | TCK | CLK (pin 6) | BOOT (`--boot hi` / `lo`, open by default) |
+| GPIO 21 | – | – | – | TDO | DO (pin 2) | flasher TX → target RX |
+| GPIO 20 | – | – | – | TMS | /CS (pin 1) | – |
+| GPIO 6 | RST | nRESET | nRESET | nRESET | RESET of the board's processor, held low | RESET |
+| GPIO 7 (+ 10, 3, 1) | target power | target power | target power | target power | target power with `--power` only | target power |
+| GND | GND | GND | GND | GND | GND (pin 4) | GND |
+
+The SWS wire is one target pin: GPIO 5 goes to it directly, GPIO 4 through a 1 k … 1.8 k resistor.
+In the SPI mode the flash's /WP (pin 3) and /HOLD (pin 7) must be high (3.3 V) if the board does not pull them
+up, and the reset wire holds the board's own processor in reset, so that it keeps off the bus. In the UART bridge GPIO 0 is the
+target's BOOT pin, which is the SWCLK / TCK wire of the other modes.
+
+Pins and the power-up defaults are set in `src/config.h`. Never put 5 V on the target. Keep the data
+wires short (10 cm or less) for the faster settings.
+
+**Power.** A target can get its 3.3 V from the C3's 3V3 pin, from its own supply, or from the power pins
+GPIO 7, 10, 3 and 1 (`PWR_PINS`). The power pins switch with one register write, so the flasher can power
+the target off and on: every Telink activation switches it off for 300 ms and catches it while it starts,
+which is how boards without a reset pad (and firmware that switches SWS off right after start, for example
+Tuya relay modules) are reached. One pin gives about 40 mA at its limit, so join two or more of them on the
+target's 3.3 V pad; all four give enough for a bare chip board, not for relays or other loads, nor for a
+router. Do not connect them to the 3V3 pin, and remove the batteries of a battery device first.
+
+**Reset.** GPIO 6 is open drain, active low; leave it open if the board has no reset pad. In the SPI mode it
+holds the board's own processor in reset instead (see there).
+
+**Mains powered modules:** their supply is usually not isolated (logic ground = neutral). Disconnect both
+mains wires before connecting the flasher, and power the board from the flasher only.
+
+A pin is only an output while its mode needs it; otherwise it is an input, so a loose wire touching
+something does not short it. The power pins stay inputs until the target is powered the first time;
+`power-off` switches them off and back to inputs.
+
+## Use
+
+    pip install pyserial
+
+`-p` gives the port (default `/dev/ttyACM0`); on Windows use `py tlsr_c3.py -p COM12 ...`. Without a mode
+option the commands talk to a Telink chip; `--swd`, `--cjtag`, `--jtag` and `--spi` select the others. The
+commands are the same in every mode where they make sense: `info`, `rf addr len file [--twice]` (read flash),
+`wf addr file` (write and verify), `es addr len` (erase), `ea` (erase all), `--run` (restart the target at the
+end).
+
+## Telink TLSR825x over SWS
+
+Used on these TLSR8258 boards:
 
 | Board | Flash | Reset pad | Done with it |
 |---|---|---|---|
 | ZY-ZTH03Pro thermometer (Tuya) | 512 k GigaDevice | yes | backup, write, verify |
 | Zbeacon TS0001 relay module | 512 k ZBIT | no (power pins) | backup, write, verify, sector erase |
 | TS004F rotary knob (ZG-101ZD) | 1 M GigaDevice | no (power pins) | backup, write, pin and LED search |
+| TS0052 dimmer module | 1 M | no (power pins) | backup, write, sector erase |
+| TS011F plug with ZT2S module (two of them) | 1 M | no (power pins) | backup, sector erase, write |
 
 At the default 1 Mbit/s (RMT mode) a 512 k read takes 9.3 s, a full backup with `--twice` 19.8 s, a 182 k
 firmware write with verify 15.3 s. Read works up to 1.6 Mbit/s (`--rate 1500000`); the default leaves more
@@ -23,60 +100,119 @@ The SWS line can be driven in two ways, selectable at run time on the same wirin
 | `rmt` (default) | The RMT peripheral generates and measures the pulses (12.5 ns steps) | `--rate` SWire bit rate, default 1 Mbit/s | tested up to 1.6 Mbit/s |
 | `uart` | One UART byte per SWire bit, a port of pvvx's `TLSR825xComFlasher.py` | `-b` UART baud, SWire bit rate = baud / 10 | tested at 921600 baud (92 kbit/s); the fallback |
 
-## Wiring
-
-| ESP32-C3 | Target | Note |
-|---|---|---|
-| GPIO 5 (`PIN_SWS_RX`) | SWS | direct |
-| GPIO 4 (`PIN_SWS_TX`) | SWS | through a 1 k … 1.8 k resistor |
-| GPIO 6 (`PIN_RST`) | RST | open drain, active low; leave open if the board has no reset pad |
-| 3V3 **or** GPIO 7 (+ 10, 3, 1) | 3.3 V / VBAT+ | see below; remove the batteries first |
-| GND | GND | |
-
-Pins and the power-up defaults are set in `src/config.h`. Never put 5 V on the target. Keep the SWS wire
-short (10 cm or less) for the faster settings.
-
-**Boards with a reset pad:** power from the 3V3 pin, reset from GPIO 6.
-
-**Boards without a reset pad** (and boards whose firmware switches SWS off right after start, for example
-Tuya relay modules): connect the target's 3.3 V pad to GPIO 7 instead of the 3V3 pin. Every activation
-then switches the target off for 300 ms and catches it while it starts. One pin gives about 40 mA at its
-limit; GPIO 7, 10, 3 and 1 (`PWR_PINS`) switch with one register write, so join two or more of them on the
-target's 3.3 V pad to share the current. Do not connect these pins to the 3V3 pin. Enough for a bare
-Telink board, not for relays or other loads.
-
 The firmware also tries an activation by itself for 3 seconds when the flasher is plugged in
 (`AUTO_ACTIVATE_MS`), for a target that gets its power from the 3V3 pin together with the flasher. Whether
-this is early enough depends on the target's firmware; the power pins are the reliable way.
+this is early enough depends on the target's firmware; the power pins are the reliable way. Boards with a
+reset pad can be powered from the 3V3 pin and reset from GPIO 6.
 
-**Mains powered modules:** their supply is usually not isolated (logic ground = neutral). Disconnect both
-mains wires before connecting the flasher, and power the board from the flasher only.
+### Commands
 
-## Other targets: Arm SWD and a UART bridge (firmware 0.15)
+    python3 tlsr_c3.py -p /dev/ttyACM0 selftest
+    python3 tlsr_c3.py -p /dev/ttyACM0 info
+    python3 tlsr_c3.py -p /dev/ttyACM0 rf 0 0x80000 stock.bin --twice
+    python3 tlsr_c3.py -p /dev/ttyACM0 wf 0 new_firmware.bin
+    python3 tlsr_c3.py -p /dev/ttyACM0 es 0x2D000 0x49000
+    python3 tlsr_c3.py -p /dev/ttyACM0 ea
+    python3 tlsr_c3.py -p /dev/ttyACM0 --run info
 
-The same board also talks Arm SWD, two-wire cJTAG, four-wire JTAG and SPI flash, and works as a USB–UART
-bridge. Only one mode is active at a time, so they share the wires. Every wire in every mode:
+    python3 tlsr_c3.py -p /dev/ttyACM0 --mode uart info
 
-| ESP32-C3 wire | SWS (Telink) | SWD (EFR32, nRF5x, STM32, …) | cJTAG (TI CC13xx / CC26xx) | JTAG | SPI flash | UART bridge |
-|---|---|---|---|---|---|---|
-| GPIO 4 –1 k– GPIO 5 (the SWS wire) | SWS | SWDIO | TMSC | TDI | DI (flash pin 5) | target TX → flasher RX (GPIO 4 is an input) |
-| GPIO 0 | – | SWCLK | TCKC | TCK | CLK (pin 6) | BOOT (`--boot hi` / `lo`, open by default) |
-| GPIO 21 | – | – | – | TDO | DO (pin 2) | flasher TX → target RX |
-| GPIO 20 | – | – | – | TMS | /CS (pin 1) | – |
-| GPIO 6 | RST | nRESET | nRESET | nRESET | RESET of the board's processor, held low | RESET |
-| GPIO 7 (+ 10, 3, 1) | target power | target power | target power | target power | target power with `--power` only | target power |
-| GND | GND | GND | GND | GND | GND (pin 4) | GND |
+Options:
 
-In the SPI mode the flash's /WP (pin 3) and /HOLD (pin 7) must be high (3.3 V) if the board does not pull them
-up, and the reset wire holds the board's own processor in reset, so that it keeps off the bus. In the UART bridge GPIO 0 is the
-target's BOOT pin, which is the SWCLK / TCK wire of the other modes. Only boards with the C3's own USB port are
-supported, because GPIO 20 / 21 (UART0) are target wires here.
+- `-m rmt|uart` how the line is driven (default `rmt`).
+- `--rate bps` RMT mode speed, 30000 … 2000000, default 1000000. The firmware picks the nearest divider
+  the chip can do and prints the real bit rate (941 kbit/s for the default, 1.6 Mbit/s for 1500000).
+- `-b baud` UART mode speed, 340000 … 5000000, default 921600 (92 kbit/s on the wire). Do not go higher.
+- `-t ms` activation time after the reset pulse (default 100; try 300–1000 if the chip does not answer).
+- `--burst n` bytes requested in one go; `--burst 1` is the slow, safest read (default 64, up to 256).
+- `--run` restart the target's CPU at the end. Without it the chip stays stopped after every command.
 
-A pin is only an output while its mode needs it; otherwise it is an input, so a loose wire touching
-something does not short it. The power pins stay inputs until the target is powered the first time;
-`power-off` switches them off and back to inputs.
+`selftest` sends one END byte and checks what the RX pin sees; it works without a target and tells whether
+the TX – resistor – RX path is right. `info` prints the chip id (0x5562 for TLSR825x), the program counter
+and the flash JEDEC id; the flash size tells how much to read (0x80000 for 512 k, 0x100000 for 1 M).
 
-SWD:
+### Finding the pins of an unknown board
+
+With the chip stopped, its GPIO registers can be read and written over SWS. Two commands use this to map
+a board without reading its firmware:
+
+    python3 tlsr_c3.py -p /dev/ttyACM0 pins --seconds 30            # 10 k pull-ups on every pin
+    python3 tlsr_c3.py -p /dev/ttyACM0 pins --seconds 3 --pull down
+    python3 tlsr_c3.py -p /dev/ttyACM0 led
+    python3 tlsr_c3.py -p /dev/ttyACM0 led --only C4
+
+- `pins` makes every pin (except PA7 = SWS) an input and prints each change with its time, about 250
+  polls per second: press the button, turn the encoder, close the switch input and read off the pins and
+  their order. A pin that reads 1 with pull-ups and 0 with pull-downs is not connected to anything (free
+  for a battery measurement, for example); one that stays 1 with pull-downs is tied to the supply, often
+  through an LED.
+- `led` drives the pins one by one low and then high for a second and prints which one it is at: note the
+  line on the screen when the LED lights. `--skip` lists pins that must stay inputs (default `A1,D4,D7`),
+  `--only` tests just the given pins three times.
+
+The chip is stopped right after reset, with the clocks of its blocks off; `pins` and `led` switch them on
+first (registers `0x60`–`0x65`), otherwise the pull resistors and the input enable of ports B and C, which
+live in the analog registers, are not accepted.
+
+### First use
+
+1. `selftest` with only the resistor fitted, no target: checks the TX – resistor – RX path.
+2. `info` — proves wiring, activation and the speed. Every activation also writes a test pattern into the
+   chip's RAM and reads it back at the speed and burst in use; if that fails, nothing else is done.
+   If the chip does not answer: check the resistor and GND, raise `-t`, lower `--rate 500000`, or try
+   `--mode uart`.
+3. `rf 0 <flash size> stock.bin --twice` — full backup; the second pass compares checksums.
+4. Keep the backup safe, then `wf`. It erases the touched sectors, writes and verifies.
+
+### The SWire protocol, and how the two modes map onto it
+
+From Telink's SWire description (in pvvx's TLSRPGM repository) and the working tools:
+
+- A bit is 5 time units: 0 = 1 low + 4 high, 1 = 4 low + 1 high. The line idles high.
+- A byte is a command bit, 8 data bits MSB first, and one unit of low.
+- A message is START (`0x5a`, command bit set), the address (3 bytes on TLSR825x, 2 on TLSR826x), RW_ID
+  (bit 7 = read), the data, and END (`0xff`, command bit set).
+- Read: the master sends one unit of low per byte. When the line has then been high for longer than that
+  pulse, the slave sends 8 bits and one unit of low, timed by its own clock.
+- Slave speed: bit rate = system clock / 5 / `reg 0xb2`. With the divider 5 the chip does about 960 kbit/s.
+- `reg 0xb3` bit 7 is the FIFO mode: the address is not incremented, used to stream bytes through the SPI
+  data register (`0x0c`; control `0x0d`) to the flash.
+- Activation: reset pulse, then "stall CPU" (`0x0602 = 0x05`) repeated so that it lands before the firmware
+  can disable SWS or go to sleep.
+
+| | UART mode | RMT mode |
+|---|---|---|
+| Bit shape | `0x80` = low for 8 of 10 UART bit times, `0xfe` = low for 2 of 10 | exact 1 : 4 and 4 : 1 pulses |
+| Speed match | the chip's divider is scanned until the read-back fits the UART frame | the current divider is read at a slow speed, the chip's bit period is measured, the clock is computed and the divider nearest to the requested rate is set |
+| Read decode | the UART samples each slave bit at a fixed point, so the slave must run at baud / 10 | each bit is 1 when its low part is longer than its high part, any slave speed |
+| Bulk read | start pulses sent one by one with a timed gap, up to 256 bytes per burst | up to 256 bytes per burst, 10 pulses per byte; the driver empties the channel memory in halves while receiving, a lost symbol fails the burst |
+| Long writes | one UART stream | pieces of 9 bytes queued back to back, cut on byte boundaries |
+| Echo check | yes, every write is read back | only in `selftest` |
+
+### Flash access, checked against the chip's own flash code
+
+Compared with `flash.c` / `spi_i.h` of pvvx's loader (Telink's reference routines) and `TlsrPgm.py`:
+
+| Step | Reference | Here |
+|---|---|---|
+| Commands | 0x06 write enable, 0x02 page program, 0x03 read, 0x05 status, 0x20 sector erase (4 k), 0x60 chip erase, 0x01 write status | same |
+| Page program | at most 256 bytes, inside one page | same; the host cuts on page boundaries |
+| Read | command, address, a dummy byte, control `0x0a` (auto read), then the data register | same |
+| Status | command, then a **dummy byte** to clock the answer in, then the data register | same. pvvx's SWire script reads without the dummy byte, so its "ready" check may be a constant |
+| Unlock | write enable, write status 0, wait, status must read 0 | same, plus a check that the write-enable latch follows 0x06 / 0x04; without it nothing is erased or written |
+| After a page program | poll the busy bit | 2 ms fixed wait, then poll |
+
+Cautions that come from the layout of Telink / Tuya firmware (from memory of the Telink SDK, not confirmed
+by the sources read: check them in your own dump):
+
+- The top sectors hold per-device data: the MAC address and the factory RF calibration (512 k flash:
+  0x76000 / 0x77000, 1 M flash: 0xFF000 / 0xFE000). `ea` wipes them. `wf` only erases the sectors the
+  file covers, so a firmware written at address 0 leaves them alone.
+- To find them, search the backup for the device's IEEE address in reversed byte order.
+- pvvx's advice for these thermometers: write the BLE firmware by wire first (smaller, address 0), then
+  switch to Zigbee from his web flasher over BLE.
+
+## Arm SWD
 
     python3 tlsr_c3.py -p /dev/ttyACM0 --swd info
     python3 tlsr_c3.py -p /dev/ttyACM0 --swd rf 0 0x40000 backup.bin --twice
@@ -99,7 +235,6 @@ on the flasher. Register maps from the Silicon Labs device headers and Nordic's 
 | nRF5340 application core | NVMC at 0x50039000; a page is erased by writing 0xFFFFFFFF into it | 4 k | CTRL-AP (AP 2) ERASEALL |
 | SAM D2x / L2x / C2x | NVMCTRL at 0x41004000: page buffer, WP; ADDR in half-words | 64 B pages, 256 B rows | DSU chip erase (also clears the security bit) |
 | SAM D5x / E5x | NVMCTRL at 0x41004000: page buffer, WP | 512 B pages, 8 k blocks | DSU chip erase |
-
 | STM32 F0, F1, F3 | FLASH at 0x40022000, half-word programming | 1 k / 2 k | MER |
 | STM32 F4 (F401 … F446, F42x/43x with two banks) | FLASH at 0x40023C00, 32-bit programming (needs 2.7–3.6 V) | 16 k / 64 k / 128 k sectors | MER (+ MER1) |
 | STM32 G0, G4, L4, WB, C0 | FLASH at 0x40022000, double-word programming, second bank from the option bytes | 2 k / 4 k | MER1 (+ MER2) |
@@ -121,7 +256,7 @@ erase, Series 2 through the Secure Engine; neither is implemented yet. A read-pr
 reported by `info`; removing the protection erases the chip and is not implemented either.
 Nothing of the SWD part is tested on hardware yet.
 
-### TI CC13xx / CC26xx over two-wire cJTAG (firmware 0.16)
+## TI CC13xx / CC26xx over two-wire cJTAG
 
 These chips have no SWD: their debug port is IEEE 1149.7 cJTAG on two pins (TMSC, TCKC) behind TI's ICEPick
 router. The same two wires are used as for SWD: TMSC on the SWS wire (GPIO 4 – 1 k – GPIO 5), TCKC on
@@ -146,7 +281,7 @@ sector, and `es` over the last sector keeps the CCFG. CC13x4 / CC26x4 (Cortex-M3
 CC2538 are not handled. Not tested on hardware: the OScan1 timing, the ICEPick sequence on these chips and
 the ROM calls are all from the sources above.
 
-### Four-wire JTAG (firmware 0.19)
+## Four-wire JTAG
 
 | JTAG | Flasher wire |
 |---|---|
@@ -168,7 +303,7 @@ sequence on TMS, so an SWJ-DP left in SWD mode answers too. A chain without an A
 and `JDR` do raw scans for anything else (RISC-V debug, EJTAG, boundary scan are not built on them yet).
 Tested against a simulated chain (`tests/jtag_sim`), not on hardware yet.
 
-### SPI NOR flash, e.g. a router's (firmware 0.21)
+## SPI NOR flash, e.g. a router's
 
 The 25-series SPI flash of a router, a dongle or any other board:
 
@@ -203,7 +338,7 @@ the power pins on after the reset is down and off at the end: for a flash out of
 a small module. Clock 4 MHz by default (`--spi-khz`, the DI wire goes through 1 k); the read and write speeds
 are printed (binary streams, see the host protocol). Not tested on hardware yet.
 
-UART bridge:
+## UART bridge
 
     python3 tlsr_c3.py -p /dev/ttyACM0 bridge 115200 --boot hi     # restarts the target with BOOT high
     ... any serial tool on the same port, at the same baud ...
@@ -212,125 +347,6 @@ UART bridge:
 The baud rate is fixed by the `bridge` command: the C3's USB port does not pass on the host's setting.
 Tools must not toggle DTR / RTS, because those reset the C3 itself (`esptool --before no_reset --after
 no_reset`). GPIO 21 carries the C3's own boot messages for a moment when the flasher is plugged in.
-
-## Build and upload
-
-    pio run -e c3-usb -t upload      # USB connector wired straight to the C3 (Super Mini, XIAO)
-
-Only boards that use the C3's own USB port are supported: UART0 (GPIO 20 / 21) belongs to the target
-(UART bridge, SPI flash), so a board with a separate CH340 / CP2102 chip on it cannot be the host link.
-
-Needs the Arduino core 3.x (ESP-IDF 5) for the RMT driver.
-
-## Use
-
-    pip install pyserial
-    python3 tlsr_c3.py -p /dev/ttyACM0 selftest
-    python3 tlsr_c3.py -p /dev/ttyACM0 info
-    python3 tlsr_c3.py -p /dev/ttyACM0 rf 0 0x80000 stock.bin --twice
-    python3 tlsr_c3.py -p /dev/ttyACM0 wf 0 new_firmware.bin
-    python3 tlsr_c3.py -p /dev/ttyACM0 es 0x2D000 0x49000
-    python3 tlsr_c3.py -p /dev/ttyACM0 ea
-    python3 tlsr_c3.py -p /dev/ttyACM0 --run info
-
-    python3 tlsr_c3.py -p /dev/ttyACM0 --mode uart info
-
-On Windows use `py tlsr_c3.py -p COM12 ...`.
-
-Options:
-
-- `-m rmt|uart` how the line is driven (default `rmt`).
-- `--rate bps` RMT mode speed, 30000 … 2000000, default 1000000. The firmware picks the nearest divider
-  the chip can do and prints the real bit rate (941 kbit/s for the default, 1.6 Mbit/s for 1500000).
-- `-b baud` UART mode speed, 340000 … 5000000, default 921600 (92 kbit/s on the wire). Do not go higher.
-- `-t ms` activation time after the reset pulse (default 100; try 300–1000 if the chip does not answer).
-- `--burst n` bytes requested in one go; `--burst 1` is the slow, safest read (default 64, up to 256).
-- `--run` restart the target's CPU at the end. Without it the chip stays stopped after every command.
-
-`selftest` sends one END byte and checks what the RX pin sees; it works without a target and tells whether
-the TX – resistor – RX path is right. `info` prints the chip id (0x5562 for TLSR825x), the program counter
-and the flash JEDEC id; the flash size tells how much to read (0x80000 for 512 k, 0x100000 for 1 M).
-
-## Finding the pins of an unknown board
-
-With the chip stopped, its GPIO registers can be read and written over SWS. Two commands use this to map
-a board without reading its firmware:
-
-    python3 tlsr_c3.py -p /dev/ttyACM0 pins --seconds 30            # 10 k pull-ups on every pin
-    python3 tlsr_c3.py -p /dev/ttyACM0 pins --seconds 3 --pull down
-    python3 tlsr_c3.py -p /dev/ttyACM0 led
-    python3 tlsr_c3.py -p /dev/ttyACM0 led --only C4
-
-- `pins` makes every pin (except PA7 = SWS) an input and prints each change with its time, about 250
-  polls per second: press the button, turn the encoder, close the switch input and read off the pins and
-  their order. A pin that reads 1 with pull-ups and 0 with pull-downs is not connected to anything (free
-  for a battery measurement, for example); one that stays 1 with pull-downs is tied to the supply, often
-  through an LED.
-- `led` drives the pins one by one low and then high for a second and prints which one it is at: note the
-  line on the screen when the LED lights. `--skip` lists pins that must stay inputs (default `A1,D4,D7`),
-  `--only` tests just the given pins three times.
-
-The chip is stopped right after reset, with the clocks of its blocks off; `pins` and `led` switch them on
-first (registers `0x60`–`0x65`), otherwise the pull resistors and the input enable of ports B and C, which
-live in the analog registers, are not accepted.
-
-## First use
-
-1. `selftest` with only the resistor fitted, no target: checks the TX – resistor – RX path.
-2. `info` — proves wiring, activation and the speed. Every activation also writes a test pattern into the
-   chip's RAM and reads it back at the speed and burst in use; if that fails, nothing else is done.
-   If the chip does not answer: check the resistor and GND, raise `-t`, lower `--rate 500000`, or try
-   `--mode uart`.
-3. `rf 0 <flash size> stock.bin --twice` — full backup; the second pass compares checksums.
-4. Keep the backup safe, then `wf`. It erases the touched sectors, writes and verifies.
-
-## The protocol, and how the two modes map onto it
-
-From Telink's SWire description (in pvvx's TLSRPGM repository) and the working tools:
-
-- A bit is 5 time units: 0 = 1 low + 4 high, 1 = 4 low + 1 high. The line idles high.
-- A byte is a command bit, 8 data bits MSB first, and one unit of low.
-- A message is START (`0x5a`, command bit set), the address (3 bytes on TLSR825x, 2 on TLSR826x), RW_ID
-  (bit 7 = read), the data, and END (`0xff`, command bit set).
-- Read: the master sends one unit of low per byte. When the line has then been high for longer than that
-  pulse, the slave sends 8 bits and one unit of low, timed by its own clock.
-- Slave speed: bit rate = system clock / 5 / `reg 0xb2`. With the divider 5 the chip does about 960 kbit/s.
-- `reg 0xb3` bit 7 is the FIFO mode: the address is not incremented, used to stream bytes through the SPI
-  data register (`0x0c`; control `0x0d`) to the flash.
-- Activation: reset pulse, then "stall CPU" (`0x0602 = 0x05`) repeated so that it lands before the firmware
-  can disable SWS or go to sleep.
-
-| | UART mode | RMT mode |
-|---|---|---|
-| Bit shape | `0x80` = low for 8 of 10 UART bit times, `0xfe` = low for 2 of 10 | exact 1 : 4 and 4 : 1 pulses |
-| Speed match | the chip's divider is scanned until the read-back fits the UART frame | the current divider is read at a slow speed, the chip's bit period is measured, the clock is computed and the divider nearest to the requested rate is set |
-| Read decode | the UART samples each slave bit at a fixed point, so the slave must run at baud / 10 | each bit is 1 when its low part is longer than its high part, any slave speed |
-| Bulk read | start pulses sent one by one with a timed gap, up to 256 bytes per burst | up to 256 bytes per burst, 10 pulses per byte; the driver empties the channel memory in halves while receiving, a lost symbol fails the burst |
-| Long writes | one UART stream | pieces of 9 bytes queued back to back, cut on byte boundaries |
-| Echo check | yes, every write is read back | only in `selftest` |
-
-## Flash access, checked against the chip's own flash code
-
-Compared with `flash.c` / `spi_i.h` of pvvx's loader (Telink's reference routines) and `TlsrPgm.py`:
-
-| Step | Reference | Here |
-|---|---|---|
-| Commands | 0x06 write enable, 0x02 page program, 0x03 read, 0x05 status, 0x20 sector erase (4 k), 0x60 chip erase, 0x01 write status | same |
-| Page program | at most 256 bytes, inside one page | same; the host cuts on page boundaries |
-| Read | command, address, a dummy byte, control `0x0a` (auto read), then the data register | same |
-| Status | command, then a **dummy byte** to clock the answer in, then the data register | same. pvvx's SWire script reads without the dummy byte, so its "ready" check may be a constant |
-| Unlock | write enable, write status 0, wait, status must read 0 | same, plus a check that the write-enable latch follows 0x06 / 0x04; without it nothing is erased or written |
-| After a page program | poll the busy bit | 2 ms fixed wait, then poll |
-
-Cautions that come from the layout of Telink / Tuya firmware (from memory of the Telink SDK, not confirmed
-by the sources read: check them in your own dump):
-
-- The top sectors hold per-device data: the MAC address and the factory RF calibration (512 k flash:
-  0x76000 / 0x77000, 1 M flash: 0xFF000 / 0xFE000). `ea` wipes them. `wf` only erases the sectors the
-  file covers, so a firmware written at address 0 leaves them alone.
-- To find them, search the backup for the device's IEEE address in reversed byte order.
-- pvvx's advice for these thermometers: write the BLE firmware by wire first (smaller, address 0), then
-  switch to Zigbee from his web flasher over BLE.
 
 ## Host protocol
 
@@ -366,13 +382,20 @@ L0 / L1, whose erased flash reads 0x00). The old text commands stay for single b
 
 ## Not done
 
-- pvvx's RAM loader (`TlsrComProg825x`) is not used: it talks over the chip's UART pins (PA0 / PB1), not
-  over SWS, so it needs two more wires.
-- Chips other than TLSR825x (the TLSR826x family uses 2-byte addresses).
+- Telink: pvvx's RAM loader (`TlsrComProg825x`) is not used: it talks over the chip's UART pins (PA0 / PB1),
+  not over SWS, so it needs two more wires. The TLSR826x family (2-byte addresses) is not handled.
+- SWD: STM32 F7 / H7 and the F1 XL-density parts have no flash routine; locked EFR32 (AAP / Secure Engine
+  unlock) and STM32 read protection removal are not implemented.
+- cJTAG: CC13x4 / CC26x4 and CC2538.
+- JTAG: RISC-V debug, EJTAG and boundary scan on top of the raw scans.
 
 ## Files
 
-- `src/main.cpp`, `src/config.h`, `platformio.ini`: the ESP32-C3 firmware.
+- `src/main.cpp`, `src/config.h`, `platformio.ini`: the ESP32-C3 firmware, with the Telink SWS part and the
+  command parser.
+- `src/swd.cpp` / `.h`: SWD, cJTAG and JTAG line handling, DP / AP access, memory and core control.
+- `src/swdflash.cpp` / `.h`: the flash routines of the Arm and TI chips.
+- `src/spiflash.cpp` / `.h`: SPI NOR flash.
 - `tlsr_c3.py`: the command line tool on the computer (Python 3, `pyserial`).
 - `tests/`: checks without hardware (stream protocol, SPI host logic, JTAG against a simulated chain).
 
