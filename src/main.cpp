@@ -25,9 +25,12 @@
 #include "swd.h"
 #include "swdflash.h"
 #include "spiflash.h"
+#include "wch.h"
+#include "wchflash.h"
+#include "bk72xx.h"
 
 #define FW_NAME "tlsr-c3-flasher"
-#define FW_VERSION "0.21"
+#define FW_VERSION "0.24"
 
 enum SwsMode { MODE_UART = 0, MODE_RMT = 1 };
 
@@ -372,6 +375,8 @@ static void bridge_end();
 static bool set_mode(SwsMode m) {
   bridge_end();
   spif_end();
+  wch_end();
+  bk_end();
   if (swd_on) {
     swd_end();
     swd_on = jtag_on = false;
@@ -762,6 +767,10 @@ static uint32_t crc32_update(uint32_t crc, const uint8_t *d, int n) {
 }
 
 static void ok() { Serial.print("OK\n"); }
+static void out_line(const char *s) {
+  Serial.print(s);
+  Serial.print("\n");
+}
 static void err(const char *why) { Serial.print("ERR "); Serial.print(why); Serial.print("\n"); }
 
 // Line test without a target: send an END byte and look at what comes back on the RX pin.
@@ -802,6 +811,12 @@ static bool bridge_on = false;
 static uint32_t bridge_last_ms = 0;
 static int esc_pos = -1;
 static SwsMode mode_before_bridge = MODE_RMT;
+// "bk" catch: a Beken BK72xx answers its ROM's link check only right after a reset. While the host sends and
+// the target has not answered a link check yet (04 0E ...), the target is reset every BRIDGE_CATCH_MS.
+static const uint32_t BRIDGE_CATCH_MS = 1500;
+static bool bridge_catch = false, bridge_linked = false;
+static uint32_t bridge_reset_ms = 0;
+static uint8_t bridge_prev_rx = 0;
 
 static void bridge_end() {
   if (!bridge_on) return;
@@ -818,6 +833,8 @@ static void bridge_begin(uint32_t baud, int boot) {
     swd_on = jtag_on = false;
   }
   spif_end();
+  wch_end();
+  bk_end();
   uart_teardown();
   rmt_teardown();
   pinMode(PIN_SWS_TX, INPUT);                // the resistor side of the SWS wire stays quiet
@@ -843,6 +860,9 @@ static void bridge_begin(uint32_t baud, int boot) {
   bridge_last_ms = millis();
   esc_pos = -1;
   target_reset_pulse();                      // the target starts with the BOOT level applied
+  bridge_reset_ms = millis();
+  bridge_linked = false;
+  bridge_prev_rx = 0;
   uart_flush_input(BRIDGE_UART);
 }
 
@@ -864,12 +884,22 @@ static void bridge_pump() {
     }
     bridge_last_ms = now;
     uart_write_bytes(BRIDGE_UART, buf, n);
+    if (bridge_catch && !bridge_linked && now - bridge_reset_ms >= BRIDGE_CATCH_MS) {
+      target_reset_pulse();                  // the host's next link checks reach the ROM right after the reset
+      bridge_reset_ms = millis();
+    }
   }
   size_t avail = 0;
   uart_get_buffered_data_len(BRIDGE_UART, &avail);
   if (avail) {
     int got = uart_read_bytes(BRIDGE_UART, buf, min(avail, sizeof(buf)), 0);
-    if (got > 0) Serial.write(buf, got);
+    if (got > 0) {
+      for (int i = 0; i < got; i++) {        // 04 0E: an HCI-style answer of the Beken ROM
+        if (bridge_prev_rx == 0x04 && buf[i] == 0x0E) bridge_linked = true;
+        bridge_prev_rx = buf[i];
+      }
+      Serial.write(buf, got);
+    }
   }
 }
 
@@ -882,8 +912,9 @@ static void bridge_pump() {
 //                          is answered with 'K' after it is written, or 'E' <n:u16> <text>. The host sends
 //                          ahead: the next frames wait in the receive buffer while one is programmed.
 // src / dst: F = Telink flash over SWS, S = SWD flash (write) / memory (read), M = SWD memory (write),
-// P = SPI flash. unit: the write is split at these boundaries (flash page); skip 1: parts that are all 0xff
-// are not written (erased flash).
+// P = SPI flash, C = WCH CH32V003 memory (read) / flash in 64-byte pages or RAM (write), B = Beken BK72xx flash
+// (read: every 4 k block checked by the target's CRC; write: whole erased 4 k sectors). unit: the write is
+// split at these boundaries (flash page); skip 1: parts that are all 0xff are not written (erased flash).
 
 static const int XBLK = 4096;
 static uint8_t xbuf[XBLK + 8];
@@ -938,6 +969,14 @@ static const char *x_read(char src, uint32_t addr, uint8_t *buf, int n) {
     case 'P':
       spif_read(addr, buf, n);
       return NULL;
+    case 'C': {
+      int r = wchf_mem_read(addr, buf, n);
+      return r == WCH_OK ? NULL : wchf_err_text(r);
+    }
+    case 'B': {
+      int r = bk_read(addr, buf, n);
+      return r == BK_OK ? NULL : bk_err_text(r);
+    }
   }
   return "source";
 }
@@ -959,21 +998,34 @@ static const char *x_write_part(char dst, uint32_t addr, const uint8_t *d, int n
       int r = swd_mem_write(0, addr, d, n);
       return r == SWD_OK ? NULL : swdf_err_name(r);
     }
+    case 'C': {
+      bool flash = (addr >= WCH_FLASH_BASE && addr < WCH_FLASH_BASE + 0x40000) ||
+                   (addr >= WCH_BOOT_BASE && addr < WCH_BOOT_BASE + WCH_BOOT_SIZE);
+      int r = flash ? wchf_flash_write(addr, d, n) : wchf_mem_write(addr, d, n);
+      return r == WCH_OK ? NULL : wchf_err_text(r);
+    }
+    case 'B': {
+      if (n != (int)BK_SECTOR) return "whole 4 k sectors only";
+      int r = bk_write4k(addr, d);
+      return r == BK_OK ? NULL : bk_err_text(r);
+    }
   }
   return "destination";
 }
 
 static const char *x_mode_check(char c) {
-  if (c == 'F') return swd_on || spif_active() ? "not in SWire mode" : NULL;
+  if (c == 'F') return swd_on || spif_active() || wch_active() || bk_active() ? "not in SWire mode" : NULL;
   if (c == 'S' || c == 'M') return swd_on ? NULL : "not in SWD mode";
   if (c == 'P') return spif_active() ? NULL : "not in SPI mode";
-  return "source / destination: F, S, M or P";
+  if (c == 'C') return wch_active() ? NULL : "not in WCH mode";
+  if (c == 'B') return bk_linked() ? NULL : "not linked to a BK72xx (BK, BKL first)";
+  return "source / destination: F, S, M, P, C or B";
 }
 
 static void x_read_cmd(char src, uint32_t addr, uint32_t len) {
   const char *why = x_mode_check(src);
   if (why) return err(why);
-  if (src == 'S' && ((addr | len) & 3)) return err("SWD: address and length in whole words");
+  if ((src == 'S' || src == 'C') && ((addr | len) & 3)) return err("address and length in whole words");
   Serial.printf("OK %u\n", (unsigned)len);
   while (len > 0) {
     // anything from the host stops the stream: a client that was interrupted (Ctrl-C) leaves it running,
@@ -993,8 +1045,12 @@ static void x_write_cmd(char dst, uint32_t addr, uint32_t len, uint32_t unit, bo
   const char *why = x_mode_check(dst);
   if (why) return err(why);
   if (dst == 'F' || dst == 'P') unit = 256;
+  if (dst == 'C') unit = WCH_PAGE;
+  if (dst == 'B') unit = BK_SECTOR;
   if (unit < 4 || unit > XBLK || (unit & (unit - 1))) return err("unit: power of two, 4..4096");
-  if ((dst == 'S' || dst == 'M') && ((addr | len) & 3)) return err("SWD: address and length in whole words");
+  if ((dst == 'S' || dst == 'M' || dst == 'C') && ((addr | len) & 3))
+    return err("address and length in whole words");
+  if (dst == 'B' && ((addr | len) & (BK_SECTOR - 1))) return err("address and length in whole 4 k sectors");
   ok();
   while (len > 0) {
     uint8_t h[2];
@@ -1168,6 +1224,8 @@ static void handle(char *ln) {
     if (khz < 100 || khz > 20000) return err("100..20000 kHz");
     if (!spif_active()) {
       bridge_end();
+      wch_end();
+      bk_end();
       if (swd_on) {
         swd_end();
         swd_on = jtag_on = false;
@@ -1234,6 +1292,8 @@ static void handle(char *ln) {
   } else if (!strcmp(cmd, "SWD")) {          // SWD: switch the pins to SWD, target power on
     bridge_end();
     spif_end();
+    wch_end();
+    bk_end();
     uart_teardown();
     rmt_teardown();
     swd_begin();
@@ -1245,6 +1305,8 @@ static void handle(char *ln) {
   } else if (!strcmp(cmd, "JTAG")) {         // JTAG [kHz]: the pins to four-wire JTAG, target power on
     bridge_end();
     spif_end();
+    wch_end();
+    bk_end();
     uart_teardown();
     rmt_teardown();
     jtag_begin();
@@ -1350,7 +1412,7 @@ static void handle(char *ln) {
     static const struct { const char *name; SwdFlashFamily fam; } fams[] = {
         {"efr32s1", SWDF_EFR32S1}, {"efr32s2", SWDF_EFR32S2}, {"nrf52", SWDF_NRF52},   {"nrf53", SWDF_NRF53},
         {"stm32f1", SWDF_STM32F1}, {"stm32f4", SWDF_STM32F4}, {"stm32v2", SWDF_STM32V2}, {"stm32u5", SWDF_STM32U5},
-        {"stm32l0", SWDF_STM32L0}, {"samd21", SWDF_SAMD21},   {"samd51", SWDF_SAMD51}};
+        {"stm32l0", SWDF_STM32L0}, {"samd21", SWDF_SAMD21},   {"samd51", SWDF_SAMD51},  {"py32", SWDF_PY32}};
     if (argc < 2) return err("family");
     bool found = false;
     for (auto &f : fams) {
@@ -1378,7 +1440,7 @@ static void handle(char *ln) {
   } else if (!strcmp(cmd, "SFE")) {          // SFE <addr>: erase the flash page at addr
     if (!swd_check(swdf_erase_page(a1))) return;
     ok();
-  } else if (!strcmp(cmd, "SFX")) {          // SFX: mass erase (EFR32 Series 1, nRF52)
+  } else if (!strcmp(cmd, "SFX")) {          // SFX: mass erase (EFR32 Series 1, nRF52, STM32, SAM D, PY32)
     if (!swd_check(swdf_mass_erase())) return;
     ok();
   } else if (!strcmp(cmd, "SFW")) {          // SFW <addr> <hex>: program whole words within one page
@@ -1397,9 +1459,36 @@ static void handle(char *ln) {
       done += cnt;
     }
     Serial.printf("OK %08x\n", (unsigned)crc);
-  } else if (!strcmp(cmd, "BRIDGE")) {       // BRIDGE <baud> [hi|lo|z]: transparent UART bridge
+  } else if (cmd[0] == 'W') {               // WCH CH32V003 over SWIO: WCH, WT, WA, WR, WW, WH, ... (wchflash.cpp)
+    if (!strcmp(cmd, "WCH") && !(argc > 1 && a1 == 0) && !wch_active()) {
+      bridge_end();
+      spif_end();
+      bk_end();
+      if (swd_on) {
+        swd_end();
+        swd_on = jtag_on = false;
+      }
+      uart_teardown();
+      rmt_teardown();
+    }
+    if (!wchf_command(argc, argv, out_line)) err("unknown command");
+  } else if (cmd[0] == 'B' && cmd[1] == 'K') {   // Beken BK72xx download port: BK, BKL, BKI, ... (bk72xx.cpp)
+    if (!strcmp(cmd, "BK") && !(argc > 1 && a1 == 0) && !bk_active()) {
+      bridge_end();
+      spif_end();
+      wch_end();
+      if (swd_on) {
+        swd_end();
+        swd_on = jtag_on = false;
+      }
+      uart_teardown();
+      rmt_teardown();
+    }
+    if (!bk_command(argc, argv, out_line)) err("unknown command");
+  } else if (!strcmp(cmd, "BRIDGE")) {       // BRIDGE <baud> [hi|lo|z] [bk]: transparent UART bridge
     int boot = -1;
     if (argc > 2) boot = !strcmp(argv[2], "hi") ? 1 : !strcmp(argv[2], "lo") ? 0 : -1;
+    bridge_catch = argc > 3 && !strcmp(argv[3], "bk");
     if (a1 < 1200 || a1 > 3000000) return err("baud 1200..3000000");
     Serial.printf("OK bridge %u baud, boot %s; leave with a 1 s pause and %s\n", (unsigned)a1,
                   boot < 0 ? "open" : boot ? "high" : "low", ESCAPE);
@@ -1430,6 +1519,8 @@ void setup() {
   REG_WRITE(GPIO_OUT_W1TC_REG, pwr_mask);    // the level they will have when they become outputs
   pinMode(PIN_SWCLK, INPUT);
   pinMode(PIN_BRIDGE_TX, INPUT);
+  wchf_set_power(target_power);              // WCH mode: power cycle and catch the target at start
+  bk_set_reset(target_reset_pulse);          // BK72xx: reset (CEN) and power cycle while catching the ROM
   set_mode(SWS_MODE_DEFAULT ? MODE_RMT : MODE_UART);
 #if AUTO_ACTIVATE_MS > 0
   activate(AUTO_ACTIVATE_MS);                // leaves the target's CPU stopped, if it was caught

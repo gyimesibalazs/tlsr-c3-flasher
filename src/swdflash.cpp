@@ -60,6 +60,7 @@ const char *swdf_err_name(int r) {
     case SWDF_ERR_FAMILY: return "no flash family set (SFAM)";
     case SWDF_ERR_HALT: return "core does not halt";
     case SWDF_ERR_PROGRAM: return "flash programming error (write protected, read protected or not erased)";
+    case SWDF_ERR_TIMING: return "no flash timing in the factory configuration bytes";
     default: return swd_ack_name(r);
   }
 }
@@ -392,6 +393,112 @@ static int samd_chip_erase() {
   }
 }
 
+// ---------------------------------------------------------------- Puya PY32F002B type (also the MS32C001)
+// From Puya's py32f002b_hal_flash.c / .h, py32f002bx5.h and the Keil flash algorithm (FlashPrg.c) of the
+// PY32F002B pack: 128-byte pages written through a page buffer (PG, 31 words, PGSTRT, the 32nd word), erase by
+// writing any word of the page with PER (MER for the whole main flash). The erase / program timing registers
+// must hold the values of the factory configuration bytes for the HSI frequency in use (HAL
+// __HAL_FLASH_TIMMING_SEQUENCE_CONFIG). The option bytes (OPTKEYR, OPTR, OPTSTRT) are never touched.
+static const uint32_t PY_FLASH = 0x40022000, PY_KEYR = PY_FLASH + 0x08, PY_SR = PY_FLASH + 0x10,
+                      PY_CR = PY_FLASH + 0x14, PY_OPTR = PY_FLASH + 0x20, PY_TS0 = PY_FLASH + 0x100;
+static const uint32_t PY_CR_PG = 1u << 0, PY_CR_PER = 1u << 1, PY_CR_MER = 1u << 2, PY_CR_PGSTRT = 1u << 19,
+                      PY_CR_EOPIE = 1u << 24, PY_CR_LOCK = 1u << 31;
+static const uint32_t PY_SR_EOP = 1u << 0, PY_SR_WRPERR = 1u << 4, PY_SR_BSY = 1u << 16;
+static const uint32_t PY_RCC_ICSCR = 0x40021004, PY_IWDG = 0x40003000;
+static const uint32_t PY_PAGE = 128, PY_MAIN = 0x08000000;
+
+// The timing registers TS0, TS1, TS2P, TPS3, TS3, PERTPE, SMERTPE, PRGTPE, PRETPE from the factory bytes
+static int py_timing() {
+  uint32_t icscr = 0;
+  TRY(rd(PY_RCC_ICSCR, &icscr));
+  uint32_t fs = (icscr >> 13) & 7;                       // HSI_FS
+  uint32_t src = fs == 5 ? 0x1FFF0130 : 0x1FFF011C;      // _FlashTimmingParam[] of the HAL
+  uint32_t p[5];
+  for (int i = 0; i < 5; i++) TRY(rd(src + 4 * i, &p[i]));
+  if (p[0] == 0xFFFFFFFF || p[0] == 0 || p[4] == 0xFFFFFFFF || p[4] == 0) return SWDF_ERR_TIMING;
+  const uint32_t v[9] = {p[0] & 0x1FF,          (p[0] >> 18) & 0x3FF,  p[1] & 0x1FF,
+                         (p[1] >> 16) & 0xFFF,  (p[0] >> 9) & 0x1FF,   p[2] & 0x3FFFF,
+                         p[3] & 0x3FFFF,        p[4] & 0xFFFF,         (p[4] >> 16) & 0x3FFF};
+  // register order: TS0 0x100, TS1 0x104, TS2P 0x108, TPS3 0x10C, TS3 0x110, PERTPE 0x114, SMERTPE 0x118,
+  // PRGTPE 0x11C, PRETPE 0x120
+  for (int i = 0; i < 9; i++) {
+    uint32_t cur = 0;
+    TRY(rd(PY_TS0 + 4 * i, &cur));
+    if (cur != v[i]) TRY(wr(PY_TS0 + 4 * i, v[i]));
+  }
+  return SWD_OK;
+}
+
+static int py_unlock() {
+  uint32_t cr = 0;
+  TRY(rd(PY_CR, &cr));
+  if (cr & PY_CR_LOCK) {
+    TRY(wr(PY_KEYR, ST_KEY1));
+    TRY(wr(PY_KEYR, ST_KEY2));
+    TRY(rd(PY_CR, &cr));
+    if (cr & PY_CR_LOCK) return SWDF_ERR_LOCKED;
+  }
+  // a watchdog started by the option bytes (IWDG_SW = 0) keeps running: give it the longest time-out
+  uint32_t optr = 0;
+  TRY(rd(PY_OPTR, &optr));
+  if (!(optr & (1u << 12))) {
+    TRY(wr(PY_IWDG + 0x0, 0x5555));
+    TRY(wr(PY_IWDG + 0x4, 6));                           // LSI / 256
+    TRY(wr(PY_IWDG + 0x8, 0xFFF));
+    TRY(wr(PY_IWDG + 0x0, 0xAAAA));
+  }
+  TRY(py_timing());
+  return wr(PY_SR, PY_SR_EOP | PY_SR_WRPERR);            // write 1 to clear
+}
+
+static int py_wait(uint32_t timeout_ms) {
+  uint32_t t0 = millis();
+  for (;;) {
+    uint32_t sr = 0;
+    TRY(rd(PY_SR, &sr));
+    if (!(sr & PY_SR_BSY)) {
+      if (sr & PY_SR_WRPERR) {
+        wr(PY_SR, PY_SR_WRPERR);
+        return SWDF_ERR_PROGRAM;
+      }
+      return SWD_OK;
+    }
+    wr(PY_IWDG, 0xAAAA);                                 // as the Keil algorithm: reload a running watchdog
+    if (millis() - t0 > timeout_ms) return SWDF_ERR_TIMEOUT;
+  }
+}
+
+// one operation: set the CR bits, write the trigger word, wait, clear the bits again
+static int py_erase(uint32_t bits, uint32_t addr, uint32_t timeout_ms) {
+  TRY(py_unlock());
+  uint32_t cr = 0;
+  TRY(rd(PY_CR, &cr));
+  TRY(wr(PY_CR, cr | bits | PY_CR_EOPIE));
+  int r = wr(addr, 0xFF);                                // any word of the page starts the erase
+  if (r == SWD_OK) r = py_wait(timeout_ms);
+  wr(PY_CR, cr & ~(bits | PY_CR_EOPIE | PY_CR_PGSTRT));
+  return r;
+}
+
+// one page; the bytes of the page outside addr..addr+len are written as 0xFF (they stay as they are)
+static int py_write(uint32_t addr, const uint8_t *data, int len) {
+  uint32_t page = addr & ~(PY_PAGE - 1);
+  if (addr < PY_MAIN || addr + len > page + PY_PAGE) return SWDF_ERR_ADDRESS;
+  uint8_t buf[PY_PAGE];
+  memset(buf, 0xFF, sizeof buf);
+  memcpy(buf + (addr - page), data, len);
+  TRY(py_unlock());
+  uint32_t cr = 0;
+  TRY(rd(PY_CR, &cr));
+  TRY(wr(PY_CR, cr | PY_CR_PG | PY_CR_EOPIE));
+  int r = swd_mem_write(0, page, buf, PY_PAGE - 4);      // words 0..30 into the page buffer
+  if (r == SWD_OK) r = wr(PY_CR, cr | PY_CR_PG | PY_CR_EOPIE | PY_CR_PGSTRT);
+  if (r == SWD_OK) r = swd_mem_write(0, page + PY_PAGE - 4, buf + PY_PAGE - 4, 4);   // the 32nd word starts it
+  if (r == SWD_OK) r = py_wait(50);
+  wr(PY_CR, cr & ~(PY_CR_PG | PY_CR_EOPIE | PY_CR_PGSTRT));
+  return r;
+}
+
 int swdf_call(uint32_t pc, uint32_t sp, uint32_t lr, const uint32_t *args, int nargs, uint32_t timeout_ms,
               uint32_t *r0) {
   TRY(wr(DHCSR, 0xA05F000B));                // halted, interrupts masked while the function runs
@@ -416,6 +523,7 @@ int swdf_call(uint32_t pc, uint32_t sp, uint32_t lr, const uint32_t *args, int n
 }
 
 int swdf_erase_page(uint32_t addr) {
+  if (fam == SWDF_PY32) return py_erase(PY_CR_PER, addr & ~(PY_PAGE - 1), 100);
   if (is_stm32()) return st_erase(addr);
   if (fam == SWDF_STM32L0) return l0_erase(addr);
   if (fam == SWDF_NRF53) {                   // nRF53: a page is erased by writing 0xFFFFFFFF into it
@@ -455,6 +563,7 @@ int swdf_erase_page(uint32_t addr) {
 }
 
 int swdf_write(uint32_t addr, const uint8_t *data, int len) {
+  if (fam == SWDF_PY32) return py_write(addr, data, len);
   if (is_stm32()) return st_write(addr, data, len);
   if (fam == SWDF_STM32L0) return l0_write(addr, data, len);
   if (fam == SWDF_NRF53) {
@@ -521,6 +630,7 @@ int swdf_write(uint32_t addr, const uint8_t *data, int len) {
 }
 
 int swdf_mass_erase() {
+  if (fam == SWDF_PY32) return py_erase(PY_CR_MER, PY_MAIN, 1000);   // main flash only, not the option bytes
   if (is_stm32()) return st_mass_erase();
   if (fam == SWDF_SAMD21 || fam == SWDF_SAMD51) return samd_chip_erase();
   if (fam == SWDF_NRF53) {

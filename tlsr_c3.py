@@ -7,8 +7,12 @@ Examples:
     python3 tlsr_c3.py -p /dev/ttyACM0 wf 0 firmware.bin
     python3 tlsr_c3.py -p /dev/ttyACM0 --rate 1500000 rf 0 0x80000 stock.bin --twice
     python3 tlsr_c3.py -p /dev/ttyACM0 --mode uart info
-    python3 tlsr_c3.py -p /dev/ttyACM0 --swd info                     # Arm SWD target (EFR32, nRF52, STM32)
+    python3 tlsr_c3.py -p /dev/ttyACM0 --swd info                     # Arm SWD target (EFR32, nRF52, STM32, PY32)
     python3 tlsr_c3.py -p /dev/ttyACM0 --swd rf 0 0x40000 efr32.bin --twice
+    python3 tlsr_c3.py -p /dev/ttyACM0 --wch info                     # WCH CH32V003 over SWIO, caught at power-up
+    python3 tlsr_c3.py -p /dev/ttyACM0 --bk info                      # Beken BK7231N / T over its UART download port
+    python3 tlsr_c3.py -p /dev/ttyACM0 --bk rf 0 0 backup.bin --twice # whole flash
+    python3 tlsr_c3.py -p /dev/ttyACM0 --bk wf 0 firmware.uf2 --run   # LibreTiny / ESPHome UF2
     python3 tlsr_c3.py -p /dev/ttyACM0 bridge 115200 --boot hi        # UART bridge, BOOT pin high
     python3 tlsr_c3.py -p /dev/ttyACM0 bridge-exit
 """
@@ -461,6 +465,45 @@ def nrf_info(f, say, part):
     return None
 
 
+# Puya PY32F002B type, also the MS32C001 (a PY32F002B-compatible part): DBGMCU IDCODE at 0x40015800 (the
+# 002B reads 0x20220064, the other PY32F0 parts 0x60001000, which have another flash controller); recognised from
+# the flash controller at 0x40022000 and the flash timing in the factory configuration bytes at 0x1FFF011C.
+PUYA_DEV = {0x064: 'PY32F002B'}
+PY32_FLASH, PY32_PAGE = 0x08000000, 128
+
+
+def puya_info(f, say, part):
+    if part != 0xC60:                                   # Cortex-M0+
+        return None
+    idcode = swd_word(f, 0x40015800)
+    if idcode & 0xfff in STM32 or idcode == 0x60001000:
+        return None
+    timing = [swd_word(f, 0x1FFF011C + 4 * i) for i in range(5)]
+    if timing[0] in (0, 0xffffffff) or timing[4] in (0, 0xffffffff):
+        return None
+    swd_word(f, 0x40022100)                             # FLASH TS0: only the Puya controller has it
+    cr = swd_word(f, 0x40022014)
+    # flash size: the first 1 k step that is not readable (the reserved space answers with a bus fault)
+    kb = 0
+    for k in range(1, 65):
+        try:
+            swd_word(f, PY32_FLASH + 1024 * k - 4)
+        except FlasherError:
+            break
+        kb = k
+    if kb == 64:                                        # no fault at all: size not known
+        kb = 0
+    name = PUYA_DEV.get(idcode & 0xfff)
+    label = ('Puya %s (DBGMCU IDCODE 0x%08x)' % (name, idcode) if name else
+             'Puya PY32F002B type, e.g. MS32C001 (DBGMCU IDCODE 0x%08x not in the list)' % idcode)
+    t = SwdTarget(label, kb * 1024 or None, PY32_PAGE, 'py32', PY32_FLASH, write_unit=PY32_PAGE,
+                  erase_unit=PY32_PAGE)
+    say('Chip:    %s, flash %s in %d-byte pages%s' % (
+        t.name, '%d kbytes' % kb if kb else 'size unknown', PY32_PAGE, '' if cr & (1 << 31) else ' (flash unlocked)'))
+    say('         option bytes 0x%08x (not changed by this tool)' % swd_word(f, 0x1FFF0080))
+    return t
+
+
 def samd_info(f, say, part):
     did = swd_word(f, 0x41002018)                      # DSU DID
     proc = did >> 28
@@ -657,7 +700,7 @@ def swd_info(f, quiet=False):
         if t is not None:
             return t
     # each probe reads addresses that do not exist on other chips: a bus fault there just means "not this one"
-    for probe in (efr32_info, nrf_info, stm32_info, samd_info):
+    for probe in (efr32_info, nrf_info, stm32_info, puya_info, samd_info):
         try:
             t = probe(f, say, part)
         except FlasherError:
@@ -814,12 +857,12 @@ def swd_write(f, t, addr, data, erase=True):
         ti_write(f, t, addr, data)
         return
     if t.family is None:
-        raise FlasherError('writing needs a recognised chip (EFR32 Series 1 / 2, nRF52)')
+        raise FlasherError('writing needs a recognised chip (see the README, Arm SWD)')
     if addr % 4 or len(data) % 4:
         data += b'\xff' * (-len(data) % 4)
         if addr % 4:
             raise FlasherError('the address must be a multiple of 4')
-    if t.flash and addr + len(data) > t.flash:
+    if t.flash and addr - t.base + len(data) > t.flash:      # addresses are absolute (base: STM32, PY32)
         raise FlasherError('0x%x bytes at 0x%x do not fit into %d kbytes of flash' % (len(data), addr, t.flash // 1024))
     if t.family == 'stm32f1' and addr + len(data) > STM32_FLASH + 0x80000:
         raise FlasherError('above 512 k: GD32F10x / F30x bank 1 has its own registers, not handled yet')
@@ -1106,6 +1149,755 @@ def spi_ops(f, args):
         f.cmd('PX', timeout=420)
 
 
+# ---- WCH CH32V003 over its single-wire debug interface (SDI, the SWIO pin): SWIO on the SWS wire, target power
+#      on the power pins so that it can be caught at power-up. The flash routines run on the flasher (W commands).
+WCH_FLASH, WCH_BOOT, WCH_BOOT_SIZE, WCH_OPT, WCH_RAM, WCH_PAGE = 0x08000000, 0x1FFFF000, 1920, 0x1FFFF800, 0x20000000, 64
+WCH_FACTORY_OPTIONS = bytes([0xa5, 0x5a, 0x97, 0x68, 0x00, 0xff, 0x00, 0xff, 0xff, 0x00, 0xff, 0x00, 0xff, 0x00, 0xff, 0x00])
+WCH_CPBR = 0x00010403          # what WCH's own host expects once the debug output is on
+
+
+class WchTarget:
+    def __init__(self, flash=16384, rdprt=False, wpr=0xffffffff, options=WCH_FACTORY_OPTIONS, name=''):
+        self.flash, self.rdprt, self.wpr, self.options, self.name = flash, rdprt, wpr, options, name
+
+
+def wch_mem(f, addr, size):
+    """Any range of target memory (word reads on the flasher)."""
+    start = addr - addr % 4
+    end = addr + size
+    end += -end % 4
+    out = bytearray()
+    for a in range(start, end, 1024):
+        out += bytes.fromhex(f.cmd('WM %d %d' % (a, min(1024, end - a))))
+    return bytes(out[addr - start:addr - start + size])
+
+
+def wch_word(f, addr):
+    return int.from_bytes(wch_mem(f, addr, 4), 'little')
+
+
+def wch_options_text(ob):
+    """The 16 option bytes as text: each byte is followed by its complement."""
+    def pair(i):
+        b, nb = ob[2 * i], ob[2 * i + 1]
+        return '%02x/%02x%s' % (b, nb, '' if nb == b ^ 0xff else ' (complement wrong)')
+    user = ob[2]
+    lines = ['RDPR  %s  %s' % (pair(0), 'read protection off' if ob[0] == 0xa5 else 'READ PROTECTED'),
+             'USER  %s  IWDG_SW %d, STANDBY_RST %d, RST_MODE %d, START_MODE %d' % (
+                 pair(1), user & 1, user >> 2 & 1, user >> 3 & 3, user >> 5 & 1),
+             'DATA  %s  %s' % (pair(2), pair(3)),
+             'WRPR  %s  %s  %s  %s%s' % (pair(4), pair(5), pair(6), pair(7),
+                                         '' if all(ob[8 + 2 * i] == 0xff for i in range(4)) else
+                                         '  (some pages write protected)')]
+    return lines
+
+
+def wch_attach(f, args, say=print):
+    off = 0 if args.external_power else args.wch_off
+    try:
+        answer = f.cmd('WA %d %d' % (off, args.wch_window), timeout=(off + args.wch_window) / 1000 + 10)
+    except FlasherError as e:
+        hint = ('\n  With external power the flasher cannot restart the target. If its firmware uses the SWIO pin '
+                '(pin 8 of the SOP8 is also UART TX), power it from the power pins and leave out --external-power.'
+                if args.external_power else
+                '\n  Check: GND to pin 2, the power pins to VDD (pin 4), SWIO (pin 8) on GPIO 5 and through 1 k on '
+                'GPIO 4; a longer --wch-off if the board has big capacitors; --wch-window for a slow start.')
+        raise FlasherError(str(e) + hint)
+    dmstatus, cpbr, tries, first_us, powered = answer.split()
+    tries, first_us = int(tries), int(first_us)
+    if powered == '1':
+        say('Attach:  core halted; first answer %.2f ms after power-on (try %d), dmstatus %s' % (
+            first_us / 1000, tries, dmstatus))
+    else:
+        say('Attach:  core halted at try %d (external power: no catch at power-up), dmstatus %s' % (tries, dmstatus))
+    if int(cpbr, 16) != WCH_CPBR:
+        say('         CPBR 0x%s, WCH\'s reference host expects 0x%08x' % (cpbr, WCH_CPBR))
+
+
+def wch_info(f, say=print):
+    dmi_id = int(f.cmd('WR 0x7f'), 16)
+    chipid = wch_word(f, 0x1FFFF7C4)
+    flacap = wch_word(f, 0x1FFFF7E0) & 0xffff
+    uid = [wch_word(f, a) for a in (0x1FFFF7E8, 0x1FFFF7EC, 0x1FFFF7F0)]
+    obr = wch_word(f, 0x4002201C)
+    wpr = wch_word(f, 0x40022020)
+    ob = wch_mem(f, WCH_OPT, 16)
+    v003 = (dmi_id & 0xfff00f00) == 0x00300500 or (chipid & 0xfff00f00) == 0x00300500
+    name = 'CH32V003' if v003 else 'not a CH32V003 (only the V003 is handled)'
+    flash = flacap * 1024 if 0 < flacap <= 256 else 16384
+    say('Chip:    %s, CHIPID 0x%08x (debug register 0x7f: 0x%08x), flash %d kbytes' % (name, chipid, dmi_id,
+                                                                                         flash // 1024))
+    say('UID:     %08x %08x %08x' % tuple(uid))
+    t = WchTarget(flash, bool(obr & 2), wpr, ob, name)
+    say('Flash:   OBR 0x%08x (%s%s), WPR 0x%08x%s' % (
+        obr, 'READ PROTECTED' if t.rdprt else 'not read protected', ', option byte error' if obr & 1 else '',
+        wpr, '' if wpr == 0xffffffff else ' (write protected pages)'))
+    for line in wch_options_text(ob):
+        say('Options: ' + line)
+    if not v003:
+        raise FlasherError('this chip id is not a CH32V003; refusing to go on')
+    return t
+
+
+def wch_options_dump(f, t, args):
+    """Shown before anything is written: the option bytes as they are, and where to keep them."""
+    print('Options: %s (RDPR USER DATA0 DATA1 WRPR0..3, each with its complement)' % t.options.hex())
+    if args.save_options:
+        with open(args.save_options, 'wb') as fh:
+            fh.write(t.options)
+        print('         saved to %s' % args.save_options)
+    else:
+        print('         (--save-options FILE keeps a copy; wf 0x1FFFF800 FILE --write-options puts them back)')
+
+
+def wch_area(t, addr, size):
+    """(name, start, end) of the memory area that holds addr..addr+size-1, or None."""
+    for name, start, n in (('flash', WCH_FLASH, t.flash), ('boot', WCH_BOOT, WCH_BOOT_SIZE), ('options', WCH_OPT, 64),
+                           ('ram', WCH_RAM, 2048)):
+        if start <= addr and addr + size <= start + n:
+            return name, start, start + n
+    return None
+
+
+def wch_addr(addr):
+    return addr + WCH_FLASH if addr < 0x01000000 else addr      # 0x00000000 is an alias of the user flash
+
+
+def wch_read(f, addr, size, progress=True):
+    start = addr - addr % 4
+    end = addr + size
+    end += -end % 4
+    data = f.stream_read('C', start, end - start, progress=progress)
+    return data[addr - start:addr - start + size]
+
+
+def wch_write_flash(f, t, addr, data):
+    """Page by page (64 bytes): what the image does not cover inside a page is read first and kept, pages that
+    already hold the data are left alone, the others are erased and written in runs."""
+    first = addr - addr % WCH_PAGE
+    end = addr + len(data)
+    end += -end % WCH_PAGE
+    old = bytearray(wch_read(f, first, end - first, progress=False))
+    want = bytearray(old)
+    want[addr - first:addr - first + len(data)] = data
+    runs, same = [], 0
+    for a in range(first, end, WCH_PAGE):
+        page = bytes(want[a - first:a - first + WCH_PAGE])
+        if page == old[a - first:a - first + WCH_PAGE]:
+            same += 1
+        elif runs and runs[-1][0] + len(runs[-1][1]) == a:
+            runs[-1][1] += page
+        else:
+            runs.append([a, bytearray(page)])
+    for start, buf in runs:
+        for a in range(start, start + len(buf), WCH_PAGE):
+            print('\rErase 0x%08x' % a, end='', flush=True)
+            f.cmd('WFE %d' % a, timeout=5)
+        print('\r' + ' ' * 28 + '\r', end='')
+        f.stream_write('C', start, bytes(buf), unit=WCH_PAGE, skip=True)
+    if same:
+        print('%d of %d pages already held the data.' % (same, (end - first) // WCH_PAGE))
+
+
+def wch_verify(f, addr, data):
+    start = addr - addr % 4
+    pre = wch_mem(f, start, addr - start) if addr > start else b''
+    body = pre + data
+    body_end = start + len(body)
+    tail = -body_end % 4
+    if tail:
+        body += wch_mem(f, body_end, tail)
+    for pos in range(0, len(body), 4096):
+        n = min(4096, len(body) - pos)
+        print('\rVerify 0x%08x' % (start + pos), end='', flush=True)
+        if int(f.cmd('WFC %d %d' % (start + pos, n), timeout=20), 16) != zlib.crc32(body[pos:pos + n]):
+            print()
+            return start + pos
+    print('\r' + ' ' * 24 + '\r', end='')
+    return None
+
+
+def wch_options_check(ob):
+    for i in range(8):
+        if ob[2 * i + 1] != ob[2 * i] ^ 0xff:
+            raise FlasherError('option byte %d: 0x%02x is not the complement of 0x%02x' % (i, ob[2 * i + 1], ob[2 * i]))
+
+
+def wch_unlock(f, t, args):
+    """Remove the read protection: the option bytes get RDPR = 0xA5 (and no write protection); the chip erases
+    its whole user flash when this happens."""
+    if not t.rdprt and t.wpr == 0xffffffff:
+        print('Neither read nor write protected: nothing to unlock.')
+        return
+    if not args.yes_erase_all:
+        raise FlasherError('unlock removes the read protection, and the chip then ERASES ITS WHOLE USER FLASH; '
+                           'nothing of the firmware can be read before. Add --yes-erase-all to go on.')
+    new = bytearray(t.options)
+    new[0:2] = b'\xa5\x5a'
+    for i in (1, 2, 3):                               # USER, DATA0, DATA1 stay unless their complement is broken
+        if new[2 * i + 1] != new[2 * i] ^ 0xff:
+            new[2 * i:2 * i + 2] = WCH_FACTORY_OPTIONS[2 * i:2 * i + 2]
+    new[8:16] = WCH_FACTORY_OPTIONS[8:16]             # no write protection
+    print('Options: %s -> %s' % (t.options.hex(), bytes(new).hex()))
+    f.cmd('WH reset', timeout=5)
+    f.cmd('WOB ' + bytes(new).hex(), timeout=20)
+    # the option bytes are loaded at reset: a power cycle when the flasher powers the target
+    print('Option bytes written; restarting the target to load them...')
+    wch_attach(f, args)
+    f.cmd('WH reset', timeout=5)
+    t2 = wch_info(f, say=lambda *a: None)
+    if t2.rdprt:
+        raise FlasherError('still read protected after the restart; power the target off and on, then run info')
+    blank = zlib.crc32(b'\xff' * t2.flash)
+    if int(f.cmd('WFC %d %d' % (WCH_FLASH, t2.flash), timeout=30), 16) != blank:
+        print('The user flash is not blank after the unlock; erasing it.')
+        f.cmd('WFX', timeout=10)
+    print('Read protection removed, user flash erased.')
+
+
+def wch_main(f, args):
+    print('WCH:     SWIO timing (ns) one/zero/high/slot/threshold/stop %s' % f.cmd('WCH').replace(' ', '/'))
+    if args.wch_timing:
+        print('         set to %s' % f.cmd('WT ' + ' '.join(args.wch_timing.split(','))).replace(' ', '/'))
+    wch_attach(f, args)
+    t = wch_info(f, say=print if args.op in ('info', 'unlock') else (lambda *a: None))
+    if args.op == 'info':
+        pass
+    elif args.op == 'rf':
+        addr = wch_addr(args.address)
+        area = wch_area(t, addr, args.size)
+        if area and area[0] == 'flash' and t.rdprt:
+            raise FlasherError('the flash is read protected: the debug port does not return its contents '
+                               '(unlock removes the protection and erases the flash)')
+        os.makedirs(os.path.dirname(os.path.abspath(args.filename)), exist_ok=True)
+        t1 = time.time()
+        data = wch_read(f, addr, args.size)
+        print('Read in %.1f s (%.0f kB/s)' % (time.time() - t1, len(data) / max(time.time() - t1, 1e-3) / 1000))
+        if args.twice:
+            bad = wch_verify(f, addr, data)
+            if bad is not None:
+                with open(args.filename + '.pass1', 'wb') as fh:
+                    fh.write(data)
+                raise FlasherError('the second pass differs in the block at 0x%08x; the first read was kept as '
+                                   '%s.pass1' % (bad, args.filename))
+            print('Second pass (CRC on the flasher) matches.')
+        with open(args.filename, 'wb') as fh:
+            fh.write(data)
+        print('Saved %d bytes to %s' % (len(data), args.filename))
+    elif args.op in ('wf', 'es', 'ea', 'unlock'):
+        wch_options_dump(f, t, args)
+        if args.op == 'unlock':
+            wch_unlock(f, t, args)
+        else:
+            if t.rdprt:
+                raise FlasherError('the chip is read protected: the flash cannot be erased or written page by page. '
+                                   '"unlock --yes-erase-all" removes the protection and erases everything')
+            f.cmd('WH reset', timeout=5)                # stopped at the reset vector, peripherals reset
+            if args.op == 'ea':
+                print('Mass erase of the user flash...')
+                f.cmd('WFX', timeout=10)
+            elif args.op == 'es':
+                addr = wch_addr(args.address)
+                area = wch_area(t, addr, max(args.size, 1))
+                if not area or area[0] not in ('flash', 'boot'):
+                    raise FlasherError('es: user flash 0x%08x..0x%08x or boot area 0x%08x..0x%08x only' % (
+                        WCH_FLASH, WCH_FLASH + t.flash, WCH_BOOT, WCH_BOOT + WCH_BOOT_SIZE))
+                start = addr - addr % WCH_PAGE
+                for a in range(start, addr + max(args.size, 1), WCH_PAGE):
+                    print('\rErase 0x%08x' % a, end='', flush=True)
+                    f.cmd('WFE %d' % a, timeout=5)
+                print()
+            else:
+                with open(args.filename, 'rb') as fh:
+                    data = fh.read()
+                if not data:
+                    raise FlasherError('empty file')
+                addr = wch_addr(args.address)
+                area = wch_area(t, addr, len(data))
+                if area is None:
+                    raise FlasherError('0x%x bytes at 0x%08x do not fit into one area: user flash 0x%08x (%d k), '
+                                       'boot 0x%08x (%d bytes), option bytes 0x%08x, RAM 0x%08x' % (
+                                           len(data), addr, WCH_FLASH, t.flash // 1024, WCH_BOOT, WCH_BOOT_SIZE,
+                                           WCH_OPT, WCH_RAM))
+                if area[0] == 'options':
+                    if addr != WCH_OPT or len(data) != 16:
+                        raise FlasherError('option bytes: exactly 16 bytes at 0x%08x' % WCH_OPT)
+                    wch_options_check(data)
+                    for line in wch_options_text(data):
+                        print('New:     ' + line)
+                    if data[0] != 0xa5:
+                        print('These option bytes switch the READ PROTECTION ON: afterwards the flash can only be '
+                              'opened again by erasing it.')
+                    if not args.write_options:
+                        raise FlasherError('writing the option bytes needs --write-options')
+                    f.cmd('WOB ' + data.hex(), timeout=20)
+                    print('Option bytes written; they take effect at the next reset or power cycle.')
+                    return t
+                print('Write 0x%08x..0x%08x (%s)' % (addr, addr + len(data), area[0]))
+                if area[0] == 'ram':
+                    f.stream_write('C', addr, data + b'\x00' * (-len(data) % 4), unit=WCH_PAGE, skip=False)
+                else:
+                    wch_write_flash(f, t, addr, data)
+                if not args.no_verify:
+                    bad = wch_verify(f, addr, data)
+                    if bad is not None:
+                        raise FlasherError('verify failed in the block at 0x%08x' % bad)
+                    print('Verified.')
+    else:
+        raise FlasherError('over SWIO: info, rf, wf, es, ea, unlock')
+    if args.run:
+        f.cmd('WRUN', timeout=5)
+        print('Target restarted (its firmware may take the SWIO pin again; the next command catches it at power-up).')
+    return t
+
+
+# ---- Beken BK72xx (BK7231N, BK7231T) over the UART download protocol: TX1 on the SWS wire, RX1 on GPIO 21, CEN on
+#      the reset wire, 3V3 on the power pins. The protocol itself runs on the flasher (BK commands, src/bk72xx.cpp).
+BK_BOOT_END = 0x11000           # the bootloader in flash, on BK7231N and BK7231T
+BK_SECTOR, BK_BLOCK = 0x1000, 0x10000
+BK_CHIPS = {0x7231C: 'BK7231N', 0x7231A: 'BK7231T', 0x7231: 'BK7231Q', 0x7238: 'BK7238', 0x7252: 'BK7252'}
+# CRC-32 of the first 256 bytes of the bootloader (257 on the BootROM protocol, whose CRC range includes the end
+# address), and the chip ID register value: from bk7231tools (MIT, tuya-cloudcutter/bk7231tools, serial/base/enums.py)
+BK_BOOTLOADERS = {
+    0xE14191BA: 'BK7231N 1.0.1', 0x9B49BF9C: 'BK7231N 3.0.1', 0xF42F8C32: 'BK7238 (T1) 2.0.0',
+    0x6BEB0924: 'BK7238 1.0.14', 0xF0231EF6: 'BK7231Q', 0xFF5A3EAC: 'BK7231Q (Tuya SDK)',
+    0xC1ECA871: 'BK7231T (BK7231S 1.0.1)', 0x4B31E44D: 'BK7231T (BK7231S 1.0.3)', 0xBA54C1B8: 'BK7231T (BK7231S 1.0.5)',
+    0xE5CBC953: 'BK7231T (BK7231S 1.0.6)', 0x2739019F: 'BK7231U 1.0.6', 0x39F9B50C: 'BK7252 0.1.3',
+    0xE3A27C26: 'BK7252 (SDK)'}
+# Number of status register bytes of the flash chips found on BK72xx modules, by JEDEC id: from bk7231tools
+# (MIT, serial/cmd_hl_flash.py, FLASH_SR_SIZE). The protection bits cleared before an erase or write are the same as
+# there: BP0..BP4 (bits 2..6) and, with two bytes, CMP (bit 14).
+BK_FLASH_SR = {
+    '0b4014': 2, '0b4015': 2, '0b4016': 2, '0b4017': 2, '0b6017': 2, '0e4016': 2, '1c3113': 1, '1c4116': 1,
+    '1c7015': 1, '1c7016': 1, '204016': 2, '514013': 1, '514014': 1, '5e4014': 1, '854215': 1, '852015': 2,
+    '856013': 2, '856014': 2, '856016': 2, '856017': 2, 'c22314': 2, 'c22315': 2, 'c84013': 1, 'c84014': 2,
+    'c84015': 2, 'c84016': 1, 'c86515': 2, 'c86516': 2, 'c86517': 2, 'cd6014': 2, 'e04013': 1, 'e04014': 1,
+    'eb6015': 2, 'ef4016': 2, 'ef4018': 2}
+BK_FLASH_VENDORS = {0x0B: 'XTX', 0x1C: 'ESMT / EON', 0x20: 'XMC', 0x51: 'GigaDevice (MD)', 0x5E: 'XTX / Zbit',
+                    0x68: 'Boya', 0x85: 'Puya', 0xA1: 'Fudan', 0xC2: 'Macronix', 0xC4: 'Giantec', 0xC8: 'GigaDevice',
+                    0xCD: 'TH', 0xE0: 'Boya', 0xEB: 'TH', 0xEF: 'Winbond'}
+# RF calibration with the MAC address (TLV) at these addresses, as ltchiptool reads it
+BK_CALIBRATION = {'BK7231N': 0x1D0000, 'BK7231T': 0x1E0000}
+UF2_FAMILIES = {0x7B3EF230: 'BK7231N', 0x675A40B0: 'BK7231T', 0xAFE81D49: 'BK7231Q'}
+
+
+class BkTarget:
+    def __init__(self, rom=True, baud=115200, chip_id=0, flash_id='', size=0x200000):
+        self.rom, self.baud, self.chip_id, self.flash_id, self.size = rom, baud, chip_id, flash_id, size
+        self.chip = BK_CHIPS.get(chip_id, '') if rom else 'BK7231T'
+        self.bootloader = ''
+        self.sr = None                # (value, bytes, mask) of the flash status registers, BootROM only
+
+
+def bk_spans(t, addr, size):
+    """The BK7231T bootloader refuses its own area, but the same flash is reached at the address plus the flash
+    size (the flash ignores the upper address bits): (address on the wire, logical address, length) pieces."""
+    out = []
+    while size > 0:
+        if not t.rom and addr < BK_BOOT_END:
+            n = min(size, BK_BOOT_END - addr)
+            out.append((addr + t.size, addr, n))
+        else:
+            n = size
+            out.append((addr, addr, n))
+        addr += n
+        size -= n
+    return out
+
+
+def bk_crc(f, t, addr, size):
+    """zlib CRC-32 of a flash range, computed by the target."""
+    crc = None
+    for wire, _, n in bk_spans(t, addr, size):
+        part = int(f.cmd('BKC %d %d' % (wire, n), timeout=10 + n / 50000), 16)
+        crc = part if crc is None else zlib_crc32_combine(crc, part, n)
+    return crc
+
+
+def zlib_crc32_combine(crc1, crc2, len2):
+    """CRC-32 of A + B from crc(A), crc(B) and len(B) (zlib's crc32_combine)."""
+    def gf2_times(mat, vec):
+        s, i = 0, 0
+        while vec:
+            if vec & 1:
+                s ^= mat[i]
+            vec >>= 1
+            i += 1
+        return s
+
+    def gf2_square(mat):
+        return [gf2_times(mat, mat[n]) for n in range(32)]
+    if len2 <= 0:
+        return crc1
+    odd = [0xEDB88320] + [1 << n for n in range(31)]
+    even = gf2_square(odd)
+    odd = gf2_square(even)
+    while True:
+        even = gf2_square(odd)
+        if len2 & 1:
+            crc1 = gf2_times(even, crc1)
+        len2 >>= 1
+        if not len2:
+            break
+        odd = gf2_square(even)
+        if len2 & 1:
+            crc1 = gf2_times(odd, crc1)
+        len2 >>= 1
+        if not len2:
+            break
+    return crc1 ^ crc2
+
+
+def bk_read(f, t, addr, size, progress=True):
+    out = b''
+    for wire, _, n in bk_spans(t, addr, size):
+        out += f.stream_read('B', wire, n, progress=progress)
+    return out
+
+
+def bk_attach(f, args):
+    print('BK72xx:  catching the target at power-up (up to %d s; reset by RST = CEN and the power pins)...'
+          % args.bk_seconds)
+    f.cmd('BK')
+    a = f.cmd('BKL %d %d' % (args.bk_seconds * 1000, args.bk_baud), timeout=2 * args.bk_seconds + 40).split(' ', 6)
+    rom, baud, resets, ms, fallback = a[0] == 'rom', int(a[1]), int(a[2]), int(a[3]), a[4] == '1'
+    print('Link:    %s protocol at %d baud, %d reset%s, answer %d ms after the last one%s' % (
+        'BootROM' if rom else 'bootloader', baud, resets, '' if resets == 1 else 's', ms,
+        ', %s bytes of its own firmware before' % a[5] if a[5] != '0' else ''))
+    if fallback:
+        print('         %d baud did not work (%s); using %d' % (args.bk_baud, a[6] if len(a) > 6 else '?', baud))
+    return rom, baud
+
+
+def bk_sr_layout(t, args):
+    """(status bytes, protection mask) of the flash, or None if the flash is not known."""
+    vendor = int(t.flash_id[:2], 16)
+    if vendor == 0xC2:
+        return 1, 0x3C          # Macronix: bit 6 is QE, BP0..BP3 only; the second byte is a configuration register
+    n = args.bk_sr or BK_FLASH_SR.get(t.flash_id)
+    if not n:
+        return None
+    return n, 0x407C if n == 2 else 0x7C
+
+
+def bk_status(f, n):
+    sr = int(f.cmd('BKSR 0x05'), 16)
+    if n == 2:
+        sr |= int(f.cmd('BKSR 0x35'), 16) << 8
+    return sr
+
+
+def bk_info(f, args, say=print):
+    rom, baud = bk_attach(f, args)
+    chip_id, fid = f.cmd('BKI').split()
+    t = BkTarget(rom, baud, int(chip_id, 16), fid)
+    if rom:
+        t.size = 1 << int(fid[4:6], 16) if 0x11 <= int(fid[4:6], 16) <= 0x19 else 0x200000
+        say('Chip:    %s (chip id 0x%x)' % (t.chip or 'unknown', t.chip_id))
+    else:
+        say('Chip:    bootloader protocol, no chip id: BK7231T (or another chip whose download code is in its '
+            'flash); flash size taken as 2 Mbytes')
+    crc = int(f.cmd('BKC 0 %d' % (257 if rom else 256)), 16)
+    t.bootloader = BK_BOOTLOADERS.get(crc, '')
+    say('Boot:    %s (CRC %08x of its first bytes)' % (t.bootloader or 'bootloader not in the list', crc))
+    if rom:
+        lay = bk_sr_layout(t, args)
+        vendor = BK_FLASH_VENDORS.get(int(fid[:2], 16), 'unknown maker')
+        if lay:
+            sr = bk_status(f, lay[0])
+            t.sr = (sr, lay[0], lay[1])
+            prot = 'protected, cleared before erase / write' if sr & lay[1] else 'not protected'
+            say('Flash:   JEDEC %s (%s), %d kbytes, status %0*x: %s' % (fid, vendor, t.size // 1024, 2 * lay[0],
+                                                                         sr, prot))
+        else:
+            sr = int(f.cmd('BKSR 0x05'), 16)
+            t.sr = (sr, 1, 0x7C)
+            say('Flash:   JEDEC %s (%s), %d kbytes, status 1 = %02x (%s); this flash is not in the list: '
+                '--bk-sr 1|2 gives its number of status bytes' % (fid, vendor, t.size // 1024, sr,
+                                                                  'protected' if sr & 0x7C else 'no BP bits set'))
+    cal = BK_CALIBRATION.get(t.chip)
+    if cal and cal + BK_SECTOR <= t.size:
+        tlv = bk_read(f, t, cal, 0x40, progress=False)
+        if tlv[0x1C:0x24] == b'\x02\x11\x11\x11\x06\x00\x00\x00':
+            say('MAC:     %s (in the RF calibration at 0x%x)' % (':'.join('%02x' % b for b in tlv[0x24:0x2A]), cal))
+    return t
+
+
+def bk_unprotect(f, t, args):
+    if not t.rom:
+        return                  # the BK7231T bootloader has no status register commands and unlocks by itself
+    lay = bk_sr_layout(t, args)
+    sr = bk_status(f, lay[0] if lay else 1)
+    if lay is None:
+        if sr & 0x7C:
+            raise FlasherError('flash %s is not in the list and its status register 0x%02x has protection bits set; '
+                               'give its number of status bytes with --bk-sr 1|2' % (t.flash_id, sr))
+        print('Flash %s: not in the list; status 1 has no BP bits set, going on' % t.flash_id)
+        return
+    n, mask = lay
+    if not sr & mask:
+        return
+    new = sr & ~mask
+    print('Flash:   status %0*x -> %0*x (protection off)' % (2 * n, sr, 2 * n, new))
+    f.cmd('BKSW 1 %s' % new.to_bytes(n, 'little').hex())
+    back = bk_status(f, n)
+    if back & mask:
+        raise FlasherError('the flash is still protected (status %0*x)' % (2 * n, back))
+
+
+def bk_guard(t, args, start, end, what):
+    """Refuse anything in the bootloader area unless --force-bootloader (never on a BK7231T)."""
+    if start >= BK_BOOT_END:
+        return
+    if not t.rom:
+        raise FlasherError('%s would touch 0x%x..0x%x: on a BK7231T the bootloader IS the UART download code; '
+                           'overwriting it bricks UART flashing (SPI only). Refused.' % (what, start, BK_BOOT_END))
+    if not args.force_bootloader:
+        raise FlasherError('%s would touch the bootloader area 0x0..0x%x. Refused; --force-bootloader allows it. '
+                           '(For an application image use the address 0x%x.)' % (what, BK_BOOT_END, BK_BOOT_END))
+    print('WARNING: %s touches the bootloader at 0x0..0x%x (--force-bootloader). On a BK7231N the BootROM keeps '
+          'UART flashing possible, but a wrong bootloader keeps the device from starting.' % (what, BK_BOOT_END))
+
+
+def bk_erase(f, t, start, end):
+    """Erase [start, end), 4 k aligned: 64 k blocks where a whole one is inside, 4 k sectors elsewhere."""
+    a = start
+    while a < end:
+        if a % BK_BLOCK == 0 and a + BK_BLOCK <= end:
+            print('\rErase 0x%06x (64 k)' % a, end='', flush=True)
+            f.cmd('BKE %d 64' % bk_spans(t, a, 1)[0][0], timeout=15)
+            a += BK_BLOCK
+        else:
+            print('\rErase 0x%06x      ' % a, end='', flush=True)
+            f.cmd('BKE %d' % bk_spans(t, a, 1)[0][0], timeout=6)
+            a += BK_SECTOR
+    print('\r' + ' ' * 28 + '\r', end='')
+
+
+def bk_write(f, t, addr, data):
+    """Sector by sector: sectors whose CRC already matches are skipped, what the image does not cover inside a
+    sector is read first and kept; each run of changed sectors is erased, then streamed in one go."""
+    if addr + len(data) > t.size:
+        raise FlasherError('0x%x bytes at 0x%x do not fit into %d kbytes' % (len(data), addr, t.size // 1024))
+    first = addr - addr % BK_SECTOR
+    end = addr + len(data)
+    end += -end % BK_SECTOR
+    want = bytearray()
+    if first < addr:
+        want += bk_read(f, t, first, BK_SECTOR, progress=False)[:addr - first]
+    want += data
+    if len(want) < end - first:
+        want += bk_read(f, t, end - BK_SECTOR, BK_SECTOR, progress=False)[len(want) - (end - BK_SECTOR - first):]
+    runs, skipped = [], 0
+    chunk = first
+    while chunk < end:                             # a CRC per 64 k block first, per 4 k inside one that differs
+        cend = min(end, chunk - chunk % BK_BLOCK + BK_BLOCK)
+        print('\rCompare 0x%06x' % chunk, end='', flush=True)
+        if bk_crc(f, t, chunk, cend - chunk) == zlib.crc32(want[chunk - first:cend - first]):
+            skipped += (cend - chunk) // BK_SECTOR
+        else:
+            for a in range(chunk, cend, BK_SECTOR):
+                part = bytes(want[a - first:a - first + BK_SECTOR])
+                if bk_crc(f, t, a, BK_SECTOR) == zlib.crc32(part):
+                    skipped += 1
+                elif runs and runs[-1][0] + len(runs[-1][1]) == a:
+                    runs[-1][1] += part
+                else:
+                    runs.append([a, bytearray(part)])
+        chunk = cend
+    print('\r' + ' ' * 28 + '\r', end='')
+    for start, buf in runs:
+        bk_erase(f, t, start, start + len(buf))
+        for wire, logical, n in bk_spans(t, start, len(buf)):
+            f.stream_write('B', wire, bytes(buf[logical - start:logical - start + n]), unit=BK_SECTOR, skip=True)
+    if skipped:
+        print('%d of %d sectors already held the data.' % (skipped, (end - first) // BK_SECTOR))
+
+
+def bk_verify(f, t, addr, data):
+    """The target's CRC of the whole range; on a mismatch, block by block to find the first bad one."""
+    if bk_crc(f, t, addr, len(data)) == zlib.crc32(data):
+        return None
+    for pos in range(0, len(data), BK_SECTOR):
+        n = min(BK_SECTOR - (addr + pos) % BK_SECTOR, len(data) - pos)
+        if bk_crc(f, t, addr + pos, n) != zlib.crc32(data[pos:pos + n]):
+            return addr + pos
+    return addr
+
+
+def uf2_parts(raw, chip=''):
+    """A LibreTiny / ESPHome UF2 (ltchiptool's uf2tool, OTA format 2): the parts written over UART (the "flasher"
+    OTA scheme) as [(flash offset, data)]. A block's address is relative to the partition that the last
+    OTA_PART_INFO tag names for that scheme; the partitions' offsets are in the FAL_PTABLE tag of the header."""
+    if len(raw) % 512 or not raw:
+        raise FlasherError('UF2: the size is not a multiple of 512')
+    gtags, part, family, parts, ptable = {}, None, None, [], {}
+    for i in range(0, len(raw), 512):
+        b = raw[i:i + 512]
+        m1, m2, flags, addr, length, seq, _, fam = (int.from_bytes(b[k:k + 4], 'little') for k in range(0, 32, 4))
+        if m1 != 0x0A324655 or m2 != 0x9E5D5157 or int.from_bytes(b[508:], 'little') != 0x0AB16F30 or length > 476:
+            raise FlasherError('UF2: bad block %d' % (i // 512))
+        if seq != i // 512:
+            raise FlasherError('UF2: block %d has the sequence number %d' % (i // 512, seq))
+        if flags & 0x2000:
+            family = fam
+        tags = {}
+        if flags & 0x8000:
+            tb = b[32 + length:508]
+            k = 0
+            while k + 4 <= len(tb) and tb[k]:
+                n = tb[k]
+                tags[int.from_bytes(tb[k + 1:k + 4], 'little')] = tb[k + 4:k + n]
+                k += n + (-n % 4)
+        if not length:
+            gtags.update(tags)
+            if 0x8288ED in tags:            # FAL_PTABLE: magic, name[16], flash name[16], offset, length, padding
+                pt = tags[0x8288ED]
+                for k in range(0, len(pt) - 47, 48):
+                    if int.from_bytes(pt[k:k + 4], 'little') == 0x45503130:
+                        name = pt[k + 4:k + 20].split(b'\0')[0].decode()
+                        ptable[name] = (int.from_bytes(pt[k + 36:k + 40], 'little'),
+                                        int.from_bytes(pt[k + 40:k + 44], 'little'))
+            continue
+        if 0xC0EE0C in tags:                # OTA_PART_INFO: 6 nibbles (partition index per scheme), names
+            info = tags[0xC0EE0C]
+            names = [x.decode() for x in info[3:].split(b'\0') if x]
+            index = int(info[0:3].hex()[3])     # scheme 3: FLASHER_SINGLE
+            part = names[index - 1] if index else None
+        if not part:
+            continue
+        if part not in ptable:
+            raise FlasherError('UF2: partition "%s" is not in the partition table of the file' % part)
+        start, plen = ptable[part]
+        if addr + length > plen:
+            raise FlasherError('UF2: data beyond the end of partition "%s"' % part)
+        offs = start + addr
+        if parts and parts[-1][0] + len(parts[-1][1]) == offs:
+            parts[-1][1] += b[32:32 + length]
+        else:
+            parts.append([offs, bytearray(b[32:32 + length])])
+    if 0x6C8492 not in gtags:
+        raise FlasherError('UF2: not the OTA format 2 of LibreTiny (ltchiptool 3.x or older wrote it); use the '
+                           '.0x011000.rbl image of the build instead')
+    if not parts:
+        raise FlasherError('UF2: nothing in it is meant for flashing over UART')
+    fam = UF2_FAMILIES.get(family, '0x%08x' % (family or 0))
+    if chip and fam != chip:
+        raise FlasherError('UF2: this image is for %s, the chip is %s' % (fam, chip))
+    board = gtags.get(0xCA25C8, b'').decode(errors='replace')
+    fw = gtags.get(0x00DE43, b'').decode(errors='replace')
+    ver = gtags.get(0x9FC7BC, b'').decode(errors='replace')
+    print('UF2:     %s %s, board %s, family %s: %s' % (fw, ver, board, fam, ', '.join(
+        '0x%x bytes at 0x%06x' % (len(d), o) for o, d in parts)))
+    return [(o, bytes(d)) for o, d in parts]
+
+
+def bk_image(f, t, args):
+    """The file of wf as [(flash address, data)], with the bootloader area handled."""
+    with open(args.filename, 'rb') as fh:
+        raw = fh.read()
+    if not raw:
+        raise FlasherError('empty file')
+    if raw[:4] == b'UF2\n':
+        parts = uf2_parts(raw, t.chip if t.chip in ('BK7231N', 'BK7231T') else '')
+        if args.address not in (0, parts[0][0]):
+            raise FlasherError('a UF2 says itself where it goes: give the address 0')
+        return parts
+    if raw[:4] == b'RBL\0':
+        raise FlasherError('this is an OTA package (it starts with its RBL header), not for flashing over UART: give '
+                           'the .uf2, the ..._app.0x011000.rbl (at 0x11000) or OpenBeken\'s _UA_ / _QIO_ .bin')
+    if raw[:4] == b'\x55\xaa\x55\xaa':
+        raise FlasherError('this is a Tuya OTA package (UG), not for flashing over UART')
+    addr = args.address
+    if addr == 0 and len(raw) > BK_BOOT_END and not args.force_bootloader:
+        # a full image: OpenBeken's _QIO_ file or a backup. Its bootloader part is left out.
+        chip_crc = bk_crc(f, t, 0, BK_BOOT_END)
+        same = chip_crc == zlib.crc32(raw[:BK_BOOT_END])
+        print('Full image from 0: its first 0x%x bytes (bootloader) are %s; written from 0x%x on. '
+              '--force-bootloader writes them too.' % (BK_BOOT_END, 'the same as on the chip' if same else
+                                                       'DIFFERENT from the chip\'s, which stays', BK_BOOT_END))
+        return [(BK_BOOT_END, raw[BK_BOOT_END:])]
+    if '_UA_' in os.path.basename(args.filename) and addr != BK_BOOT_END:
+        print('Note: OpenBeken\'s _UA_ images go to 0x%x.' % BK_BOOT_END)
+    return [(addr, raw)]
+
+
+def bk_main(f, args):
+    try:
+        bk_ops(f, args)
+    finally:
+        f.stop()                # after Ctrl-C or an error: stop a stream that may still run
+        time.sleep(0.3)
+        f.ser.reset_input_buffer()
+        f.rxbuf = b''
+
+
+def bk_ops(f, args):
+    if args.op not in ('info', 'rf', 'wf', 'es', 'ea'):
+        raise FlasherError('BK72xx: info, rf, wf, es, ea')
+    t = bk_info(f, args, say=print if args.op == 'info' else (lambda *a: None))
+    if args.op == 'info':
+        pass
+    elif args.op == 'rf':
+        size = args.size or t.size - args.address
+        if args.address + size > t.size:
+            raise FlasherError('0x%x bytes at 0x%x: beyond the flash (%d kbytes)' % (size, args.address, t.size // 1024))
+        os.makedirs(os.path.dirname(os.path.abspath(args.filename)), exist_ok=True)
+        t1 = time.time()
+        data = bk_read(f, t, args.address, size)
+        print('Read 0x%x bytes in %.1f s (%.0f kB/s); every 4 k block checked against the target\'s CRC' % (
+            size, time.time() - t1, size / max(time.time() - t1, 1e-3) / 1000))
+        if args.twice:
+            bad = bk_verify(f, t, args.address, data)
+            if bad is not None:
+                with open(args.filename + '.pass1', 'wb') as fh:
+                    fh.write(data)
+                raise FlasherError('the target\'s CRC of the range differs in the block at 0x%06x; the read was kept '
+                                   'as %s.pass1' % (bad, args.filename))
+            print('Second pass (CRC of the whole range on the target) matches.')
+        with open(args.filename, 'wb') as fh:
+            fh.write(data)
+        print('Saved %d bytes to %s' % (len(data), args.filename))
+    elif args.op == 'wf':
+        parts = bk_image(f, t, args)
+        for addr, data in parts:
+            bk_guard(t, args, addr, addr + len(data), 'writing 0x%06x..0x%06x' % (addr, addr + len(data)))
+        if args.force_bootloader:
+            f.cmd('BKG 0')
+        bk_unprotect(f, t, args)
+        for addr, data in parts:
+            print('Write 0x%06x..0x%06x' % (addr, addr + len(data)))
+            bk_write(f, t, addr, data)
+        if not args.no_verify:
+            for addr, data in parts:
+                bad = bk_verify(f, t, addr, data)
+                if bad is not None:
+                    raise FlasherError('verify failed in the block at 0x%06x' % bad)
+            print('Verified (CRC on the target).')
+    elif args.op == 'es':
+        start = args.address - args.address % BK_SECTOR
+        end = args.address + max(args.size, 1)
+        end = min(end + (-end % BK_SECTOR), t.size)
+        bk_guard(t, args, start, end, 'erasing 0x%06x..0x%06x' % (start, end))
+        if args.force_bootloader:
+            f.cmd('BKG 0')
+        bk_unprotect(f, t, args)
+        bk_erase(f, t, start, end)
+        print('Erased 0x%06x..0x%06x' % (start, end))
+    elif args.op == 'ea':
+        cal = BK_CALIBRATION.get(t.chip)
+        print('Erasing 0x%06x..0x%06x: everything but the bootloader%s.' % (
+            BK_BOOT_END, t.size, ', also the RF calibration and MAC address at 0x%x' % cal if cal else ''))
+        bk_unprotect(f, t, args)
+        bk_erase(f, t, BK_BOOT_END, t.size)
+    else:
+        raise FlasherError('BK72xx: info, rf, wf, es, ea')
+    if args.run:
+        f.cmd('BKX')
+        print('Target restarted (reboot command).')
+    return t
+
+
 def main():
     ap = argparse.ArgumentParser(description='ESP32-C3 Telink TLSR825x SWire flasher')
     ap.add_argument('-p', '--port', default='/dev/ttyACM0')
@@ -1139,6 +1931,33 @@ def main():
                          'module, not for a router), switched off at the end')
     ap.add_argument('--unprotect', action='store_true',
                     help='SPI flash: clear the block protection bits before wf / es / ea')
+    ap.add_argument('--wch', action='store_true',
+                    help='WCH CH32V003 over its single-wire debug pin (SWIO on the SWS wire, power on the power '
+                         'pins): info, rf, wf, es, ea, unlock')
+    ap.add_argument('--wch-off', type=auto_int, default=300,
+                    help='WCH: power-off time in ms before the catch at power-up (default 300)')
+    ap.add_argument('--wch-window', type=auto_int, default=100,
+                    help='WCH: how long to keep trying after power-on, ms (default 100)')
+    ap.add_argument('--external-power', action='store_true',
+                    help='WCH: the target has its own supply; no power cycle, so no catch at power-up')
+    ap.add_argument('--wch-timing', default='',
+                    help='WCH: SWIO timing in ns: one,zero,high,slot,threshold,stop (default 250,1000,375,1500,550,4000)')
+    ap.add_argument('--save-options', default='', help='WCH: save the 16 option bytes to this file first')
+    ap.add_argument('--write-options', action='store_true',
+                    help='WCH: allow wf to the option bytes (0x1FFFF800, 16 bytes)')
+    ap.add_argument('--yes-erase-all', action='store_true',
+                    help='WCH: confirm unlock (removing the read protection erases the whole user flash)')
+    ap.add_argument('--bk', action='store_true',
+                    help='Beken BK72xx (BK7231N, BK7231T: CB2S, CB3S, WB2S ...) over its UART download port: TX1 on '
+                         'the SWS wire, RX1 on GPIO 21, CEN on the reset wire, 3V3 on the power pins')
+    ap.add_argument('--bk-baud', type=auto_int, default=921600,
+                    help='BK72xx: speed after the link at 115200 (default 921600; 115200 when it fails)')
+    ap.add_argument('--bk-seconds', type=auto_int, default=10,
+                    help='BK72xx: how long to keep resetting and sending link checks (default 10)')
+    ap.add_argument('--bk-sr', type=int, choices=[1, 2], default=0,
+                    help='BK72xx: number of status register bytes of a flash chip that is not in the list')
+    ap.add_argument('--force-bootloader', action='store_true',
+                    help='BK72xx: allow wf / es in the bootloader area 0x0..0x11000 (BK7231N only)')
     ap.add_argument('--wake', action='store_true',
                     help='after activation switch the clocks on and wake the flash from deep power-down '
                          '(for a flash that reads all zeros / JEDEC 000000)')
@@ -1159,11 +1978,15 @@ def main():
     p.add_argument('address', type=auto_int)
     p.add_argument('size', type=auto_int)
     sub.add_parser('ea', help='erase the whole flash')
+    sub.add_parser('unlock', help='WCH: remove the read protection (ERASES the user flash; needs --yes-erase-all)')
     p = sub.add_parser('bridge', help='make the flasher a UART bridge to the target (RX = SWS wire, TX = GPIO 21), '
                                       'then use another tool on the same port')
     p.add_argument('baud', type=auto_int)
     p.add_argument('--boot', choices=['hi', 'lo', 'z'], default='z',
                    help='level of the BOOT pin (GPIO 0) while the target is restarted (default: left open)')
+    p.add_argument('--catch', choices=['bk'],
+                   help='bk: reset the target (power pins and RST) every 1.5 s while the host sends and no Beken '
+                        'BK72xx ROM answer (04 0E) has come yet, so that a flash tool links without a manual reset')
     sub.add_parser('bridge-exit', help='leave the UART bridge')
     sub.add_parser('power-off', help='switch the target power pins off and make them inputs')
     p = sub.add_parser('led', help='drive every free pin low and then high for a moment, one after the other, '
@@ -1198,6 +2021,20 @@ def main():
             fw = (0, 0)
         if fw < (0, 18):
             raise FlasherError('this script needs flasher firmware 0.18 or newer on the C3 (binary streams)')
+        if args.wch:
+            if fw < (0, 22):
+                raise FlasherError('WCH mode needs flasher firmware 0.22 or newer on the C3')
+            wch_main(f, args)
+            print('Done in %.1f s' % (time.time() - t0))
+            return
+        if args.op == 'unlock':
+            raise FlasherError('unlock is a WCH command (--wch)')
+        if args.bk:
+            if fw < (0, 24):
+                raise FlasherError('BK72xx mode needs flasher firmware 0.24 or newer on the C3')
+            bk_main(f, args)
+            print('Done in %.1f s' % (time.time() - t0))
+            return
         if args.spi:
             if fw < (0, 21):
                 raise FlasherError('SPI flash needs flasher firmware 0.21 or newer on the C3 (chip select moved '
@@ -1227,6 +2064,8 @@ def main():
         if args.op in ('bridge', 'power-off') or args.swd:
             if fw < (0, 15):
                 raise FlasherError('this needs flasher firmware 0.15 or newer on the C3')
+        if args.op == 'bridge' and args.catch and fw < (0, 23):
+            raise FlasherError('--catch needs flasher firmware 0.23 or newer on the C3')
         if args.op == 'power-off':
             f.cmd('PWR 0')
             time.sleep(0.2)
@@ -1234,7 +2073,7 @@ def main():
             print('Target power off, power pins are inputs.')
             return
         if args.op == 'bridge':
-            print(f.cmd('BRIDGE %d %s' % (args.baud, args.boot)))
+            print(f.cmd('BRIDGE %d %s%s' % (args.baud, args.boot, ' ' + args.catch if args.catch else '')))
             f.ser.close()
             print('The port is free for the target tool now. Do not let it toggle DTR / RTS (they reset the C3);')
             print('for example esptool --before no_reset --after no_reset. Leave with: bridge-exit')
@@ -1297,7 +2136,7 @@ def main():
                     f.cmd('SFAM ' + t.family + t.sfam_args)
                     f.cmd('SHALT reset')
                     if args.op == 'ea' and t.family in ('efr32s1', 'nrf52', 'nrf53', 'stm32f1', 'stm32f4', 'stm32v2',
-                                                        'stm32u5', 'samd21', 'samd51'):
+                                                        'stm32u5', 'samd21', 'samd51', 'py32'):
                         print('Mass erase %s...' % t.name)
                         f.cmd('SFX', timeout=60)
                         if t.family == 'nrf53':

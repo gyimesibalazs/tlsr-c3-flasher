@@ -55,3 +55,22 @@
 #define PIN_SPI_DI PIN_SWS_TX     // flash DI (MOSI) = the SWS wire, driven through its resistor
 #define PIN_SPI_DO PIN_BRIDGE_TX  // flash DO (MISO) = the UART bridge TX wire, an input here
 #define SPI_KHZ_DEFAULT 4000
+
+// ---- WCH CH32V003 single-wire debug (SDI, the "SWIO" pin), on the SWS wire: GPIO 4 drives it through the
+// resistor (the line idles high through it), GPIO 5 reads it. The RMT peripheral times the pulses (12.5 ns).
+// Bit timing of the debug interface (QingKe V2 debug manual, normal "2x" mode after reset, T = 125 ns):
+//   1: low T..4T, high T..16T;  0: low 6T..64T, high T..16T;  stop: high for 18T or longer.
+// The defaults sit inside those windows with margin on both sides (WCH's own reference host uses about
+// 232 / 739 / 274 ns; the T values are those of the chip's 8 MHz debug clock).
+#define WCH_ONE_LOW_NS 250        // low part of a 1 bit
+#define WCH_ZERO_LOW_NS 1000      // low part of a 0 bit
+#define WCH_HIGH_NS 375           // high part of every bit the host sends
+#define WCH_READ_SLOT_NS 1500     // one bit read from the target: our short low pulse plus the target's answer
+#define WCH_READ_THRESHOLD_NS 550 // a read bit is 0 when the line stayed low longer than this
+#define WCH_STOP_NS 4000          // high after every packet (the stop condition is 18T = 2.25 us)
+#define WCH_LINE_RESET_US 100     // low for this long resets the debug interface (256T = 32 us are needed)
+// Catch at power-up: the power pins are switched off for WCH_OFF_MS, then the handshake is repeated from the
+// first microsecond after power returns, for up to WCH_CATCH_MS, so that the core is halted before the
+// firmware can turn the SWIO pin into something else (on the SOP8 CH32V003J4M6 pin 8 is also UART TX).
+#define WCH_OFF_MS 300
+#define WCH_CATCH_MS 100

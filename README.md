@@ -1,20 +1,27 @@
-# ESP32-C3 flasher: Telink SWS, Arm SWD, cJTAG, JTAG and SPI flash
+# ESP32-C3 flasher: Telink SWS, Arm SWD, cJTAG, JTAG, SPI flash, WCH SWIO and Beken UART
 
 An ESP32-C3 board as a flasher for small boards' chips: Telink TLSR825x over its single-wire debug pin (SWS,
-where it started), Arm Cortex-M chips over SWD or JTAG, TI CC13xx / CC26xx over two-wire cJTAG and 25-series
-SPI NOR flash. It also works as a USB–UART bridge. All modes use the same few wires; one is active at a time.
+where it started), Arm Cortex-M chips over SWD or JTAG, TI CC13xx / CC26xx over two-wire cJTAG, 25-series
+SPI NOR flash, the WCH CH32V003 over its single-wire debug pin (SWIO) and Beken BK7231N / BK7231T Wi-Fi chips
+over their UART download port. It also works as a USB–UART bridge.
+All modes use the same few wires; one is active at a time.
 
-**What is tested (2026-11-23).** Only the Telink mode has been used on real boards. The other modes are
-written from the vendors' documentation and headers and checked without hardware (see `tests/`); expect to
-find bugs on the first real chip, and keep a backup.
+**What is tested (2026-11-25).** The Telink mode has been used on real boards, the Arm SWD mode on one
+chip: a Puya MS32C001 (PY32F002B type) in a Tuya dimmer, read and written several times (see
+[Arm SWD](#arm-swd)), and the Beken mode on a CB2S (BK7231N) in a Tuya FS-05R dimmer: full backup read and an
+ESPHome firmware written (see [Beken](#beken-bk72xx-cb2s-cb3s-wb2s--over-uart)). The other modes are written from
+the vendors' documentation and headers and checked without hardware (see `tests/`); expect to find bugs on the
+first real chip, and keep a backup.
 
 | Mode | Option | Targets | Tested |
 |---|---|---|---|
 | [Telink SWS](#telink-tlsr825x-over-sws) | (default) | TLSR8251 / 8253 / 8258 (Tuya "Z2", ZT2S, ZTU …) | on hardware: five kinds of boards |
-| [Arm SWD](#arm-swd) | `--swd` | EFR32, nRF52 / nRF5340, STM32, SAM D / E, RP2040, GD32 / CH32 (F1 compatible) | no |
+| [Arm SWD](#arm-swd) | `--swd` | EFR32, nRF52 / nRF5340, STM32, SAM D / E, RP2040, GD32 / CH32 (F1 compatible), Puya PY32F002B / MS32C001 | on hardware: Puya MS32C001 (info, read, write); the other chips no |
 | [cJTAG](#ti-cc13xx--cc26xx-over-two-wire-cjtag) | `--cjtag` | TI CC13xx / CC26xx | no |
 | [JTAG](#four-wire-jtag) | `--jtag` | chain scan; Arm chips behind a JTAG-DP as over SWD | against a simulated chain |
 | [SPI flash](#spi-nor-flash-eg-a-routers) | `--spi` | 25-series SPI NOR (routers, dongles, modules) | host logic against simulated chips |
+| [WCH SWIO](#wch-ch32v003-over-swio) | `--wch` | WCH CH32V003 (SOP8 J4M6, TSSOP20 F4P6, …) | no; firmware and host against a simulated chip |
+| [Beken UART](#beken-bk72xx-cb2s-cb3s-wb2s--over-uart) | `--bk` | BK7231N (Tuya CB2S, CB3S, …), BK7231T (WB2S, WB3S, …) | on hardware: CB2S (BK7231N; read, write); BK7231T no |
 | [UART bridge](#uart-bridge) | `bridge` | any 3.3 V UART, with a BOOT pin | no |
 
 ## Board, build and upload
@@ -30,15 +37,15 @@ Needs the Arduino core 3.x (ESP-IDF 5) for the RMT driver.
 
 One table for every mode; the wires are shared:
 
-| ESP32-C3 wire | SWS (Telink) | SWD (EFR32, nRF5x, STM32, …) | cJTAG (TI CC13xx / CC26xx) | JTAG | SPI flash | UART bridge |
-|---|---|---|---|---|---|---|
-| GPIO 4 –1 k– GPIO 5 (the SWS wire) | SWS | SWDIO | TMSC | TDI | DI (flash pin 5) | target TX → flasher RX (GPIO 4 is an input) |
-| GPIO 0 | – | SWCLK | TCKC | TCK | CLK (pin 6) | BOOT (`--boot hi` / `lo`, open by default) |
-| GPIO 21 | – | – | – | TDO | DO (pin 2) | flasher TX → target RX |
-| GPIO 20 | – | – | – | TMS | /CS (pin 1) | – |
-| GPIO 6 | RST | nRESET | nRESET | nRESET | RESET of the board's processor, held low | RESET |
-| GPIO 7 (+ 10, 3, 1) | target power | target power | target power | target power | target power with `--power` only | target power |
-| GND | GND | GND | GND | GND | GND (pin 4) | GND |
+| ESP32-C3 wire | SWS (Telink) | SWD (EFR32, nRF5x, STM32, …) | cJTAG (TI CC13xx / CC26xx) | JTAG | SPI flash | SWIO (WCH CH32V003) | Beken UART (BK7231N / T) | UART bridge |
+|---|---|---|---|---|---|---|---|---|
+| GPIO 4 –1 k– GPIO 5 (the SWS wire) | SWS | SWDIO | TMSC | TDI | DI (flash pin 5) | SWIO (PD1; SOP8 pin 8) | TX1 (P11; CB2S pad 7), GPIO 4 an input | target TX → flasher RX (GPIO 4 is an input) |
+| GPIO 0 | – | SWCLK | TCKC | TCK | CLK (pin 6) | – | – | BOOT (`--boot hi` / `lo`, open by default) |
+| GPIO 21 | – | – | – | TDO | DO (pin 2) | – | RX1 (P10; CB2S pad 5) | flasher TX → target RX |
+| GPIO 20 | – | – | – | TMS | /CS (pin 1) | – | – | – |
+| GPIO 6 | RST | nRESET | nRESET | nRESET | RESET of the board's processor, held low | – (not used) | CEN (CB2S pad 10) | RESET |
+| GPIO 7 (+ 10, 3, 1) | target power | target power | target power | target power | target power with `--power` only | VDD (SOP8 pin 4), switched for the catch | 3V3 (CB2S pad 1), switched for the catch | target power |
+| GND | GND | GND | GND | GND | GND (pin 4) | VSS (SOP8 pin 2) | GND (CB2S pad 3) | GND |
 
 The SWS wire is one target pin: GPIO 5 goes to it directly, GPIO 4 through a 1 k … 1.8 k resistor.
 In the SPI mode the flash's /WP (pin 3) and /HOLD (pin 7) must be high (3.3 V) if the board does not pull them
@@ -71,7 +78,7 @@ something does not short it. The power pins stay inputs until the target is powe
     pip install pyserial
 
 `-p` gives the port (default `/dev/ttyACM0`); on Windows use `py tlsr_c3.py -p COM12 ...`. Without a mode
-option the commands talk to a Telink chip; `--swd`, `--cjtag`, `--jtag` and `--spi` select the others. The
+option the commands talk to a Telink chip; `--swd`, `--cjtag`, `--jtag`, `--spi`, `--wch` and `--bk` select the others. The
 commands are the same in every mode where they make sense: `info`, `rf addr len file [--twice]` (read flash),
 `wf addr file` (write and verify), `es addr len` (erase), `ea` (erase all), `--run` (restart the target at the
 end).
@@ -222,6 +229,8 @@ by the sources read: check them in your own dump):
 
 `info` reads the IDCODE, the access ports, the CPU type and, for Silicon Labs EFR32 (Series 1 and 2) and
 Nordic nRF52, the device information (part, flash size, page size). `--swd-khz` sets the clock (default 1000).
+For a Puya PY32F002B-type chip it prints the DBGMCU IDCODE, the flash size (found from the first kbyte that answers
+with a bus fault) and the option bytes.
 
 The flash routines run on the flasher (`SFAM`, `SFE`, `SFW`, `SFX`, `SFC`): the core is stopped at its reset
 vector, the touched pages are erased, the data goes in 512-byte pieces, and the verify compares CRCs computed
@@ -241,6 +250,7 @@ on the flasher. Register maps from the Silicon Labs device headers and Nordic's 
 | STM32 L0, L1 | PECR at 0x40022000 / 0x40023C00, word programming; a page is erased by writing a word with ERASE + PROG | 128 / 256 B | page by page |
 | STM32 U5 | non-secure registers (NSCR) at 0x40022000, quad-word programming, two banks | 8 k | MER1 + MER2 (TrustZone off only) |
 | RP2040 | external QSPI flash, written by the boot ROM's own routines run on core 0 | 4 k | – (give the range to `es`) |
+| Puya PY32F002B type: PY32F002B, MS32C001 (power stage of Tuya dimmers); **tested on an MS32C001** | FLASH at 0x40022000: page buffer (PG, 31 words, PGSTRT, the 32nd word); erase / program timing registers loaded from the factory bytes at 0x1FFF011C (0x1FFF0130 for HSI_FS = 5), as Puya's HAL does | 128 B | MER (main flash only) |
 
 STM32 addresses may be given from 0 (taken as 0x08000000), RP2040 ones from 0 (taken as 0x10000000). The
 RP2040 is reached through its multi-drop port (core 0); `info` cannot read the size of its external flash,
@@ -254,7 +264,26 @@ firmware written there must keep it open as well (nrfx `nrf53_handle_approtect`)
 A debug-locked EFR32 shows only its AAP and cannot be read or written: Series 1 opens with the AAP mass
 erase, Series 2 through the Secure Engine; neither is implemented yet. A read-protected STM32 (RDP) is
 reported by `info`; removing the protection erases the chip and is not implemented either.
-Nothing of the SWD part is tested on hardware yet.
+A Puya chip is recognised by its DBGMCU IDCODE (0x20220064 is the PY32F002B, and the MS32C001 reports the same), or, with an unknown IDCODE, by its flash controller and the flash timing in its factory configuration
+bytes; the PY32F002A / F003 / F030 (IDCODE 0x60001000) have another flash controller and are not handled. The
+option bytes are never written. If the option bytes start the watchdog in hardware mode, it gets its longest
+time-out (about 32 s) before each operation, as Puya's Keil algorithm does. The routine follows Puya's HAL and
+Keil flash algorithm for the PY32F002B and is checked against a simulated chip only (`tests/py32_sim`).
+
+**On hardware (2026-11-24): Puya MS32C001L12S6**, the SOP8 power-stage MCU of a Tuya TS0052 Zigbee dimmer
+(pads DIO / CLK / 3.3 V / GND on the board; SOP8 pin 1 VCC, 2 SWDIO = PB6, 3 SWCLK = PA2, 8 GND):
+
+- `info`: SW-DP IDCODE 0x0bc11477, AHB-AP IDR 0x04770031, Cortex-M0+ (CPUID 0x410cc601), DBGMCU IDCODE
+  0x20220064, option bytes 0x2f55d0aa. The flash probe reports 24 kbytes, although the datasheet says 18: the chip
+  is a PY32F002B inside, or the range above 18 k still answers; nothing above 18 k was written.
+- `rf 0x08000000 0x4800 ... --twice`: the stock firmware (18432 bytes, readable, no read protection) read twice
+  with identical results.
+- `wf 0x08000000 ... --run` (6.4 to 7.2 kbytes, about ten times that day): erase, program through the page buffer,
+  CRC verify and restart all worked, about 3 s for 7 k; the new firmware ran at once, and its RAM counters were
+  read back with `rf 0x20000000 ...` while it ran.
+- `info` and `rf` do not stop the core; the stock firmware leaves SWD on its pins.
+
+The other SWD targets in the table are still untested on hardware.
 
 ## TI CC13xx / CC26xx over two-wire cJTAG
 
@@ -338,10 +367,266 @@ the power pins on after the reset is down and off at the end: for a flash out of
 a small module. Clock 4 MHz by default (`--spi-khz`, the DI wire goes through 1 k); the read and write speeds
 are printed (binary streams, see the host protocol). Not tested on hardware yet.
 
+## WCH CH32V003 over SWIO
+
+The CH32V003 has a one-wire debug interface, which WCH calls SDI and whose pin is SWIO (PD1). It goes on the
+SWS wire, and the target's VDD on the power pins, so that the flasher can switch it off and catch it while it
+starts:
+
+| CH32V003J4M6 (SOP8) pin | Flasher wire |
+|---|---|
+| 8: PD1 = SWIO, bonded together with PD4 and PD5 (UART TX) | SWS wire: GPIO 5 directly, GPIO 4 through 1 k |
+| 4: VDD | power pins GPIO 7 (+ 10, 3, 1) |
+| 2: VSS | GND |
+| 1 (PD6 / PA1, UART RX), 3 (PA2), 5 (PC1), 6 (PC2), 7 (PC4) | – |
+
+In the other packages SWIO is PD1 alone: pin 18 of the TSSOP20 (F4P6); after the pinout drawings linked from
+the ch32v003fun README, pin 7 of the SOP16 (A4M6) and pin 15 of the QFN20 (F4U6); check the datasheet before
+soldering. The reset pin (PD7, not on the SOP8) is not used.
+
+**These dimmer and switch boards are not isolated from the mains.** Disconnect both mains wires before
+connecting the flasher, and power the board only from the flasher.
+
+    python3 tlsr_c3.py --wch info
+    python3 tlsr_c3.py --wch rf 0 0x4000 backup.bin --twice
+    python3 tlsr_c3.py --wch wf 0 firmware.bin --run
+    python3 tlsr_c3.py --wch es 0x3c00 0x400
+    python3 tlsr_c3.py --wch ea
+    python3 tlsr_c3.py --wch unlock --yes-erase-all --save-options options.bin
+    python3 tlsr_c3.py --wch wf 0x1FFFF800 options.bin --write-options
+    python3 tlsr_c3.py --wch --external-power info
+
+**Why pin 8 needs the catch at power-up.** On the SOP8 one pad carries PD1, PD4 and PD5. Once the firmware
+switches its UART on, PD5 drives the pad high as TX, and SWIO is gone: the flasher's pulses through 1 k do
+not move it (`SWIO never went low`). After a reset, though, every pin is an input and PD1 is SWIO. So every
+command starts the same way: SWIO is held low and the power pins are switched off for `--wch-off` ms (300),
+then on again, and from the first microsecond on the flasher repeats, for up to `--wch-window` ms (100), two
+halt requests, the debug output enable, two more halt requests and a read of the debug module status. The
+first sensible status means the core is halted; it stays halted until the end of the command, or `--run`
+restarts it. A halt request goes out about every 0.2 ms, so a firmware that takes the pin over sooner than
+that after its start is not caught; the error then says so.
+
+With `--external-power` the flasher does not switch the power: only a target whose firmware leaves SWIO
+alone can then be reached. A long window (`--external-power --wch-window 10000`) leaves time to switch an
+external supply on by hand while the flasher is trying. The power pins give about 40 mA each at their limit;
+join two or more on VDD, as for the other modes.
+
+**What the commands do.**
+
+- `info`: the chip id (CHIPID at 0x1FFFF7C4 and the debug register 0x7f), the flash size (0x1FFFF7E0), the
+  unique id, FLASH_OBR (read protection) and FLASH_WPR (write protection), and the 16 option bytes decoded.
+- Addresses: the user flash at 0x08000000 (an address below 0x01000000 is taken from there; 0 = 0x08000000),
+  16 k on the V003; the boot area at 0x1FFFF000, 1920 bytes (unlocked with its own key); the option bytes at
+  0x1FFFF800; RAM at 0x20000000. `rf` reads any of them, and registers too.
+- `wf` works in 64-byte pages: pages that already hold the data are skipped, what the image does not cover
+  inside a page is read first and kept, the rest is erased and written with the fast page programming
+  (16 words into the page buffer, then one program command), and verified by CRCs computed on the flasher.
+- `es` erases the 64-byte pages of the range, `ea` the whole user flash (mass erase; the boot area and the
+  option bytes stay).
+- Before `wf`, `es`, `ea` and `unlock` the option bytes are printed; `--save-options FILE` keeps a copy.
+- `wf 0x1FFFF800 file --write-options` writes the 16 option bytes (RDPR, USER, DATA0, DATA1, WRPR0..3, each
+  followed by its complement): the complements are checked, and an RDPR other than 0xA5, which switches the
+  read protection on, is pointed out first. They take effect at the next reset.
+- `--run` resets the chip and lets it run; its firmware may take the pin again, the next command catches it.
+
+**Read protection.** An RDPR other than 0xA5 protects the flash: `info` shows `READ PROTECTED`, the debug port
+does not return the flash contents, and `rf`, `wf`, `es` and `ea` refuse to start. `unlock --yes-erase-all`
+writes the option bytes with RDPR = 0xA5 (USER and DATA kept, write protection off); the chip then **erases
+its whole user flash**. There is no way to read the firmware of a protected chip first. The flasher restarts
+the target (a power cycle) to load the new option bytes, checks that the protection is gone and that the
+flash is blank, and erases it if it is not.
+
+**The protocol in brief.** From WCH's QingKe V2 debug manual (chapter 2, transport; chapter 3, debug
+module) and WCH's one-wire host example for a CH32F103:
+
+- The line idles high and every bit starts with a falling edge. A packet is a start bit 1, the 7-bit register
+  address, 1 = host writes / 0 = host reads, and 32 data bits, MSB first; a high of 18T or more ends it.
+  To read, the host sends a short low pulse per bit and the target keeps the line low for a 0.
+- After reset the interface runs in "normal mode 2x" with the debug clock of the HSI divided by 3 (8 MHz,
+  T = 125 ns); it needs the HSI running. A low of 256T or longer resets the interface.
+- The target answers only after the output enable: 0x5AA50400 into SHDWCFGR (0x7E), then into CFGR (0x7D).
+  CPBR (0x7C) then reads 0x00010403.
+- The debug module follows the RISC-V debug specification 0.13: dmcontrol 0x10 (halt request 0x80000001,
+  system reset 0x80000003, resume 0x40000001), dmstatus 0x11, abstractcs 0x16, command 0x17, abstractauto
+  0x18, data0 / data1 0x04 / 0x05, eight program buffer words 0x20..0x27. Abstract commands reach the core
+  registers only; memory goes through small programs in the program buffer. With abstractauto set every
+  access to data0 runs the program again, so a block costs one register access per word.
+- The flash controller at 0x40022000 is opened with the keys 0x45670123, 0xCDEF89AB in KEYR and in MODEKEYR
+  (fast mode); BOOT_MODEKEYR opens the boot area, OBKEYR the option bytes. Page erase (64 bytes): CTLR =
+  PAGE_ER, ADDR, CTLR = PAGE_ER | STRT. Programming: CTLR = PAGE_PG | BUF_RST, then per word a store into the
+  page and CTLR = PAGE_PG | BUF_LOAD, then ADDR and CTLR = PAGE_PG | STRT; BSY in STATR after each step.
+  Mass erase: MER, then MER | STRT. Option bytes: OPTER (+ STRT), then OPTPG and half-word stores.
+
+| | Debug manual, normal mode (T = 125 ns) | Here (default; `--wch-timing one,zero,high,slot,threshold,stop`) |
+|---|---|---|
+| 1 | low T..4T (125–500 ns), high T..16T | low 250 ns, high 375 ns |
+| 0 | low 6T..64T (0.75–8 µs), high T..16T | low 1000 ns, high 375 ns |
+| stop | high 18T (2.25 µs) or longer | 4 µs |
+| read bit | not given; the target holds the line low for a 0 | 250 ns pulse every 1.5 µs; a low longer than 550 ns is a 0 |
+| interface reset | low 256T (32 µs) or longer | 100 µs |
+
+The pulses come from the RMT peripheral (12.5 ns steps), as in the Telink mode: GPIO 4 drives the line through
+the 1 k resistor, so the high level is a strong pull-up the target can pull down, and GPIO 5 measures the
+length of every low pulse, ours and the target's. A packet is one RMT transmission that fits into the channel
+memory, so no interrupt can stretch a bit in the middle of it. Bit-banging with interrupts off would meet the
+timing as well, but the RMT measures the answer instead of sampling it at one instant. The defaults stay
+inside the manual's windows for a debug clock between about 6 and 16 MHz; the simulation checks them at
+±10 % of 8 MHz.
+
+Written from the sources in the credits and checked against a simulated chip (`tests/wch_sim`,
+`tests/test_wch_host.py`); nothing of it has run on a real CH32V003 yet.
+
+## Beken BK72xx (CB2S, CB3S, WB2S …) over UART
+
+The Beken BK7231N (Tuya CB2S, CB3S, CBU, …) and BK7231T (WB2S, WB3S, …) are flashed through their UART1 with
+Beken's download protocol. The flasher speaks that protocol itself, as ltchiptool and bk7231tools do on a PC: it
+catches the chip at power-up, links, raises the speed, and reads, erases and writes the flash, checking everything
+with the CRC the chip computes. No other tool is needed (the [UART bridge](#uart-bridge) with `--catch bk` is the
+older way, through ltchiptool).
+
+**On hardware (2026-11-25): a CB2S (BK7231N) in a Tuya FS-05R Wi-Fi dimmer.** The flasher caught the chip at
+power-up on its own, read the whole 2 MB flash (bk7231tools unpacked the bootloader, the application and the
+encrypted Tuya storage from it without an error), and wrote an ESPHome (LibreTiny) `.uf2` with `wf 0 … --run`,
+which booted and has been updated over the air since. Powered from the flasher's switched power pins alone, the
+module also started Wi-Fi and joined the network. Not tried yet: a BK7231T, and the bootloader area
+(`--force-bootloader`).
+
+| CB2S pad | Signal | Flasher wire |
+|---|---|---|
+| 7: TX1 (P11) | the chip's TX | SWS wire: GPIO 5 directly (GPIO 4, behind the 1 k, is an input here) |
+| 5: RX1 (P10) | the chip's RX | GPIO 21 |
+| 10: CEN | reset, active low | GPIO 6 (reset wire, open drain) |
+| 1: 3V3 | supply | power pins GPIO 7 (+ 10, 3, 1), joined; or the 3V3 pin |
+| 3: GND | | GND |
+
+Other modules have the same signals on other pads: look them up in the module's datasheet. With the power pins the
+flasher switches the module off and on for every catch; join all four on 3V3, as the chip draws more than one pin
+gives once its own firmware starts Wi-Fi. A module on the C3's 3V3 pin is restarted through CEN alone.
+
+**Another chip on UART1.** On boards like the Tuya FS-05R dimmer the module's UART1 is also wired to another chip
+on the board. Its TX fights the flasher's, and it may answer or print: disconnect it before flashing (lift the
+module, cut or lift the track, or keep that chip unpowered). **These boards are not isolated from the mains**:
+disconnect both mains wires and power the board only from the flasher.
+
+    python3 tlsr_c3.py --bk info
+    python3 tlsr_c3.py --bk rf 0 0 backup.bin --twice          # size 0 = to the end of the flash
+    python3 tlsr_c3.py --bk wf 0 firmware.uf2 --run            # ESPHome / LibreTiny
+    python3 tlsr_c3.py --bk wf 0x11000 OpenBK7231T_UA_<version>.bin
+    python3 tlsr_c3.py --bk es 0x1D3000 0x8000
+    python3 tlsr_c3.py --bk ea
+    python3 tlsr_c3.py --bk --bk-baud 460800 --bk-seconds 20 info
+
+**The catch.** The BK7231N's BootROM looks for a link check (`01 E0 FC 01 00`) on UART1 only for a moment after
+reset, then starts the firmware in flash. So every command starts by pulling CEN low and switching the power pins
+off for 300 ms (GPIO 21 is an input meanwhile, so that it does not feed the unpowered chip), and from the moment the
+power is back the flasher sends link checks back to back (0.43 ms each at 115200 baud) until the answer
+`04 0E 05 01 E0 FC 01 00` comes. Without an answer it resets again every 1.2 s, for `--bk-seconds` (10). If that
+fails, the error says what came back: nothing at all (wiring, power), or bytes of the chip's own firmware (`info`
+prints the start of them): then CEN and the power are not under the flasher's control, or another chip is on UART1.
+Without CEN and power wired, short CEN to GND for a moment while the flasher tries.
+
+**The protocol and the speed.** At 115200 baud the flasher reads the first 4 k of the application (0x11000) and
+asks the chip for the CRC of 256 bytes of it: the BootROM's CRC includes the end address (257 bytes), the BK7231T's
+bootloader's does not, which tells the two protocols apart. Then it sends the speed command (`--bk-baud`, default
+921600): the chip answers 50 ms later at the new speed, a link check must pass, and the same 4 k read again must
+equal the first. If any of it fails, the flasher returns to 115200 (with the chip's own speed command, or by
+catching it again) and says so. A read answer carries no checksum, so every 4 k block of `rf` is compared with the
+chip's CRC of it and read again (up to four times) when they differ. Expect about 30–40 s for 2 Mbytes at 921600
+(estimated, not measured yet).
+
+**The commands.**
+
+- `info`: protocol and speed, the chip id (register 0x800000: 0x7231C is the BK7231N), the bootloader (by the CRC of
+  its first bytes, in bk7231tools' list), the flash's JEDEC id, size and status register with its protection bits,
+  and the MAC address from the RF calibration (BK7231N 0x1D0000, BK7231T 0x1E0000).
+- `rf addr size file`: `size 0` reads to the end of the flash. `--twice` adds the chip's CRC of the whole range.
+- `wf addr file`: clears the flash protection, compares by CRC (per 64 k, then per 4 k) and skips sectors that
+  already hold the data, keeps what the file does not cover inside its first and last sector (read first), erases
+  64 k blocks where a whole one is covered and 4 k sectors elsewhere, writes in 4 k units and verifies with the
+  chip's CRC of each part.
+- `es addr size`: erases the 4 k sectors of the range (64 k blocks where possible).
+- `ea`: erases everything from 0x11000 to the end; the bootloader stays. That includes the RF calibration with the
+  MAC address and the Tuya configuration: have a backup.
+- `--run`: the reboot command (`0E A5`): the chip starts the firmware in flash.
+
+**The bootloader guard.** 0x0–0x11000 holds the bootloader. `wf` and `es` refuse anything there unless
+`--force-bootloader` is given, and the flasher's firmware refuses it as well (`BKG`). On the BK7231N the download
+code is in its ROM, so UART flashing keeps working, but a wrong bootloader keeps the device from starting until the
+backup is written back. On the BK7231T the download code *is* that bootloader: writing it is refused even with
+`--force-bootloader`; a broken one leaves only SPI flashing. A file written at 0 that is longer than 0x11000 (a full
+image such as OpenBeken's `_QIO_` file, or a backup) is written from 0x11000 on; the flasher says whether its
+bootloader part equals the chip's.
+
+**Flash protection.** Before an erase or write the BP0–BP4 bits (and CMP, on flash chips with two status bytes) are
+cleared, as ltchiptool does: the number of status bytes comes from bk7231tools' list of the flash chips found on
+these modules (by JEDEC id); for a Macronix chip only BP0–BP3 are cleared, its bit 6 is the quad enable. A flash that
+is not in the list is used if it shows no protection bits, otherwise `--bk-sr 1|2` gives its number of status
+bytes. The protection is not set again afterwards, as with ltchiptool.
+
+**Image formats.**
+
+| File | From | Give it to `wf` as |
+|---|---|---|
+| `firmware.uf2` | ESPHome / LibreTiny build | `wf 0 firmware.uf2`: the parts meant for UART flashing are taken out with their offsets (the application at 0x11000 and its RBL header near the end of that partition); the OTA part is left out |
+| `image_bk7231n_app.0x011000.rbl` | ESPHome / LibreTiny build directory | `wf 0x11000 file` |
+| `OpenBK7231N_QIO_<version>.bin` | OpenBeken release | `wf 0 file`: a full image, written from 0x11000 (see the guard) |
+| `OpenBK7231T_UA_<version>.bin` (a `_UA_` file) | OpenBeken release | `wf 0x11000 file` |
+| `backup.bin` from `rf 0 0` | this flasher | `wf 0 backup.bin`: everything but the bootloader |
+| `*_app.ota.rbl`, OpenBeken `.rbl`, `*.ug.bin` | OTA packages | refused: they are for updates over the air |
+
+A UF2 is read as ltchiptool's uf2tool writes it (OTA format 2): every data block's address is relative to the
+partition that the image's `OTA_PART_INFO` tag names for the "flasher" scheme, and the partitions' offsets come from
+the `FAL_PTABLE` tag of the file's header block. The UF2 family must match the chip (BK7231N 0x7B3EF230, BK7231T
+0x675A40B0).
+
+**The protocol in brief.** From ltchiptool and bk7231tools (packets, linking, the flash and chip commands) and
+OpenBeken's BK7231GUIFlashTool (its BK7231 flasher, for the details of the answers and the flash list):
+
+- Command: `01 E0 FC <n> <code> <payload>` (n = 1 + payload), or long: `01 E0 FC FF F4 <len:u16> <code> <payload>`
+  (len = 1 + payload). Answer: `04 0E <n> 01 E0 FC <code> <payload>` (n = 4 + payload), or long:
+  `04 0E FF 01 E0 FC F4 <len:u16> <code> <payload>`. Little endian.
+- Short commands: 0x00 link check (answer code 0x01, one byte 0); 0x03 read register (address → address, value);
+  0x0F set baud rate (baud:u32, delay_ms:u8; the same 5 bytes come back after the delay, at the new speed; the host
+  switches after half the delay); 0x10 CRC (start, end → CRC-32 with the zlib polynomial, started at 0xFFFFFFFF and
+  not inverted at the end, so the zlib CRC is its complement); 0x0E reboot (0xA5, no answer).
+- Long commands: 0x09 read 4 k (address → status, address, 4096 bytes); 0x07 write 4 k (address, 4096 bytes →
+  status, address); 0x0F erase (0x20 = 4 k sector or 0xD8 = 64 k block, address → status, size, address);
+  0x0C read a flash status register (opcode 0x05 / 0x35 / 0x15 → status, opcode, value); 0x0D write it (0x01 and
+  one or two bytes → status, opcode, bytes); 0x0E flash id (0x9F as u32 → status, one byte, the three JEDEC bytes;
+  some BootROM revisions give a length one short).
+
+| | BK7231N | BK7231T |
+|---|---|---|
+| Download code | BootROM | the bootloader in flash (0x0–0x11000) |
+| Chip id (register 0x800000) | 0x7231C | no register access |
+| CRC range | end address included | end address excluded |
+| Flash id, status registers | yes | no (the bootloader handles the protection) |
+| Reading 0x0–0x11000 | directly | refused; the same bytes at the address plus the flash size (2 Mbytes) |
+| After a CRC | – | the flash is write protected until the next link check (the flasher sends one) |
+| RF calibration, MAC | 0x1D0000 | 0x1E0000 |
+| Overwriting 0x0–0x11000 | the device does not start; UART flashing still works | UART flashing is gone |
+| Leaves the download mode | only on reboot | also when the host stays silent too long |
+
+Written from the sources in the credits and checked against a simulated BootROM / bootloader (`tests/bk_sim`,
+`tests/test_bk_host.py`); nothing of it has run on a real chip yet.
+
 ## UART bridge
 
     python3 tlsr_c3.py -p /dev/ttyACM0 bridge 115200 --boot hi     # restarts the target with BOOT high
     ... any serial tool on the same port, at the same baud ...
+    python3 tlsr_c3.py -p /dev/ttyACM0 bridge-exit
+
+For a Beken BK72xx the [`--bk` mode](#beken-bk72xx-cb2s-cb3s-wb2s--over-uart) (firmware 0.24) is the preferred
+way: the flasher speaks the download protocol itself, faster and with the bootloader guard. The bridge with
+`--catch bk` stays for using ltchiptool or another PC tool.
+
+`--catch bk` (firmware 0.23) is for a Beken BK72xx (CB2S, CB3S, WB2S ...), whose ROM answers a flash tool's
+link check only right after a reset: while the host sends and the target has not answered yet (`04 0E ...`),
+the flasher resets the target (power pins and RST) every 1.5 s. Wire the module's TX1 to the SWS wire, RX1 to
+GPIO 21, CEN to GPIO 6 and 3V3 to the power pins, keep the baud at 115200 in the tool, for example:
+
+    python3 tlsr_c3.py -p /dev/ttyACM0 bridge 115200 --catch bk
+    ltchiptool flash read -d /dev/ttyACM0 -b 115200 bk72xx backup.bin
     python3 tlsr_c3.py -p /dev/ttyACM0 bridge-exit
 
 The baud rate is fixed by the `bridge` command: the C3's USB port does not pass on the host's setting.
@@ -369,16 +654,35 @@ SPI flash: `SPI [khz]` (reset held low), `SPI 0` (leave, reset released), `PT he
 `PB addr len` (base64), `PC addr len` (CRC-32), `PE addr [0x20|0x52|0xD8]`, `PX` (chip erase),
 `PW addr hex` (within one 256-byte page), `PS` (status 1).
 
+WCH CH32V003 over SWIO (firmware 0.22): `WCH` (the SWS wire to SWIO, `OK <timing>`), `WCH 0` (leave),
+`WT [one zero high slot threshold stop]` (line timing in ns), `WA off_ms window_ms` (power off for off_ms if it
+is not 0, then catch: `OK <dmstatus> <cpbr> <tries> <µs to the first answer> <1 = power cycled>`, or `ERR` with
+the reason), `WR addr` / `WW addr value` (debug module registers), `WH [reset]` (halt), `WG` (resume),
+`WRUN` (reset and run), `WM addr len` (memory, hex, whole words), `WMW addr hex` (RAM / registers, whole
+words, up to 512 bytes per line), `WFU`
+(unlock, `OK <CTLR>`), `WFE addr` (erase the 64-byte page), `WFX` (mass erase), `WFW addr hex` (program inside
+one erased page), `WFC addr len` (CRC-32), `WOB hex` (erase and write the 16 option bytes).
+
+Beken BK72xx (firmware 0.24): `BK` (UART1 at 115200 on GPIO 21 / the SWS wire, `BK 0` leaves), `BKL catch_ms baud`
+(catch, link, protocol, speed: `OK <rom|bl> <baud> <resets> <ms to the answer> <1 = fell back to 115200>
+<bytes of the chip's own firmware before> [why it fell back]`, or `ERR` with what was seen), `BKI` (`OK <chip id>
+<flash JEDEC id>`, `0 000000` on the BK7231T), `BKRR addr` (register), `BKSR opcode` / `BKSW opcode hex` (flash
+status register), `BKC addr len` (zlib CRC-32 computed by the chip), `BKE addr [64]` (erase the 4 k sector / 64 k
+block), `BKR addr len` (read up to 512 bytes, hex), `BKB offset hex` + `BKW addr` (fill a 4 k buffer, write it to an
+erased sector), `BKG [first writable address [flash size]]` (the bootloader guard, 0x11000 after `BK`), `BKX` (reboot).
+
 Bulk data moves in binary streams (firmware 0.18), not in text answers: `XR <src> <addr> <len>` answers
 `OK <len>` and then frames `D <n:u16> <data> <crc32>` of up to 4 k (`E <n:u16> <text>` on an error, `Z` at
 the end); `XW <dst> <addr> <len> <unit> <skip>` answers `OK`, then takes frames `<n:u16> <data> <crc32>` and
 answers each with `K` once it is written. The host keeps up to three frames on their way, so the next ones
 wait in the C3's 16 k receive buffer while one is programmed. After an error the C3 drops everything until
 the line has been quiet for 300 ms, so frames sent ahead never reach the command parser. Sources and
-destinations: `F` Telink flash, `S` SWD flash (write) / memory (read), `M` SWD memory, `P` SPI flash; `unit`
+destinations: `F` Telink flash, `S` SWD flash (write) / memory (read), `M` SWD memory, `P` SPI flash, `C` CH32V003
+memory (read) / flash in 64-byte pages or RAM (write), `B` BK72xx flash (read: every 4 k block checked against the
+chip's CRC; write: whole erased 4 k sectors, address and length 4 k aligned); `unit`
 is the boundary no single flash write crosses, `skip 1` leaves out parts that are all 0xff (not on STM32
 L0 / L1, whose erased flash reads 0x00). The old text commands stay for single blocks. The second pass of
-`rf --twice` and the verify after `wf` only compare CRCs (`FC`, `SFC`, `PC`).
+`rf --twice` and the verify after `wf` only compare CRCs (`FC`, `SFC`, `PC`, `BKC`).
 
 ## Not done
 
@@ -388,6 +692,22 @@ L0 / L1, whose erased flash reads 0x00). The old text commands stay for single b
   unlock) and STM32 read protection removal are not implemented.
 - cJTAG: CC13x4 / CC26x4 and CC2538.
 - JTAG: RISC-V debug, EJTAG and boundary scan on top of the raw scans.
+- WCH: only the CH32V003. The V002 / V004 / V005 / V006 / V007 (256-byte pages, another boot area), CH32X035,
+  CH32V103 / V20x / V30x and CH5xx are not handled (minichlink knows them), nor the two-wire RVSWD of the bigger
+  parts. The fast 1x mode, the parity bit, the debug printf over SWIO and GDB are not used.
+- WCH, open until a real chip has been on the wire: the timing margins (the length of the target's 0 when
+  reading is assumed to be about 1 µs; the defaults and the 550 ns threshold rest on that), how soon after
+  power-on the first halt request lands compared with a real firmware's start, whether the chip erases its
+  flash at the moment RDPR = 0xA5 is written (as the simulation does) and whether a debug reset reloads the
+  option bytes (the flasher power-cycles anyway), what a protected flash reads as over debug, and the
+  independent watchdog of a firmware with IWDG_SW = 0 while the core is halted.
+
+- Beken: only BK7231N and BK7231T. The BK7231Q / U, BK7238 and BK7252 protocols and the eFuse / encryption key
+  readout are not handled. Open until a real chip has been on the wire: how soon after power-on the BootROM listens
+  and whether the back-to-back link checks land in that window, whether 921600 (or more) is reliable over these
+  wires, the 50 ms speed change delay, the CRC speed (timeouts assume at least 80 kbytes/s), the 64 k erase time
+  (8 s allowed), the BK7231T bootloader's answers to refused reads and its time-out in download mode, and the
+  power the module needs from the power pins.
 
 ## Files
 
@@ -396,13 +716,52 @@ L0 / L1, whose erased flash reads 0x00). The old text commands stay for single b
 - `src/swd.cpp` / `.h`: SWD, cJTAG and JTAG line handling, DP / AP access, memory and core control.
 - `src/swdflash.cpp` / `.h`: the flash routines of the Arm and TI chips.
 - `src/spiflash.cpp` / `.h`: SPI NOR flash.
+- `src/wch.cpp` / `.h`: the WCH single-wire debug line on the RMT peripheral, debug register access, the catch
+  at power-up.
+- `src/wchflash.cpp` / `.h`: CH32V003 debug module, memory access through the program buffer, flash controller,
+  option bytes, and the W commands.
+- `src/bk72xx.cpp` / `.h`: Beken BK72xx download protocol on UART1: catch at power-up, link, speed, flash read /
+  erase / write / CRC, status registers, the bootloader guard, and the BK commands.
 - `tlsr_c3.py`: the command line tool on the computer (Python 3, `pyserial`).
-- `tests/`: checks without hardware (stream protocol, SPI host logic, JTAG against a simulated chain).
+- `tests/`: checks without hardware (stream protocol, SPI host logic, JTAG against a simulated chain, the WCH
+  firmware and host against a simulated CH32V003, the BK72xx firmware and host against a simulated BootROM /
+  bootloader).
 
 ## Credits
 
 SWire emulation over a UART, the register sequences and the activation: pvvx
 (<https://github.com/pvvx/TlsrComSwireWriter>, public domain; <https://github.com/pvvx/TLSRPGM>).
+
+WCH SWIO:
+
+- WCH (Nanjing Qinheng Microelectronics): the QingKe V2 debug manual and the one-wire host example for a
+  CH32F103, both in <https://github.com/openwch/ch32v003> (`CH32V003_1Line_Base_on_CH32F103`): the line
+  timing, the output enable, halt and resume, and the read / write program for the program buffer.
+- ch32v003fun by Charles Lohr and contributors (MIT; <https://github.com/cnlohr/ch32v003fun>): minichlink and
+  the funprog programmer core (`minichlink/funprog/funprog_rvswdio.h`), with its ESP32-S2 programmer
+  (<https://github.com/cnlohr/esp32s2-cookbook>, `ch32v003programmer`) and the CH32V003 programmer in
+  <https://github.com/cnlohr/rv003usb> (`rvswdio_programmer`): the flash buffer-load program (adapted), the
+  power-off catch of its unbrick, the flash and option byte sequences, the chip identification and the
+  factory option bytes, and measured pulse lengths for the timing.
+- Ardulink by Mark Boldyrev (MIT-0; <https://gitlab.com/BlueSyncLine/arduino-ch32v003-swio>): another
+  timing reference, and the series resistor on SWIO.
+
+Beken BK72xx:
+
+- ltchiptool by Kuba Szczodrzyński (MIT; <https://github.com/libretiny-eu/ltchiptool>, `ltchiptool/soc/bk72xx`,
+  and its `uf2tool`): the flashing sequence (unprotect, erase, write, CRC), the RF calibration / MAC location, and
+  the UF2 format (blocks, tags, `OTA_PART_INFO`, `FAL_PTABLE`) read by `uf2_parts`. LibreTiny
+  (<https://github.com/libretiny-eu/libretiny>, MIT): the board flash layouts, the UF2 family ids, the build outputs
+  and the note that the BK7231T has no ROM loader.
+- bk7231tools by Khaled Nassar, Tom Clement and Kuba Szczodrzyński (MIT;
+  <https://github.com/tuya-cloudcutter/bk7231tools>, `bk7231tools/serial`): the packet framing, the command codes
+  and answers, linking with resets, the speed change, the CRC conventions of the two protocols, the BK7231T
+  bootloader's address bypass and its protection after a CRC. Adapted from it: the bootloader CRC list, the chip id
+  values and the table of status register sizes per flash id, with the protection mask.
+- BK7231GUIFlashTool by openshwprojects (<https://github.com/openshwprojects/BK7231GUIFlashTool>; its repository has
+  no license file, so no code was taken from it): read for the protocol only, which is reimplemented here: the flash
+  id answer with the short length field, the speed change timing, the status register opcodes per flash maker
+  (Macronix), the erase time-outs and the handling of OpenBeken's `_QIO_` / `_UA_` images.
 
 ## License
 
