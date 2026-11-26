@@ -13,6 +13,9 @@ Examples:
     python3 tlsr_c3.py -p /dev/ttyACM0 --bk info                      # Beken BK7231N / T over its UART download port
     python3 tlsr_c3.py -p /dev/ttyACM0 --bk rf 0 0 backup.bin --twice # whole flash
     python3 tlsr_c3.py -p /dev/ttyACM0 --bk wf 0 firmware.uf2 --run   # LibreTiny / ESPHome UF2
+    python3 tlsr_c3.py -p /dev/ttyACM0 --esp info                     # ESP32 / ESP8266 ROM download mode (esptool)
+    python3 tlsr_c3.py -p /dev/ttyACM0 --esp rf 0 0 backup.bin        # whole flash (esptool 5; give the size on 4)
+    python3 tlsr_c3.py -p /dev/ttyACM0 --esp wf 0 firmware.bin
     python3 tlsr_c3.py -p /dev/ttyACM0 bridge 115200 --boot hi        # UART bridge, BOOT pin high
     python3 tlsr_c3.py -p /dev/ttyACM0 bridge-exit
 """
@@ -1898,6 +1901,109 @@ def bk_ops(f, args):
     return t
 
 
+# ================================================================ ESP32 / ESP8266 over the UART bridge
+# The flasher restarts the target with its GPIO 0 (the BOOT wire) held low, which starts the ROM's serial download
+# mode, and esptool talks to the ROM through the bridge. The bridge's speed is fixed by the BRIDGE command (the C3's
+# USB port ignores the host's setting), and the ROM finds it from esptool's first sync, so esptool runs at that same
+# speed and never resets the target itself. At the end the bridge is closed and the target restarted with GPIO 0
+# released, so it runs its firmware.
+
+def bridge_exit(port):
+    """Leave the bridge: the flasher in the bridge does not answer commands, so send the escape after a pause."""
+    with serial.Serial(port, 115200, timeout=2, dsrdtr=False, rtscts=False) as s:
+        time.sleep(1.2)
+        s.write(b'~~~X')
+        return s.read_until(b'\n', 200).decode(errors='replace').strip()
+
+
+def esptool_commands(op_args, major):
+    """The esptool runs for one of our operations: a list of argument lists (rf --twice reads twice)."""
+    d = '-' if major >= 5 else '_'
+    op = op_args.op
+    if op == 'info':
+        return [['flash' + d + 'id']]
+    if op == 'rf':
+        if op_args.size == 0 and major < 5:
+            raise FlasherError('rf with size 0 (the whole flash) needs esptool 5; give the size, e.g. 0x400000')
+        size = 'ALL' if op_args.size == 0 else hex(op_args.size)
+        runs = [['read' + d + 'flash', hex(op_args.address), size, op_args.filename]]
+        if op_args.twice:
+            runs.append(['read' + d + 'flash', hex(op_args.address), size, op_args.filename + '.2'])
+        return runs
+    if op == 'wf':
+        # esptool erases what it writes and checks the MD5 of the result
+        return [['write' + d + 'flash', hex(op_args.address), op_args.filename]]
+    if op == 'es':
+        start = op_args.address - op_args.address % SECTOR
+        end = op_args.address + max(op_args.size, 1)
+        end += -end % SECTOR
+        return [['erase' + d + 'region', hex(start), hex(end - start)]]
+    if op == 'ea':
+        return [['erase' + d + 'flash']]
+    raise FlasherError('%s is not available with --esp (info, rf, wf, es, ea)' % op)
+
+
+def esptool_argv(port, baud, chip, major, run):
+    d = '-' if major >= 5 else '_'
+    argv = ['--port', port, '--baud', str(baud), '--before', 'no' + d + 'reset', '--after', 'no' + d + 'reset']
+    if chip:
+        argv += ['--chip', chip]
+    return argv + run
+
+
+def run_esptool(esptool, argv):
+    print('esptool', ' '.join(argv))
+    try:
+        esptool.main(argv)
+    except SystemExit as e:
+        if e.code not in (None, 0):
+            raise FlasherError('esptool stopped with exit code %s' % e.code)
+    except Exception as e:  # esptool's own errors: FatalError, serial errors
+        raise FlasherError('esptool: %s' % e)
+
+
+def esp_main(f, args):
+    try:
+        import esptool
+    except ImportError:
+        raise FlasherError('the ESP mode runs esptool: pip install esptool')
+    try:
+        major = int(str(esptool.__version__).split('.')[0])
+    except (AttributeError, ValueError):
+        major = 4
+    runs = esptool_commands(args, major)
+    # Restart the target with GPIO 0 low: ROM download mode. The bridge stays at this speed.
+    print(f.cmd('BRIDGE %d lo' % args.esp_baud))
+    f.ser.close()
+    time.sleep(0.1)
+    error = None
+    try:
+        for run in runs:
+            run_esptool(esptool, esptool_argv(args.port, args.esp_baud, args.esp_chip, major, run))
+    except FlasherError as e:
+        error = e
+    answer = bridge_exit(args.port)
+    if not answer.startswith('OK'):
+        print('Leaving the bridge: %s' % (answer or 'no answer'))
+    if error is None and args.op == 'rf' and args.twice:
+        with open(args.filename, 'rb') as a, open(args.filename + '.2', 'rb') as b:
+            same = a.read() == b.read()
+        os.remove(args.filename + '.2')
+        if not same:
+            error = FlasherError('the two reads differ')
+        else:
+            print('Both reads are the same.')
+    if not args.esp_stay:
+        g = Flasher(args.port)
+        try:
+            g.cmd('RST')
+        finally:
+            g.ser.close()
+        print('Target restarted with GPIO 0 released.')
+    if error is not None:
+        raise error
+
+
 def main():
     ap = argparse.ArgumentParser(description='ESP32-C3 Telink TLSR825x SWire flasher')
     ap.add_argument('-p', '--port', default='/dev/ttyACM0')
@@ -1958,6 +2064,17 @@ def main():
                     help='BK72xx: number of status register bytes of a flash chip that is not in the list')
     ap.add_argument('--force-bootloader', action='store_true',
                     help='BK72xx: allow wf / es in the bootloader area 0x0..0x11000 (BK7231N only)')
+    ap.add_argument('--esp', action='store_true',
+                    help='ESP32 / ESP8266 in its ROM download mode, through esptool: target TX on the SWS wire, RX '
+                         'on GPIO 21, GPIO 0 (IO0) on the BOOT wire (GPIO 0), EN / RST on the reset wire; info, rf, '
+                         'wf, es, ea')
+    ap.add_argument('--esp-baud', type=auto_int, default=115200,
+                    help='ESP: bridge speed (default 115200; the ROM finds the speed from the first sync, so 460800 can '
+                         'be tried with short wires)')
+    ap.add_argument('--esp-chip', default='',
+                    help='ESP: chip type for esptool (esp32, esp8266, esp32c3, ...; default: detected)')
+    ap.add_argument('--esp-stay', action='store_true',
+                    help='ESP: leave the target in download mode at the end (no restart)')
     ap.add_argument('--wake', action='store_true',
                     help='after activation switch the clocks on and wake the flash from deep power-down '
                          '(for a flash that reads all zeros / JEDEC 000000)')
@@ -2004,12 +2121,7 @@ def main():
 
     t0 = time.time()
     if args.op == 'bridge-exit':
-        # the flasher is in the bridge and does not answer commands: send the escape after a pause
-        with serial.Serial(args.port, 115200, timeout=2, dsrdtr=False, rtscts=False) as s:
-            time.sleep(1.2)
-            s.write(b'~~~X')
-            answer = s.read_until(b'\n', 200)
-        print(answer.decode(errors='replace').strip() or 'no answer (was the bridge open?)')
+        print(bridge_exit(args.port) or 'no answer (was the bridge open?)')
         return
     f = None
     try:
@@ -2029,6 +2141,12 @@ def main():
             return
         if args.op == 'unlock':
             raise FlasherError('unlock is a WCH command (--wch)')
+        if args.esp:
+            if fw < (0, 15):
+                raise FlasherError('the ESP mode needs flasher firmware 0.15 or newer on the C3 (UART bridge)')
+            esp_main(f, args)
+            print('Done in %.1f s' % (time.time() - t0))
+            return
         if args.bk:
             if fw < (0, 24):
                 raise FlasherError('BK72xx mode needs flasher firmware 0.24 or newer on the C3')

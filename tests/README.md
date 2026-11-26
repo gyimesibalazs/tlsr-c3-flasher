@@ -2,6 +2,7 @@
 
     python3 tests/test_streams.py     # host side of the XR / XW binary streams against a model of the firmware
     python3 tests/test_spi_host.py    # SPI flash host logic against a simulated Winbond / Macronix chip
+    python3 tests/test_esp_host.py    # ESP mode: bridge, esptool arguments (4 and 5), restart, with fakes
     g++ -std=c++17 -I tests/jtag_sim/stub -I src -o /tmp/jtag_sim tests/jtag_sim/jtag_sim.cpp src/swd.cpp && /tmp/jtag_sim
     g++ -std=c++17 -Wall -Wextra -I tests/wch_sim/stub -I src -o /tmp/wch_sim tests/wch_sim/wch_sim.cpp src/wch.cpp src/wchflash.cpp && /tmp/wch_sim
     python3 tests/test_wch_host.py    # WCH host commands against the same simulation (builds it with g++)

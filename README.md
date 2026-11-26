@@ -1,9 +1,10 @@
-# ESP32-C3 flasher: Telink SWS, Arm SWD, cJTAG, JTAG, SPI flash, WCH SWIO and Beken UART
+# ESP32-C3 flasher: Telink SWS, Arm SWD, cJTAG, JTAG, SPI flash, WCH SWIO, Beken UART and ESP32 / ESP8266
 
 An ESP32-C3 board as a flasher for small boards' chips: Telink TLSR825x over its single-wire debug pin (SWS,
 where it started), Arm Cortex-M chips over SWD or JTAG, TI CC13xx / CC26xx over two-wire cJTAG, 25-series
-SPI NOR flash, the WCH CH32V003 over its single-wire debug pin (SWIO) and Beken BK7231N / BK7231T Wi-Fi chips
-over their UART download port. It also works as a USB–UART bridge.
+SPI NOR flash, the WCH CH32V003 over its single-wire debug pin (SWIO), Beken BK7231N / BK7231T Wi-Fi chips
+over their UART download port, and ESP32 / ESP8266 chips through their ROM download mode with esptool. It also
+works as a USB–UART bridge.
 All modes use the same few wires; one is active at a time.
 
 **What is tested (2026-11-25).** The Telink mode has been used on real boards, the Arm SWD mode on one
@@ -22,6 +23,7 @@ first real chip, and keep a backup.
 | [SPI flash](#spi-nor-flash-eg-a-routers) | `--spi` | 25-series SPI NOR (routers, dongles, modules) | host logic against simulated chips |
 | [WCH SWIO](#wch-ch32v003-over-swio) | `--wch` | WCH CH32V003 (SOP8 J4M6, TSSOP20 F4P6, …) | no; firmware and host against a simulated chip |
 | [Beken UART](#beken-bk72xx-cb2s-cb3s-wb2s--over-uart) | `--bk` | BK7231N (Tuya CB2S, CB3S, …), BK7231T (WB2S, WB3S, …) | on hardware: CB2S (BK7231N; read, write); BK7231T no |
+| [ESP32 / ESP8266](#esp32--esp8266-over-uart) | `--esp` | ESP32, ESP32-S2 / S3 / C2 / C3 / C6 / H2, ESP8266 (with esptool) | no; the esptool runs checked against esptool 4.14 and 5.7 without hardware |
 | [UART bridge](#uart-bridge) | `bridge` | any 3.3 V UART, with a BOOT pin | no |
 
 ## Board, build and upload
@@ -37,15 +39,15 @@ Needs the Arduino core 3.x (ESP-IDF 5) for the RMT driver.
 
 One table for every mode; the wires are shared:
 
-| ESP32-C3 wire | SWS (Telink) | SWD (EFR32, nRF5x, STM32, …) | cJTAG (TI CC13xx / CC26xx) | JTAG | SPI flash | SWIO (WCH CH32V003) | Beken UART (BK7231N / T) | UART bridge |
-|---|---|---|---|---|---|---|---|---|
-| GPIO 4 –1 k– GPIO 5 (the SWS wire) | SWS | SWDIO | TMSC | TDI | DI (flash pin 5) | SWIO (PD1; SOP8 pin 8) | TX1 (P11; CB2S pad 7), GPIO 4 an input | target TX → flasher RX (GPIO 4 is an input) |
-| GPIO 0 | – | SWCLK | TCKC | TCK | CLK (pin 6) | – | – | BOOT (`--boot hi` / `lo`, open by default) |
-| GPIO 21 | – | – | – | TDO | DO (pin 2) | – | RX1 (P10; CB2S pad 5) | flasher TX → target RX |
-| GPIO 20 | – | – | – | TMS | /CS (pin 1) | – | – | – |
-| GPIO 6 | RST | nRESET | nRESET | nRESET | RESET of the board's processor, held low | – (not used) | CEN (CB2S pad 10) | RESET |
-| GPIO 7 (+ 10, 3, 1) | target power | target power | target power | target power | target power with `--power` only | VDD (SOP8 pin 4), switched for the catch | 3V3 (CB2S pad 1), switched for the catch | target power |
-| GND | GND | GND | GND | GND | GND (pin 4) | VSS (SOP8 pin 2) | GND (CB2S pad 3) | GND |
+| ESP32-C3 wire | SWS (Telink) | SWD (EFR32, nRF5x, STM32, …) | cJTAG (TI CC13xx / CC26xx) | JTAG | SPI flash | SWIO (WCH CH32V003) | Beken UART (BK7231N / T) | UART bridge | ESP32 / ESP8266 |
+|---|---|---|---|---|---|---|---|---|---|
+| GPIO 4 –1 k– GPIO 5 (the SWS wire) | SWS | SWDIO | TMSC | TDI | DI (flash pin 5) | SWIO (PD1; SOP8 pin 8) | TX1 (P11; CB2S pad 7), GPIO 4 an input | target TX → flasher RX (GPIO 4 is an input) | U0TXD (TX0) |
+| GPIO 0 | – | SWCLK | TCKC | TCK | CLK (pin 6) | – | – | BOOT (`--boot hi` / `lo`, open by default) | GPIO 0 (IO0), held low for the download mode |
+| GPIO 21 | – | – | – | TDO | DO (pin 2) | – | RX1 (P10; CB2S pad 5) | flasher TX → target RX | U0RXD (RX0) |
+| GPIO 20 | – | – | – | TMS | /CS (pin 1) | – | – | – | – |
+| GPIO 6 | RST | nRESET | nRESET | nRESET | RESET of the board's processor, held low | – (not used) | CEN (CB2S pad 10) | RESET | EN (ESP32), EN or RST (ESP8266) |
+| GPIO 7 (+ 10, 3, 1) | target power | target power | target power | target power | target power with `--power` only | VDD (SOP8 pin 4), switched for the catch | 3V3 (CB2S pad 1), switched for the catch | target power | 3V3 (a module while it is flashed) |
+| GND | GND | GND | GND | GND | GND (pin 4) | VSS (SOP8 pin 2) | GND (CB2S pad 3) | GND | GND |
 
 The SWS wire is one target pin: GPIO 5 goes to it directly, GPIO 4 through a 1 k … 1.8 k resistor.
 In the SPI mode the flash's /WP (pin 3) and /HOLD (pin 7) must be high (3.3 V) if the board does not pull them
@@ -609,6 +611,34 @@ OpenBeken's BK7231GUIFlashTool (its BK7231 flasher, for the details of the answe
 
 Written from the sources in the credits and checked against a simulated BootROM / bootloader (`tests/bk_sim`,
 `tests/test_bk_host.py`); nothing of it has run on a real chip yet.
+
+## ESP32 / ESP8266 over UART
+
+    python3 tlsr_c3.py -p /dev/ttyACM0 --esp info                       # chip, MAC, flash id
+    python3 tlsr_c3.py -p /dev/ttyACM0 --esp rf 0 0 backup.bin --twice  # whole flash (esptool 5)
+    python3 tlsr_c3.py -p /dev/ttyACM0 --esp rf 0 0x400000 backup.bin   # esptool 4: give the size
+    python3 tlsr_c3.py -p /dev/ttyACM0 --esp wf 0 firmware.factory.bin
+    python3 tlsr_c3.py -p /dev/ttyACM0 --esp es 0x9000 0x5000           # erase a range (whole sectors)
+    python3 tlsr_c3.py -p /dev/ttyACM0 --esp ea                         # erase the whole flash
+
+Needs esptool on the PC (`pip install esptool`, version 4 or 5). The flasher restarts the target (reset wire and
+power pins) with its GPIO 0 held low by the BOOT wire, which starts the ROM's serial download mode, and opens the
+[UART bridge](#uart-bridge); esptool then does the work through the bridge, with `--before no_reset --after
+no_reset`, because a DTR / RTS reset would reset the C3 itself. At the end the bridge is closed and the target
+restarted with GPIO 0 released, so it runs its firmware (`--esp-stay` leaves it in download mode). `wf`, `es` and
+`ea` erase what they need and esptool checks the MD5 of what it wrote; `rf --twice` reads twice and compares.
+
+The bridge's speed is set once (`--esp-baud`, default 115200): the C3's USB port does not pass on the host's
+speed, and the ROM takes the speed of esptool's first sync, so esptool runs at that same speed. 460800 is worth
+a try with short wires. `--esp-chip esp8266` (or esp32, esp32c3 …) skips the detection.
+
+Wiring (see [Wiring](#wiring)): the target's TX0 to the SWS wire, its RX0 to GPIO 21, its GPIO 0 to the BOOT
+wire (the C3's GPIO 0, the SWCLK wire of the other modes), EN (ESP8266: EN or RST) to the reset wire, GND. The
+strapping pins must allow the download mode as on any ESP board: on a bare ESP8266 module GPIO 15 low, GPIO 2
+high and EN high (ESP-12: 10 k resistors), on an ESP32 GPIO 2 low or open. Power: the power pins carry an
+ESP8266 or a small ESP32 module while it is flashed, not its Wi-Fi peaks. This mode is for bare modules and
+devices (plugs, switches, sensors); a development board with its own USB–UART chip is flashed through that, as
+its chip drives the same RX0 line.
 
 ## UART bridge
 
