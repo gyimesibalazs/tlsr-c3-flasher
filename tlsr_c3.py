@@ -39,6 +39,7 @@ import os
 import re
 import select
 import socket
+import struct
 import sys
 import time
 import zlib
@@ -2249,7 +2250,7 @@ def log_main(f, args):
         print('UART log cleared.')
         return
     answer = f.cmd('LOG')
-    st = dict(kv.split('=') for kv in answer.split()[2:])
+    st = dict(kv.split('=', 1) for kv in answer.split() if '=' in kv)
     stored = int(st['stored'])
     print('UART log: %s blocks, %s bytes of records in %d bytes stored, %s blocks dropped by the ring; '
           '%s bytes to the target, %s from it' % (st['blocks'], st['raw'], stored, st['dropped'], st['tx'], st['rx']))
@@ -2674,8 +2675,13 @@ def esp_main(f, args, follow=True):
 # ================================================================ Lightning LN882H over UART
 # The flasher is a UART bridge (firmware 0.26: "BRIDGE 115200 lo ln") with the BOOT wire (GPIO 0) on the chip's BOOT pin
 # (GPIOA9) held low, so the chip starts its ROM download mode. The ROM takes text commands at 115200 and loads a RAM
-# loader ("ramcode", Lightning's, as ltchiptool ships it) over YMODEM. The loader reads and erases the flash on text
-# commands and writes it from a YMODEM transfer; "baudrate N" raises its speed, which the bridge follows.
+# loader over YMODEM; "baudrate N" raises the loader's speed, which the bridge follows. Two loaders (--ln-loader):
+# - own (default): ours, built from loaders/ln882h and embedded below ("C3LN"); it sets the clocks and UART0 itself
+#   (PLL 160 MHz, APB0 40 MHz, 115200) and repeats a wait line until it hears the host; binary frames with a CRC-32
+#   both ways for info, reads of 4 k, the CRC of a range, erase of whole sectors / blocks, page writes without erase,
+#   the status registers and reboot (the protocol is described in loaders/ln882h/loader.c).
+# - vendor: Lightning's ("ramcode", as ltchiptool ships it, not included): reads 256 bytes per text command in hex,
+#   erases on text commands and writes from a YMODEM transfer.
 
 LN_ROM_BAUD = 115200
 LN_SPEEDS = (1000000, 460800, 115200)
@@ -2690,6 +2696,107 @@ LN_BAUD_LINE = re.compile(rb'[\r\n]baudrate [0-9]+[\r\n]')
 LN_ROM_VERSION = re.compile(rb'[ -~]{11}/[0-9:]{8}')    # the ROM's build date, e.g. "Mar 14 2021/00:23:32"
 YM_SOH, YM_EOT, YM_ACK, YM_NAK, YM_CAN, YM_C = 0x01, 0x04, 0x06, 0x15, 0x18, 0x43
 BRIDGE_PAUSE = 1.2                       # the bridge takes its escape only after a pause of a second
+# our loader's answer to "version" (its start banner "C3LN 2 init 1 2 ...", its "rom clock" line and its wait lines
+# "C3LN 2 wait rx ..." do not match it)
+LN_OWN_VERSION = re.compile(rb'C3LN ([0-9]+) (ready|error ([0-9]+) at ([0-9]+))\r')
+LN_OWN_WAIT = re.compile(rb'C3LN ([0-9]+) wait rx ([0-9]+) err ([0-9]+) (ready|error ([0-9]+) at ([0-9]+))\r')
+LN_OWN_PROTO = 2
+LN_FR_START, LN_FR_END, LN_FR_ESC = 0xC0, 0xC1, 0xDB
+LN_FR_SPECIAL = re.compile(rb'[\xc0\xc1\xdb\n\r]')
+LN_MAX = 4096                            # data per read answer / write request
+LN_BLOCK = 0x10000
+LN_INFO, LN_READ, LN_CRC, LN_ERASE, LN_WRITE, LN_STATUS, LN_SRWRITE, LN_REBOOT = range(1, 9)
+LN_ERRORS = {1: 'frame CRC wrong', 2: 'bad frame', 3: 'unknown command', 4: 'bad arguments', 5: 'beyond the flash',
+             6: 'not on whole 4 k sectors', 7: 'not erased', 8: 'the read-back differs',
+             9: 'not blank after the erase', 10: 'the flash did not set its write enable latch',
+             11: 'the flash stayed busy', 12: 'the QSPI controller did not finish a transfer',
+             13: 'no flash answered'}
+LN_STAGES = {1: 'clocks and UART', 2: 'flash cache off', 3: 'QSPI set-up', 4: 'JEDEC id', 5: 'status, unique id, MAC',
+             6: 'ready'}
+# info answer: protocol, stage, init error, core from the PLL, init detail, JEDEC id, size, status 05 35 15, unique
+# id, MAC, core clock measured over the banner, baud, receive errors, data limit, core and APB0 clock set, bytes
+# received, then the registers as the ROM left them (struct ln_regs in loaders/ln882h/hal.h; all ones: not read)
+LN_INFO_LAYOUT = struct.Struct('<BBBBIII3sx16s6s2xIIIIIII22I')
+LN_INFO_FIELDS = ('proto', 'stage', 'error', 'pll', 'detail', 'id', 'size', 'sr', 'uid', 'mac', 'cpu_hz', 'baud',
+                  'rx_errors', 'max_data', 'core_hz', 'apb_hz', 'rx_bytes')
+LN_REGS = ('uart_brr', 'uart_cr1', 'uart_cr2', 'uart_cr3', 'clk_gate', 'io_en', 'func_en', 'func_sel0', 'cmp_div',
+           'clk_sel', 'awo_div', 'pll_ctrl', 'pll_lock', 'pmu_reg', 'vset', 'gpioa_ddr', 'cache_en', 'qspi_ctrlr0',
+           'qspi_baudr', 'vtor', 'sp', 'ctrl')
+
+# ---- begin LN882H loader (loaders/ln882h; written by loaders/ln882h/build.py, do not edit)
+LN_LOADER = base64.b64decode(
+    'AAAAIGgWIADCwEz/AAEAIAAAAADwLZF3AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+    'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+    'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+    'AAAAAAAAAAAAAAAAAJBMACDZAQAgLwIAIC8CACAvAgAgLwIAIC8CACAvAgAgLwIAIC8CACAvAgAgLwIAIC8CACAvAgAgLwIAIC8CACAvAgAg'
+    'LwIAIC8CACAvAgAgLwIAIC8CACAvAgAgLwIAIC8CACAvAgAgLwIAIC8CACAvAgAgLwIAIC8CACAvAgAgLwIAIC8CACAvAgAgLwIAIC8CACAv'
+    'AgAgLwIAIC8CACAvAgAgLwIAIC8CACAvAgAgLwIAIC8CACAvAgAgLwIAIC8CACAvAgAgLwIAIC8CACAvAgAgLwIAIO/zEIdythdMJWhuRu/z'
+    'FIBH6gAn7/MFgEfqAEcAIIDzFIi/82+PEEiA8wiID0ggYL/zT48OSA9JACKIQgLSQPgEK/rnDEgFYAxIBmAMSAdgAPCu+f7n7/MIgO/zBYEA'
+    '8Gm5AAAI7QDgkEwAIAABACBoFgAgkDwAIGgWACBsFgAgcBYAIIKwAZABmwu5ArBwRwGbATsBk/fnELUGSwZMomoCQIpCBNABO/nRo2AMIBC9'
+    'ACD850BCDwAAACBA8LURSxFNEk8ERk/wBwwAIIFCANHwveppVgcfvx5oATYeYMX4IMAS8AgOBNA+aBa5HmgBNh5gkgbH+ADg6tVqaiJUATDk'
+    '5wC/eBYAIAAgAEB0FgAgCEtAIhC1AUQaYohCANEQvQVK3GnkAQHVATr60RD4ASuaYvLnACAAQEFCDwAFSwZK0WoR9PgfAtHRaUkGAdQBO/bR'
+    'cEdAQg8AACAAQAhLGmhDCAPrAhOz+/DwBkug8RACmkKdvwRL2GAAIE/w/zBwR2AWACDv/wcAACAAQAFLGGhwRwC/eBYAIE/w4COYacDx/xAA'
+    '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')
+# ---- end LN882H loader
 
 
 def crc16_xmodem(data, crc=0):
@@ -2726,13 +2833,20 @@ def ln_ramcode(path=''):
                        '--ln-ramcode, or pip install ltchiptool)' % (LN_RAMCODE_URL, LN_RAMCODE_NAME))
 
 
+LN_SEEN = 8192                           # what LnLink keeps of the last bytes, for the diagnosis of a silent loader
+
+
 class LnLink:
     """The LN882H's ROM, then its RAM loader, through the flasher's UART bridge (ser is the flasher's port)."""
 
     def __init__(self, ser):
         self.ser = ser
         self.buf = b''
-        self.ramcode = False
+        self.ramcode = False                 # a loader answers (Lightning's or ours)
+        self.own = False                     # ours
+        self.seen = b''                      # the last bytes that came, for error messages
+        self.text = b''                      # our loader: what came between frames
+        self.seq = 0
 
     def write(self, data):
         self.ser.write(data)
@@ -2740,6 +2854,7 @@ class LnLink:
     def _more(self):
         chunk = self.ser.read(max(1, self.ser.in_waiting))
         self.buf += chunk
+        self.seen = (self.seen + chunk)[-LN_SEEN:]
         return bool(chunk)
 
     def wait_for(self, pattern, timeout):
@@ -2772,13 +2887,16 @@ class LnLink:
         return self.wait_for(expect, timeout)
 
     def link(self, timeout):
-        """version until the ROM (its build date) or the loader (RAMCODE) answers; returns the answer."""
+        """version until the ROM (its build date), Lightning's loader (RAMCODE) or ours (C3LN ...) answers; returns
+        the answer."""
         deadline = time.time() + timeout
         while True:
-            m = self.command('version', re.compile(LN_ROM_VERSION.pattern + rb'|RAMCODE'), timeout=0.4)
+            m = self.command('version', re.compile(LN_ROM_VERSION.pattern + rb'|RAMCODE|' + LN_OWN_VERSION.pattern),
+                             timeout=0.4)
             if m:
-                self.ramcode = m.group(0) == b'RAMCODE'
-                return m.group(0).decode()
+                self.own = m.group(0).startswith(b'C3LN')
+                self.ramcode = self.own or m.group(0) == b'RAMCODE'
+                return m.group(0).decode().strip()
             if time.time() >= deadline:
                 return None
 
@@ -2828,9 +2946,11 @@ class LnLink:
         self.write(packet(0, b''))                   # the empty header: end of the batch
         answer(1.0, (YM_ACK,))
 
-    def set_baud(self, baud):
+    def set_baud(self, baud, lead=False):
         self.buf = b''
-        self.write(b'baudrate %d\r' % baud)          # only CR: the bridge switches at the line end (src/lnscan.h)
+        # only CR at the end: the bridge switches at the line end (src/lnscan.h); lead: a CR first, so that the
+        # bridge's line scanner starts afresh whatever came before
+        self.write(b'%sbaudrate %d\r' % (b'\r' if lead else b'', baud))
         time.sleep(0.05)
         self.quiet(0.05, 0.3)
 
@@ -2857,6 +2977,101 @@ class LnLink:
                 return raw[:n]
         raise FlasherError('LN882H: flash_read at 0x%x: no valid answer' % addr)
 
+    # ---- our loader's frames (loaders/ln882h/loader.c)
+    def _text(self, data):
+        """Bytes between frames: nothing is expected there but a start banner (the loader restarted) or a fault."""
+        self.text = (self.text + data)[-600:]
+        m = re.search(rb'C3LN fault [ -~]*|C3LN [0-9]+ init', self.text)
+        if m:
+            self.text = b''
+            raise FlasherError('LN882H: our RAM loader %s' % (
+                'stopped: "%s" (exception number, then where it was)' % m.group(0).decode() if b'fault' in m.group(0)
+                else 'started again (its banner came): the chip restarted (power, reset wire, watchdog?)'))
+
+    def _frame(self, timeout):
+        """The next frame's body (unescaped), None for a damaged one, False when none came in time."""
+        deadline = time.time() + timeout
+        while True:
+            end = self.buf.find(bytes([LN_FR_END]))
+            start = self.buf.rfind(bytes([LN_FR_START]), 0, end) if end >= 0 else -1
+            if start >= 0:
+                self._text(self.buf[:start])
+                raw, self.buf = self.buf[start + 1:end], self.buf[end + 1:]
+                return ln_unescape(raw)
+            if end >= 0:                         # an end without a start: the start was lost
+                self._text(self.buf[:end])
+                self.buf = self.buf[end + 1:]
+                return None
+            first = self.buf.find(bytes([LN_FR_START]))
+            if first < 0 and self.buf:
+                self._text(self.buf)
+                self.buf = b''
+            elif first > 0:
+                self._text(self.buf[:first])
+                self.buf = self.buf[first:]
+            if not self._more() and time.time() >= deadline:
+                return False
+
+    def call(self, cmd, data=b'', timeout=3.0, tries=4):
+        """One request to our loader; returns the answer's data. A damaged or missing answer and a request the
+        loader could not read are sent again (the loader does not repeat a flash change for the same request)."""
+        self.seq = (self.seq + 1) & 0xFF
+        frame = ln_frame(bytes([cmd, self.seq, 0]) + len(data).to_bytes(2, 'little') + data)
+        why = 'no answer'
+        for _ in range(tries):
+            self.write(frame)
+            while True:
+                body = self._frame(timeout)
+                if body is False:
+                    break
+                if body is None or len(body) < 9 or zlib.crc32(body[:-4]) != int.from_bytes(body[-4:], 'little') \
+                        or int.from_bytes(body[3:5], 'little') != len(body) - 9:
+                    why = 'damaged answers'
+                    break
+                typ, seq, status, payload = body[0], body[1], body[2], body[5:-4]
+                if typ == 0xFF:              # the loader could not read the request
+                    why = 'the loader got the request damaged (%s)' % LN_ERRORS.get(status, status)
+                    break
+                if seq != self.seq or typ != cmd | 0x80:
+                    continue                 # an answer to an earlier request
+                if status:
+                    detail = int.from_bytes(payload[:4], 'little') if len(payload) >= 4 else 0
+                    raise LnError(cmd, status, detail)
+                return payload
+        raise FlasherError('LN882H: no valid answer from our RAM loader to command %d (%s, %d tries); the UART log '
+                           '(python3 tlsr_c3.py log) shows what went over the wire' % (cmd, why, tries))
+
+
+class LnError(FlasherError):
+    """An error answer of our loader."""
+    def __init__(self, cmd, status, detail):
+        self.cmd, self.status, self.detail = cmd, status, detail
+        super().__init__('LN882H: our RAM loader answers command %d with error %d (%s), detail 0x%x' % (
+            cmd, status, LN_ERRORS.get(status, 'unknown'), detail))
+
+
+def ln_frame(body):
+    """C0, the body with its CRC-32, C1; C0 C1 DB LF CR inside escaped as DB, byte ^ 0x20."""
+    body += zlib.crc32(body).to_bytes(4, 'little')
+    return bytes([LN_FR_START]) + LN_FR_SPECIAL.sub(lambda m: bytes([LN_FR_ESC, m.group(0)[0] ^ 0x20]), body) + \
+        bytes([LN_FR_END])
+
+
+def ln_unescape(raw):
+    """The body of a frame (between C0 and C1), or None when a raw CR / LF or a wrong escape is in it."""
+    if b'\n' in raw or b'\r' in raw:
+        return None
+    bad = []
+
+    def one(m):
+        c = m.group(0)[1:]
+        if not c or not LN_FR_SPECIAL.fullmatch(bytes([c[0] ^ 0x20])):
+            bad.append(m.start())
+            return b''
+        return bytes([c[0] ^ 0x20])
+    out = re.sub(rb'\xdb.?', one, raw, flags=re.S)
+    return None if bad else out
+
 
 class LnTarget:
     def __init__(self):
@@ -2866,6 +3081,7 @@ class LnTarget:
         self.uid = ''
         self.mac = ''
         self.baud = LN_ROM_BAUD
+        self.info = None                     # our loader: its info answer as a dict
 
 
 def ln_leave_bridge(f):
@@ -2876,8 +3092,59 @@ def ln_leave_bridge(f):
     return f.readline(3).decode(errors='replace').strip()
 
 
+# speeds tried when our loader is not heard at 115200 after the load: it sets its clocks and UART0 itself, so it talks
+# at another speed only when a clock is not what the SDK says (multiples and fractions of 115200 first)
+LN_PROBE_SPEEDS = (921600, 460800, 230400, 1843200, 57600, 28800, 14400, 1000000, 2000000)
+
+
+def ln_own_silent(link, baud=LN_ROM_BAUD):
+    """What to say when our loader does not answer "version": from what came (link.seen) at baud."""
+    seen = link.seen
+    fault = re.search(rb'C3LN fault[ -~]*', seen)
+    waits = list(LN_OWN_WAIT.finditer(seen))
+    banner = list(re.finditer(rb'C3LN [0-9]+ init[ -~]*', seen))
+    hello = re.search(rb'C3LN [0-9]+ rom clock', seen)
+    if fault:
+        what = 'it stopped with an exception: "%s"' % fault.group(0).decode()
+    elif waits:
+        w = waits[-1]
+        rx, err = int(w.group(2)), int(w.group(3))
+        what = 'it runs and talks at %d baud (%d wait lines, the last "%s")' % (baud, len(waits),
+                                                                               w.group(0).decode().strip())
+        if rx == 0:
+            what += ', but nothing the host sent reached it: its RX0 (A3) hears nothing, although the ROM heard the ' \
+                    'same wire (pin function of A3, or UART0 receive set-up)'
+        elif err:
+            what += ', but it received %d bytes with %d receive errors: its receiver runs at another speed or ' \
+                    'format than its transmitter' % (rx, err)
+        else:
+            what += ', and received %d bytes without errors but no valid "version" line among them' % rx
+    elif banner:
+        m = banner[-1]
+        stages = re.findall(rb' ([1-5])(?= |$)', m.group(0))
+        last = int(stages[-1]) if stages else 1
+        if b'ready' in m.group(0) or b'error' in m.group(0):
+            what = 'it started ("%s") but then fell silent: no wait line came, so it stopped after its start' % (
+                m.group(0).decode())
+        else:
+            what = 'it started ("%s") but stopped in init stage %d (%s)' % (m.group(0).decode(), last, LN_STAGES[last])
+    elif hello:
+        what = ('it said hello with the ROM\'s UART settings ("rom clock" came through: the ROM\'s divider still fit '
+                'at the hand-over), but nothing readable came after it set the clocks and UART0 itself: it stopped '
+                'there, or UART0 now runs at another speed')
+    elif seen.strip(b'\0\xff'):
+        what = 'after the load came only %d bytes of something else, the last %r (a loader at another speed sends a ' \
+               'line every 200 ms)' % (len(seen), seen[-60:])
+    else:
+        what = 'nothing came after the load (not even its hello at the ROM\'s settings: the ROM did not start it, ' \
+               'or it stopped before)'
+    return ('LN882H: our RAM loader does not answer: %s. The UART log has the whole exchange (python3 tlsr_c3.py log); '
+            '--ln-loader vendor uses Lightning\'s loader instead' % what)
+
+
 def ln_connect(f, args, baud, say=print):
     """Bridge on, ROM linked, loader loaded and linked, speed raised to baud: (LnLink, LnTarget)."""
+    own = getattr(args, 'ln_loader', 'own') == 'own'
     say(f.cmd('BRIDGE %d lo ln' % LN_ROM_BAUD))
     link = LnLink(f.ser)
     t = LnTarget()
@@ -2885,20 +3152,57 @@ def ln_connect(f, args, baud, say=print):
     if answer is None:
         raise FlasherError('LN882H: no answer from the ROM. Check TX0 (A2) on the SWS wire, RX0 (A3) on GPIO 21, BOOT '
                            '(A9) on GPIO 0, CEN on the reset wire, 3V3 on the power pins')
+    if link.ramcode and link.own != own:
+        raise FlasherError('LN882H: a RAM loader answers right after the restart ("%s"), not the ROM' % answer)
     if not link.ramcode:
         t.rom = answer
-        ramcode = ln_ramcode(args.ln_ramcode)
-        say('ROM:     %s; loading the RAM loader (%d bytes)' % (answer, len(ramcode)))
+        if own:
+            ramcode, name, what = LN_LOADER, 'c3ln.bin', 'our RAM loader'
+        else:
+            ramcode, name, what = ln_ramcode(args.ln_ramcode), 'ramcode.bin', 'the RAM loader'
+        say('ROM:     %s; loading %s (%d bytes)' % (answer, what, len(ramcode)))
         link.buf = b''
+        link.seen = b''
         link.write(b'download [rambin] [0x%X] [%d]\r\n' % (LN_RAM_ADDR, len(ramcode)))
-        link.ymodem_send('ramcode.bin', ramcode, first_ack=5.0, ack=3.0)
-        if link.link(8.0) != 'RAMCODE':
+        link.ymodem_send(name, ramcode, first_ack=5.0, ack=3.0)
+        link.seen = link.buf                     # what came right after the last ACK: the loader's hello
+        answer = link.link(8.0)
+        if own and not link.own:
+            silent = ln_own_silent(link)
+            if LN_OWN_WAIT.search(link.seen) or re.search(rb'C3LN [0-9]+ (init|fault)', link.seen):
+                raise FlasherError(silent)       # it talks at 115200: another speed would not help
+            # Not heard at 115200: if a clock is not what it should be, it talks at another speed, and repeats its
+            # wait line every 200 ms there. Look for it with the bridge's speed escape (firmware 0.27).
+            heard = []
+            for probe in LN_PROBE_SPEEDS:
+                say('Our loader is not heard at %d baud; listening at %d' % (LN_ROM_BAUD, probe))
+                time.sleep(BRIDGE_PAUSE)
+                f.ser.write(b'~~~S%d\n' % probe)
+                time.sleep(0.05)
+                link.buf = link.seen = b''
+                answer = link.link(1.0)
+                if link.own:
+                    say('Our loader answers at %d baud, %.3f times the 115200 it set: the clock of its UART is not '
+                        'what the SDK says (python3 tlsr_c3.py --ln info shows the clock registers); working at that '
+                        'speed' % (probe, probe / LN_ROM_BAUD))
+                    t.baud = baud = probe
+                    break
+                if b'C3LN' in link.seen:
+                    raise FlasherError(ln_own_silent(link, probe) + '; it talks at %d baud instead of 115200' % probe)
+                heard.append('%d: %d bytes' % (probe, len(link.seen)))
+            else:
+                raise FlasherError(silent + '; no answer at the other speeds either (%s)' % ', '.join(heard))
+        if not own and answer != 'RAMCODE':
             raise FlasherError('LN882H: the RAM loader does not answer after loading')
-    if baud != LN_ROM_BAUD:
-        link.set_baud(baud)
-        if link.link(1.5) != 'RAMCODE':
+    if baud != LN_ROM_BAUD and not (own and t.baud != LN_ROM_BAUD):
+        link.set_baud(baud, lead=own)
+        again = link.link(1.5)
+        if again is None or link.own != own:
             raise FlasherError('LN882H: no answer at %d baud' % baud)
     t.baud = baud
+    if own:
+        ln_own_info(link, t, answer)
+        return link, t
     m = link.command('flash_info', re.compile(rb'id:0x([0-9A-Fa-f]+),flash size:(\d+)M'))
     if not m:
         raise FlasherError('LN882H: no answer to flash_info')
@@ -2910,6 +3214,26 @@ def ln_connect(f, args, baud, say=print):
     t.mac = m.group(0).decode().upper() if m else ''
     link.quiet(0.05, 0.3)
     return link, t
+
+
+def ln_own_info(link, t, answer):
+    """Our loader's info answer into t."""
+    link.buf = b''
+    raw = link.call(LN_INFO)
+    if len(raw) < LN_INFO_LAYOUT.size:
+        raise FlasherError('LN882H: our RAM loader\'s info answer is %d bytes, expected %d' % (len(raw),
+                                                                                              LN_INFO_LAYOUT.size))
+    v = LN_INFO_LAYOUT.unpack_from(raw)
+    i = dict(zip(LN_INFO_FIELDS, v))
+    i['regs'] = dict(zip(LN_REGS, v[len(LN_INFO_FIELDS):]))
+    i['version'] = answer
+    if i['proto'] != LN_OWN_PROTO:
+        raise FlasherError('LN882H: our RAM loader speaks protocol %d, this script %d' % (i['proto'], LN_OWN_PROTO))
+    t.info = i
+    t.flash_id, t.size = i['id'], i['size']
+    t.uid = i['uid'].hex() if i['stage'] >= 6 else ''
+    mac = i['mac']
+    t.mac = ':'.join('%02X' % b for b in mac) if mac not in (b'\xff' * 6, b'\0' * 6) and not mac[0] & 1 else ''
 
 
 def ln_read(link, addr, size, progress=True):
@@ -2986,13 +3310,17 @@ def ln_main(f, args):
             answer = ln_leave_bridge(f)
             if not answer.startswith('OK'):
                 print('Leaving the bridge: %s' % (answer or 'no answer'))
-            if baud == speeds[-1] or 'no answer from the ROM' in str(e) or 'RAM loader is missing' in str(e):
+            if baud == speeds[-1] or 'no answer from the ROM' in str(e) or 'RAM loader is missing' in str(e) or \
+                    'our RAM loader does not answer' in str(e):
                 raise
             print('%s; trying again at %d baud' % (e, speeds[speeds.index(baud) + 1]))
             continue
         break
     try:
-        ln_ops(link, t, args)
+        if link.own:
+            lno_ops(link, t, args)
+        else:
+            ln_ops(link, t, args)
     finally:
         answer = ln_leave_bridge(f)
         if not answer.startswith('OK'):
@@ -3030,7 +3358,8 @@ def ln_ops(link, t, args):
         print('Saved %d bytes to %s' % (len(data), args.filename))
     elif args.op == 'wf':
         if args.no_erase:
-            raise FlasherError('LN882H: the loader always erases what it writes (no --no-erase)')
+            raise FlasherError('LN882H: Lightning\'s loader always erases what it writes (--no-erase needs '
+                               '--ln-loader own)')
         parts = ln_image(args, t)
         for addr, data in parts:
             print('Write 0x%06x..0x%06x' % (addr, addr + len(data)))
@@ -3056,6 +3385,287 @@ def ln_ops(link, t, args):
         m = link.command('ferase_all', re.compile(rb'pppp|ffff'), timeout=120)
         if not m or m.group(0) != b'pppp':
             raise FlasherError('LN882H: ferase_all failed (%s)' % ('no answer' if not m else 'refused'))
+        print('Erased.')
+
+
+# ---- with our loader
+def lno_timeout(t, nbytes, extra=2.0):
+    """Time for nbytes on the wire at the link's speed (and some escaping), plus extra."""
+    return extra + nbytes * 12.0 / t.baud
+
+
+def lno_read(link, t, addr, size, progress=True):
+    out = bytearray()
+    t0 = time.time()
+    for pos in range(addr, addr + size, LN_MAX):
+        n = min(LN_MAX, addr + size - pos)
+        data = link.call(LN_READ, struct.pack('<II', pos, n), timeout=lno_timeout(t, n))
+        if len(data) != n:
+            raise FlasherError('LN882H: read at 0x%x: %d bytes instead of %d' % (pos, len(data), n))
+        out += data
+        if progress and (len(out) % 0x10000 == 0 or len(out) == size):
+            el = max(time.time() - t0, 1e-3)
+            print('\r  read 0x%06x / 0x%06x (%.0f kB/s)' % (len(out), size, len(out) / el / 1000), end='', flush=True)
+    if progress:
+        print()
+    return bytes(out)
+
+
+def lno_crc(link, addr, size):
+    """zlib CRC-32 of a flash range, computed by the loader (at least about 200 kbytes/s)."""
+    return int.from_bytes(link.call(LN_CRC, struct.pack('<II', addr, size), timeout=5 + size / 100000), 'little')
+
+
+def lno_erase(link, t, start, end, progress=True):
+    """Erase [start, end), 4 k aligned, one command per 64 k block (where a whole one is inside) or 4 k sector; the
+    loader reads each one back blank."""
+    a = start
+    while a < end:
+        n = LN_BLOCK if a % LN_BLOCK == 0 and a + LN_BLOCK <= end else SECTOR
+        if progress:
+            print('\rErase 0x%06x%s' % (a, ' (64 k)' if n == LN_BLOCK else '      '), end='', flush=True)
+        try:
+            link.call(LN_ERASE, struct.pack('<II', a, n), timeout=30 if n == LN_BLOCK else 15)
+        except LnError as e:
+            if e.status == 9:
+                raise FlasherError('LN882H: 0x%06x is not blank after the erase of 0x%06x..0x%06x: is the flash '
+                                   'write protected? (status %s)' % (e.detail, a, a + n, lno_status_text(link, t)))
+            raise
+        a += n
+    if progress:
+        print('\r' + ' ' * 28 + '\r', end='')
+
+
+def lno_status(link):
+    """Status registers 05 and 35 as one value (35 in the high byte), and 15."""
+    sr = link.call(LN_STATUS)
+    return sr[0] | sr[1] << 8, sr[2]
+
+
+def lno_status_text(link, t):
+    try:
+        return '%04x' % lno_status(link)[0]
+    except FlasherError:
+        return 'unreadable'
+
+
+def lno_unprotect(link, t, args):
+    """Clear the flash's block protection bits as on the Beken flashes (bk_sr_layout): BP0..BP4 and, with two status
+    bytes, CMP; the other bits (QE among them) are written back as they are."""
+    lay = bk_sr_layout(t, args)
+    sr = lno_status(link)[0]
+    if lay is None:
+        if sr & 0x7C:
+            raise FlasherError('flash %s is not in the list and its status register 0x%02x has protection bits set; '
+                               'give its number of status bytes with --bk-sr 1|2' % (t.flash_id, sr & 0xFF))
+        print('Flash %s: not in the list; status 1 has no BP bits set, going on' % t.flash_id)
+        return
+    n, mask = lay
+    if n == 1:
+        sr &= 0xFF
+    if not sr & mask:
+        return
+    new = sr & ~mask
+    print('Flash:   status %0*x -> %0*x (protection off)' % (2 * n, sr, 2 * n, new))
+    back = link.call(LN_SRWRITE, bytes([n]) + new.to_bytes(n, 'little'), timeout=5)
+    back = back[0] | (back[1] << 8 if n == 2 else 0)
+    if back & mask:
+        raise FlasherError('the flash is still protected (status %0*x)' % (2 * n, back))
+
+
+def lno_write(link, t, addr, data, erase=True):
+    """Sector by sector, as on the Beken: sectors that already hold the data are skipped (CRC per 64 k, then per 4 k),
+    what the image does not cover inside its first and last sector is read first and kept, blank sectors are not
+    erased, the others are erased (64 k blocks where possible), then written in 4 k pieces."""
+    if addr + len(data) > t.size:
+        raise FlasherError('0x%x bytes at 0x%x: beyond the flash (%d kbytes)' % (len(data), addr, t.size // 1024))
+    first = addr - addr % SECTOR
+    end = addr + len(data)
+    end += -end % SECTOR
+    want = bytearray()
+    if first < addr:
+        want += lno_read(link, t, first, addr - first, progress=False)
+    want += data
+    if len(want) < end - first:
+        want += lno_read(link, t, first + len(want), end - first - len(want), progress=False)
+    blank = zlib.crc32(b'\xff' * SECTOR)
+    todo, skipped, blanks = [], 0, 0
+    chunk = first
+    while chunk < end:                       # a CRC per 64 k block first, per 4 k inside one that differs
+        cend = min(end, chunk - chunk % LN_BLOCK + LN_BLOCK)
+        print('\rCompare 0x%06x' % chunk, end='', flush=True)
+        if lno_crc(link, chunk, cend - chunk) == zlib.crc32(want[chunk - first:cend - first]):
+            skipped += (cend - chunk) // SECTOR
+        else:
+            for a in range(chunk, cend, SECTOR):
+                part = bytes(want[a - first:a - first + SECTOR])
+                crc = lno_crc(link, a, SECTOR)
+                if crc == zlib.crc32(part):
+                    skipped += 1
+                else:
+                    todo.append((a, part, crc == blank))
+                    blanks += crc == blank
+        chunk = cend
+    print('\r' + ' ' * 28 + '\r', end='')
+    if erase:
+        runs = []
+        for a, part, is_blank in todo:
+            if is_blank:
+                continue
+            if runs and runs[-1][1] == a:
+                runs[-1][1] = a + SECTOR
+            else:
+                runs.append([a, a + SECTOR])
+        for s0, s1 in runs:
+            lno_erase(link, t, s0, s1)
+    t0 = time.time()
+    done = 0
+    for a, part, _ in todo:
+        for k in range(0, SECTOR, LN_MAX):
+            piece = part[k:k + LN_MAX]
+            if piece.count(0xFF) == len(piece):
+                continue
+            try:
+                link.call(LN_WRITE, struct.pack('<I', a + k) + piece, timeout=lno_timeout(t, len(piece), 5))
+            except LnError as e:
+                if e.status == 7:
+                    raise FlasherError('LN882H: 0x%06x is not erased (--no-erase writes only into blank sectors)' %
+                                       e.detail)
+                if e.status == 8:
+                    raise FlasherError('LN882H: the write did not take at 0x%06x: is the flash write protected? '
+                                       '(status %s)' % (e.detail, lno_status_text(link, t)))
+                raise
+        done += SECTOR
+        el = max(time.time() - t0, 1e-3)
+        print('\r  write 0x%06x / 0x%06x (%.0f kB/s)' % (done, len(todo) * SECTOR, done / el / 1000), end='',
+              flush=True)
+    if todo:
+        print()
+    total = (end - first) // SECTOR
+    if skipped or blanks:
+        print('%d of %d sectors already held the data%s.' % (skipped, total, ', %d were blank (not erased)' % blanks
+                                                            if blanks and erase else ''))
+
+
+def lno_verify(link, addr, data):
+    """The loader's CRC of the whole range; on a mismatch, sector by sector to find the first bad one."""
+    if lno_crc(link, addr, len(data)) == zlib.crc32(data):
+        return None
+    for pos in range(0, len(data), SECTOR):
+        n = min(SECTOR - (addr + pos) % SECTOR, len(data) - pos)
+        if lno_crc(link, addr + pos, n) != zlib.crc32(data[pos:pos + n]):
+            return addr + pos
+    return addr
+
+
+def lno_info(t):
+    i, r = t.info, t.info['regs']
+    if t.rom:
+        print('ROM:     %s' % t.rom)
+    print('Loader:  ours (C3LN, protocol %d, %d bytes) at %d baud; start: %s' % (
+        i['proto'], len(LN_LOADER), t.baud, 'ready' if i['stage'] >= 6 else 'stopped in stage %d (%s), error %d (%s), '
+        'detail 0x%x' % (i['stage'], LN_STAGES.get(i['stage'], '?'), i['error'], LN_ERRORS.get(i['error'], '?'),
+                         i['detail'])))
+    if i['stage'] >= 5:
+        sr = i['sr'][0] | i['sr'][1] << 8
+        vendor = BK_FLASH_VENDORS.get(t.flash_id >> 16, 'unknown maker')
+        print('Flash:   JEDEC %06x (%s), %d kbytes, status %04x (05 %02x, 35 %02x, 15 %02x)%s, uid %s' % (
+            t.flash_id, vendor, t.size // 1024, sr, i['sr'][0], i['sr'][1], i['sr'][2],
+            ': protection bits set' if sr & 0x407C else '', t.uid))
+        print('MAC:     %s' % ('%s (flash OTP, security register 0x100)' % t.mac if t.mac else
+                               'none in the flash OTP (%s)' % i['mac'].hex(':')))
+    elif i['stage'] == 4 and i['error'] == 13:
+        print('Flash:   JEDEC id read as %06x: no flash answered' % i['detail'])
+    print('Clock:   %s, core %d MHz, APB0 %d MHz (set by the loader); measured over the banner: core about %d MHz; '
+          'UART %d bytes received, %d receive errors' % (
+              'PLL' if i['pll'] else 'crystal (the PLL was off)', i['core_hz'] // 1000000, i['apb_hz'] // 1000000,
+              round(i['cpu_hz'] / 1e6), i['rx_bytes'], i['rx_errors']))
+    print('ROM:     left %s' % ln_rom_state(r))
+    print('Start:   VTOR 0x%08x, SP 0x%08x, IPSR %d, CONTROL %x, PRIMASK %d; cache 0x%x; QSPI CTRLR0 0x%x BAUDR %d' % (
+        r['vtor'], r['sp'], r['ctrl'] >> 16, (r['ctrl'] >> 8) & 0xFF, r['ctrl'] & 1, r['cache_en'], r['qspi_ctrlr0'],
+        r['qspi_baudr']))
+    print('Regs:    %s' % ', '.join('%s %x' % (k, r[k]) for k in LN_REGS))
+
+
+def ln_rom_state(r):
+    """The clocks and UART0 as the ROM left them, from the registers our loader read before it changed anything."""
+    pll = r['clk_sel'] & 1
+    core = 40e6 * (r['pll_ctrl'] & 0x1F) / 2 if pll else 40e6
+    ahb = core / ((r['awo_div'] & 0xF) + 1)
+    apb = ahb / ((r['cmp_div'] & 0xF) + 1)
+    text = '%s (PLL %s, multiplier %d/2), core %.0f MHz, AHB %.0f MHz, APB0 %.0f MHz' % (
+        'PLL' if pll else 'crystal', 'on' if r['pll_ctrl'] & 0x8000 else 'off', r['pll_ctrl'] & 0x1F, core / 1e6,
+        ahb / 1e6, apb / 1e6)
+    if r['uart_brr'] == 0xFFFFFFFF:
+        return text + '; UART0 clock off'
+    over8 = bool(r['uart_cr1'] & 0x8000)
+    k = 16 if over8 else 8                   # BRR = k * APB0 / baud (the SDK's hal_uart_baudrate_set)
+    brr = r['uart_brr'] & 0x7FFFF
+    if brr:
+        text += '; UART0 BRR %d, %dx oversampling: %d baud at that APB0 (115200 needs APB0 %.1f MHz)' % (
+            brr, 8 if over8 else 16, round(k * apb / brr), 115200 * brr / k / 1e6)
+    return text
+
+
+def lno_ops(link, t, args):
+    if args.op == 'info':
+        lno_info(t)
+        return
+    if t.info['stage'] < 6:
+        lno_info(t)
+        raise FlasherError('LN882H: our RAM loader could not set up the flash (stage %d, error %d: %s); see above and '
+                           'the UART log (python3 tlsr_c3.py log); --ln-loader vendor tries Lightning\'s loader' % (
+                               t.info['stage'], t.info['error'], LN_ERRORS.get(t.info['error'], '?')))
+    tt = BkTarget(flash_id='%06x' % t.flash_id, size=t.size)     # what bk_sr_layout reads
+    if args.op == 'rf':
+        size = args.size or t.size - args.address
+        if args.address + size > t.size:
+            raise FlasherError('0x%x bytes at 0x%x: beyond the flash (%d kbytes)' % (size, args.address,
+                                                                                   t.size // 1024))
+        os.makedirs(os.path.dirname(os.path.abspath(args.filename)), exist_ok=True)
+        t1 = time.time()
+        data = lno_read(link, t, args.address, size)
+        print('Read 0x%x bytes in %.1f s at %d baud; every 4 k checked by the frame\'s CRC-32' % (
+            size, time.time() - t1, t.baud))
+        if args.twice:
+            bad = lno_verify(link, args.address, data)
+            if bad is not None:
+                with open(args.filename + '.pass1', 'wb') as fh:
+                    fh.write(data)
+                raise FlasherError('the loader\'s CRC of the range differs in the sector at 0x%06x; the read was kept '
+                                   'as %s.pass1' % (bad, args.filename))
+            print('Second pass (CRC of the whole range on the chip) matches.')
+        with open(args.filename, 'wb') as fh:
+            fh.write(data)
+        print('Saved %d bytes to %s' % (len(data), args.filename))
+    elif args.op == 'wf':
+        parts = ln_image(args, t)
+        for addr, data in parts:
+            if addr + len(data) > t.size:
+                raise FlasherError('0x%x bytes at 0x%x: beyond the flash (%d kbytes)' % (len(data), addr,
+                                                                                       t.size // 1024))
+        lno_unprotect(link, tt, args)
+        for addr, data in parts:
+            print('Write 0x%06x..0x%06x' % (addr, addr + len(data)))
+            lno_write(link, t, addr, data, erase=not args.no_erase)
+        if not args.no_verify:
+            for addr, data in parts:
+                bad = lno_verify(link, addr, data)
+                if bad is not None:
+                    raise FlasherError('verify failed in the sector at 0x%06x' % bad)
+            print('Verified (CRC on the chip).')
+    elif args.op == 'es':
+        start = args.address - args.address % SECTOR
+        end = args.address + max(args.size, 1)
+        end = min(end + (-end % SECTOR), t.size)
+        lno_unprotect(link, tt, args)
+        lno_erase(link, t, start, end)
+        print('Erased 0x%06x..0x%06x' % (start, end))
+    elif args.op == 'ea':
+        print('Erasing the whole flash (also the boot loader and the partition table; the ROM download mode and the '
+              'MAC in the flash OTP stay)')
+        lno_unprotect(link, tt, args)
+        lno_erase(link, t, 0, t.size)
         print('Erased.')
 
 
@@ -4060,7 +4670,7 @@ def main():
     ap.add_argument('--bk-seconds', type=auto_int, default=10,
                     help='BK72xx: how long to keep resetting and sending link checks (default 10)')
     ap.add_argument('--bk-sr', type=int, choices=[1, 2], default=0,
-                    help='BK72xx: number of status register bytes of a flash chip that is not in the list')
+                    help='BK72xx, LN882H: number of status register bytes of a flash chip that is not in the list')
     ap.add_argument('--force-bootloader', action='store_true',
                     help='BK72xx: allow wf / es in the bootloader area 0x0..0x11000 (BK7231N only)')
     ap.add_argument('--esp', action='store_true',
@@ -4080,9 +4690,12 @@ def main():
                          'BOOT (A9) on GPIO 0, CEN on the reset wire, 3V3 on the power pins; info, rf, wf, es, ea')
     ap.add_argument('--ln-baud', type=auto_int, default=0,
                     help='LN882H: speed of the RAM loader (default 1000000; when that fails 460800, then 115200)')
+    ap.add_argument('--ln-loader', choices=['own', 'vendor'], default='own',
+                    help='LN882H: the RAM loader: own (default; ours, built into this script, from loaders/ln882h) '
+                         'or vendor (Lightning\'s, a download: --ln-ramcode)')
     ap.add_argument('--ln-ramcode', default='',
-                    help='LN882H: the RAM loader file (default: %s next to this script, or ltchiptool\'s)' %
-                         LN_RAMCODE_NAME)
+                    help='LN882H, --ln-loader vendor: the RAM loader file (default: %s next to this script, or '
+                         'ltchiptool\'s)' % LN_RAMCODE_NAME)
     ap.add_argument('--ln-seconds', type=auto_int, default=5,
                     help='LN882H: how long to wait for the ROM after the restart (default 5)')
     ap.add_argument('--rtl', action='store_true',
@@ -4214,8 +4827,9 @@ def main():
             sniff_main(f, args)
             return
         if args.op == 'log':
-            if fw < (0, 25):
-                raise FlasherError('the UART log needs flasher firmware 0.25 or newer on the C3')
+            if fw < (0, 31):
+                raise FlasherError('reading the UART log needs flasher firmware 0.31 or newer on the C3 (0.25 to 0.30 '
+                                   'keep the log but refuse to hand it out: XR L)')
             log_main(f, args)
             return
         if args.wch:

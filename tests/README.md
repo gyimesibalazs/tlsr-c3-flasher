@@ -11,7 +11,9 @@
     g++ -std=c++17 -Wall -Wextra -I tests/bk_sim/stub -I src -o /tmp/bk_sim tests/bk_sim/bk_sim.cpp src/bk72xx.cpp src/tuart.cpp src/uartlog.cpp && /tmp/bk_sim
     python3 tests/test_bk_host.py     # Beken BK72xx host commands against bk_sim (builds it)
     python3 tests/test_uartlog.py     # UART log: src/uartlog.cpp built natively, its export decoded by tlsr_c3.py
-    python3 tests/test_ln_host.py     # LN882H host and src/lnscan.h against a model of the bridge, ROM and RAM loader
+    python3 tests/test_ln_host.py     # LN882H host, Lightning's loader, src/lnscan.h: model of bridge, ROM, loader
+    python3 tests/test_ln_loader.py   # LN882H, our loader: build, header, loader.c natively, the host through it
+    python3 tests/test_ln_emu.py      # our LN882H loader's binary in the unicorn emulator (pip install unicorn)
     python3 tests/test_rtl_host.py    # RTL8710B host against a model of the ROM (handshakes, read, XMODEM, RAM programs)
     python3 tests/test_rtl2_host.py   # RTL8720C host against a model of the ROM console (dumps, fwd, hashq, eFuse program)
     python3 tests/test_wifi_host.py   # host over TCP (--host, the key, wifi, a stream, bridge-exit, --esp) against a model
@@ -48,6 +50,35 @@ with noise, erase / write / CRC, the bootloader guard, protection, reboot, the B
 `test_bk_host.py` runs `tlsr_c3.py --bk` (info, rf --twice, wf with partial sectors and unchanged sectors skipped,
 the bootloader guard and full images, LibreTiny UF2 files, OTA packages refused, ea, --run, unknown and Macronix
 flash chips, the BK7231T, failed links) against it through `bk_sim --serve`.
+
+`test_ln_host.py` and `test_ln_loader.py` share `ln_sim.py`: a model of the flasher's bridge in its `ln` mode (the
+speed following of `src/lnscan.h`; bytes sent while the bridge and the chip run at different speeds arrive garbled),
+the LN882H ROM (version, YMODEM download into RAM) and either RAM loader. Lightning's is modelled after its SDK source;
+ours is the real `loaders/ln882h/loader.c` and `flash.c`, built with gcc as a shared library against
+`tests/ln_loader_sim/fake_hal.c` (ctypes) with the SPI NOR model of `ln_nor_model.py` behind it (write enable latch,
+busy polls with a violation for any other command meanwhile, page program that only clears bits and wraps in its
+page, block protection that silently ignores erase and write, a one-byte status write that clears the second byte).
+`test_ln_loader.py` checks that the loader embedded in `tlsr_c3.py` equals a fresh build (skipped without
+PlatformIO's Arm toolchain), the boot header, and the header code against Lightning's binary when it is at hand
+(`$LN882H_RAMCODE`); then runs `tlsr_c3.py --ln` through it: info, rf, wf with partial sectors, the same image again
+(nothing erased or written), blank sectors, `--no-erase`, data with a `baudrate` line, es, ea, protected flash
+chips, a damaged frame in each direction (also around a write, which is not done twice), the speed fallback, a flash
+that does not answer, a loader that does not start, a loader whose UART comes up at 921600 (found by the host
+listening at other speeds through the bridge's speed escape), a loader that talks but hears nothing (its wait lines,
+no speed probing), `--run`; frames sent straight to it (bad CRC, bad escape, a raw CR, unknown command, ranges,
+unaligned erase, writing over data that is not erased, repeated requests); the start lines and the wait line every
+200 ms until `version` came; and the host's diagnosis for each way a loader can stay silent.
+`test_ln_emu.py` runs the built image itself in the unicorn emulator (Cortex-M4) against register models of the clock
+tree (crystal, PLL, AHB / APB0 dividers with their update bits; a switch to a PLL that is off stops the core), UART0
+(its bit rate computed from the modelled APB0 and its divider: bytes at a rate more than 3 % off the host's arrive
+garbled or are lost with a framing error; they pass only with its clock on, out of reset, enabled, and A2 / A3 given
+to it), the QSPI controller (DesignWare SSI, with violations for configuration written while enabled, data while
+disabled, no slave selected, unread data, an SPI clock above 25 MHz), the flash cache, the clock gates and pad
+enables, the chip reset, SysTick, the NVIC and VTOR. Three ROM hand-over states: a UART divider that does not fit the
+clock (the hello garbled, then everything readable after the loader's own set-up), one that fits (the hello
+readable), and the PLL off (the crystal kept). Then the wait line and receive errors, version, info (the clocks set,
+the ROM's registers), reads, erase, a write across a page, CRCs, a protected flash, a damaged frame, the speed change
+and the reboot. Timing is not modelled there. It is skipped without the unicorn package.
 
 `test_wifi_host.py` runs `tlsr_c3.py` over TCP against a local server thread that models the flasher's command side
 (V, AUTH with a key, WIFI, an XR stream, BRIDGE with the escape and the rule that the bridge owner's address needs no

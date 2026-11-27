@@ -9,10 +9,12 @@ works as a USB–UART bridge and as a two-line UART logger that listens to a lin
 0.30), and the computer can reach it over Wi-Fi instead of USB (firmware 0.29).
 All modes use the same few wires; one is active at a time.
 
-**What is tested (2026-11-25).** The Telink mode has been used on real boards, the Arm SWD mode on one
+**What is tested (2026-11-27).** The Telink mode has been used on real boards, the Arm SWD mode on one
 chip: a Puya MS32C001 (PY32F002B type) in a Tuya dimmer, read and written several times (see
-[Arm SWD](#arm-swd)), and the Beken mode on a CB2S (BK7231N) in a Tuya FS-05R dimmer: full backup read and an
-ESPHome firmware written (see [Beken](#beken-bk72xx-cb2s-cb3s-wb2s--over-uart)). The other modes are written from
+[Arm SWD](#arm-swd)), the Beken mode on a CB2S (BK7231N) in a Tuya FS-05R dimmer: full backup read and an
+ESPHome firmware written (see [Beken](#beken-bk72xx-cb2s-cb3s-wb2s--over-uart)), and the LN882H mode on an LN-02 in
+a CozyLife relay module: backup read with both loaders and an ESPHome firmware written with ours, which then ran
+(see [LN882H](#lightning-ln882h-over-uart)); the UART bridge and the UART log were used for that too. The other modes are written from
 the vendors' documentation and headers and checked without hardware (see `tests/`); expect to find bugs on the
 first real chip, and keep a backup.
 
@@ -26,7 +28,7 @@ first real chip, and keep a backup.
 | [WCH SWIO](#wch-ch32v003-over-swio) | `--wch` | WCH CH32V003 (SOP8 J4M6, TSSOP20 F4P6, …) | no; firmware and host against a simulated chip |
 | [Beken UART](#beken-bk72xx-cb2s-cb3s-wb2s--over-uart) | `--bk` | BK7231N (Tuya CB2S, CB3S, …), BK7231T (WB2S, WB3S, …), BK7238 (Tuya T1) | on hardware: CB2S (BK7231N; read, write); BK7231T and BK7238 no |
 | [ESP32 / ESP8266](#esp32--esp8266-over-uart) | `--esp` | ESP32, ESP32-S2 / S3 / C2 / C3 / C6 / H2, ESP8266 (with esptool) | no; the esptool runs checked against esptool 4.14 and 5.7 without hardware |
-| [LN882H UART](#lightning-ln882h-over-uart) | `--ln` | Lightning LN882H (newer Tuya Wi-Fi / BLE modules) | no; host and bridge against a model of the ROM and the RAM loader |
+| [LN882H UART](#lightning-ln882h-over-uart) | `--ln` | Lightning LN882H (newer Tuya Wi-Fi / BLE modules) | on hardware (2026-11-27): an LN-02 (LN882H, TH25Q16 flash) in a CozyLife relay module. Lightning's loader: info, full read. Ours (protocol 2, after the start-up rebuild): info, full read (88 kB/s, the same bytes as Lightning's), an ESPHome UF2 written (53 kB/s, verified by the chip's CRC) that then ran |
 | [Realtek AmebaZ UART](#realtek-amebaz-rtl8710b-over-uart) | `--rtl` | RTL8710BN / BX (Tuya WR2, WR3 …) | no; host and bridge against a model of the ROM |
 | [Realtek AmebaZ2 UART](#realtek-amebaz2-rtl8720c-over-uart) | `--rtl2` | RTL8720CF, RTL8710CX / CM (Tuya WBR2, WBR3, CR3L …) | no; host and bridge against a model of the ROM console |
 | [UART bridge](#uart-bridge) | `bridge` | any 3.3 V UART, with a BOOT pin | no |
@@ -660,43 +662,155 @@ its chip drives the same RX0 line.
 
 ## Lightning LN882H over UART
 
-    python3 tlsr_c3.py -p /dev/ttyACM0 --ln info                        # ROM, flash id and size, MAC from the OTP
-    python3 tlsr_c3.py -p /dev/ttyACM0 --ln rf 0 0 backup.bin --twice   # whole flash
+    python3 tlsr_c3.py -p /dev/ttyACM0 --ln info                        # ROM, flash id, size, status, MAC from the OTP
+    python3 tlsr_c3.py -p /dev/ttyACM0 --ln rf 0 0 backup.bin --twice   # whole flash, then the chip's CRC of it
     python3 tlsr_c3.py -p /dev/ttyACM0 --ln wf 0 firmware.uf2 --run     # LibreTiny / ESPHome UF2
     python3 tlsr_c3.py -p /dev/ttyACM0 --ln wf 0 backup.bin             # a full image from 0
     python3 tlsr_c3.py -p /dev/ttyACM0 --ln es 0x1a0000 0x1000          # erase a range (whole sectors)
     python3 tlsr_c3.py -p /dev/ttyACM0 --ln ea                          # erase the whole flash
+    python3 tlsr_c3.py -p /dev/ttyACM0 --ln --ln-loader vendor info     # with Lightning's RAM loader instead
 
 Firmware 0.26. The flasher restarts the chip (reset wire and power pins) with its BOOT pin (GPIOA9) held low by the
 BOOT wire, which starts the ROM's download mode on UART0, and opens the [UART bridge](#uart-bridge); the rest runs in
 `tlsr_c3.py` through the bridge. The ROM takes text commands at 115200 and loads a RAM loader into the chip's RAM over
-YMODEM (`download [rambin] [0x20000000] [size]`). The loader then answers text commands: `flash_info`,
-`flash_uid`, `get_mac_in_flash_otp`, `flash_read <addr> <len>` (up to 256 bytes in hex with a CRC-16 of them, checked
-by the host and read again on a mismatch), `ferase`, `ferase_all`, and `startaddr` + `upgrade`, after which it takes
-the data over YMODEM, erases the range and writes it. `baudrate N` raises its speed: the bridge reads the host's
+YMODEM (`download [rambin] [0x20000000] [size]`). `baudrate N` raises the loader's speed: the bridge reads the host's
 bytes for that line and switches its own UART at the line's end (`src/lnscan.h`), so the host keeps the speed
 (`--ln-baud`, default 1000000; when that fails, a new session at 460800, then 115200).
 
-- **The RAM loader is not part of this repository.** It is Lightning's binary, as ltchiptool ships it. Download it
-  once as `ln882h_ramcode.bin` next to `tlsr_c3.py`
+Two RAM loaders (`--ln-loader`):
+
+- **`own`, the default: ours** (`loaders/ln882h`, 6 kbytes, built into `tlsr_c3.py`, nothing to download). It talks
+  in binary frames with a CRC-32 both ways, reads 4 k per command, computes the CRC-32 of any range on the chip, erases
+  only whole 4 k sectors or 64 k blocks it is asked for and checks them blank, writes pages without erasing (and
+  refuses to write over bits that are not erased), reads every write back, and reads and writes the flash's status
+  registers. Not working on a chip yet: the first try failed (see the checklist below).
+- **`vendor`: Lightning's** (as ltchiptool ships it). Not part of this repository: download it once as
+  `ln882h_ramcode.bin` next to `tlsr_c3.py`
   (<https://github.com/libretiny-eu/ltchiptool/raw/410874f66b60da1dd667dbba69f499acbf16eb03/ltchiptool/soc/ln882h/util/ramcode.bin>,
-  37872 bytes, SHA-256 `6bd437c6…a0c723`), give it with `--ln-ramcode`, or have ltchiptool installed: its copy
-  is found.
-- **Write.** The loader rounds the length up to whole 4 k sectors but not the start, so from an unaligned start it
-  would erase into the sector after the end. The host therefore always sends whole sectors: what is on the chip
-  before the start and after the end in them is read first and sent along. Afterwards the range is read back and
-  compared (`--no-verify` skips it); the loader has no CRC command. `--no-erase` is not available.
+  37872 bytes, SHA-256 `6bd437c6…a0c723`), give it with `--ln-ramcode`, or have ltchiptool installed: its copy is
+  found. It answers text commands (`flash_info`, `flash_uid`, `get_mac_in_flash_otp`, `flash_read` of up to 256 bytes
+  in hex with a CRC-16, `ferase`, `ferase_all`, and `startaddr` + `upgrade`, after which it takes the data over YMODEM,
+  erases the range and writes it). It rounds the length up to whole 4 k sectors but not the start, so the host always
+  sends whole sectors (what is around the range in them is read first and sent along), reads the range back to verify
+  (it has no CRC command), and refuses data that holds a line `baudrate <digits>` (the bridge would take it for the
+  speed command); `--no-erase` is not available with it.
+
+With our loader:
+
+- **Write** works as on the Beken: sectors that already hold the data are skipped (a CRC per 64 k, then per 4 k
+  sector), what the image does not cover inside its first and last sector is read first and kept, blank sectors are
+  not erased, the others are erased (64 k blocks where a whole one is inside), then written in 4 k pieces; at the end
+  the chip's CRC of every part is compared (`--no-verify` skips it). `--no-erase` writes only into blank sectors.
+- **Protection.** Before `wf`, `es` and `ea` the status registers are read; block protection bits (BP0..BP4 and, with
+  two status bytes, CMP) are cleared as in the Beken mode, with the same list of flash chips; the other bits, the quad
+  enable among them, are written back as they were. A chip not in the list with protection bits set is refused;
+  `--bk-sr 1|2` gives its number of status bytes. A write or erase the flash ignores is caught by the read-back.
+- **Any data can be written**: a frame never holds CR or LF (they are escaped), so the bridge cannot find a speed
+  command line in one.
+- `rf --twice` compares the chip's CRC of the range with the data read, instead of a second read.
+
+Both loaders:
+
 - **A UF2** (LibreTiny / ESPHome, family LN882H) says itself where its parts go. A full image or backup goes to 0.
   There is no bootloader guard: the download mode is in the ROM, so a wrong write cannot lock the chip out.
 - **`ea`** erases everything, also the boot loader and the partition table; the MAC address is in the flash's OTP
   and stays.
-- **Data with a line `baudrate <digits>`** between CR / LF characters would look like the speed command to the bridge;
-  such a write is refused (it does not happen in firmware images in practice).
 - At the end the bridge is closed; `--run` restarts the chip with BOOT released, otherwise it stays in the loader.
+
+### Our loader (`loaders/ln882h`)
+
+`loader.c` (protocol, commands), `flash.c` (SPI NOR commands), `hal.h` (what they need from the chip),
+`ln882h.c` (the chip's registers, `main`), `start.S` (boot header, vector table, reset handler), `ln882h.ld`,
+`build.py`. It runs from SRAM at 0x20000000 (the boot header first, the vector table at +0x100; image, zeroed data and
+stack take 19 kbytes), Cortex-M4 Thumb-2, soft-float, interrupts off, everything polled.
+
+Its start (protocol 2; the first chip showed that protocol 1, which kept the ROM's clock and UART divider, sent only
+three garbled bytes and never answered at any speed):
+
+1. All interrupts disabled and none pending, SysTick running as a cycle counter. The registers as the ROM left them
+   are read (clock source, PLL, AHB and APB0 dividers, band gap / LDO settings, clock gates, pin functions of A0..A3,
+   GPIOA directions, UART0's BRR / CR1 / CR2 / CR3; the info answer reports them, and `--ln info` prints what clock
+   and bit rate they mean).
+2. `C3LN 2 rom clock` is sent with UART0 as the ROM left it. Only for the log: it comes through when the ROM's divider
+   still fits the clock at the hand-over, and garbled when it does not.
+3. The clocks as Lightning's loader sets them (its `SetSysClock`, read in the SDK's `mcu/ln882h/system_ln882h.c` and
+   `hal_clock.c` and seen in its binary): band gap trim 1 and the PLL's LDO (LDO15_1) at 7, then the PLL as the source
+   with the multiplier 8 (core and AHB 160 MHz from the 40 MHz crystal), the AHB undivided, APB0 / 4 = 40 MHz. If the
+   PLL's enable bit reads 0, the crystal is kept with APB0 undivided (core 40 MHz, APB0 still 40 MHz).
+4. UART0 from scratch: its clock (and GPIOA's) on, a reset pulse, 8N1 with 8x oversampling, no interrupts, DMA or flow
+   control, BRR = 16 x APB0 / baud (the SDK's formula; 5556 for 115200), enabled; then A2 / A3 given to it (functions
+   2 / 3, GPIO side input, function enable). `baudrate N` computes the divider from the same 40 MHz.
+5. The banner and the number of each init stage as the stage begins, each drained out of the UART before the stage
+   runs, then `ready` or the error: `C3LN 2 init 1 2 3 4 5 ready` (1 clocks and UART, 2 flash cache off, 3 QSPI
+   set-up, 4 JEDEC id, 5 status / unique id / MAC).
+6. Until it has received a valid line (`version`, `baudrate`) or frame it repeats every 200 ms
+   `C3LN 2 wait rx <bytes received> err <receive errors> ready` (or `error <code> at <stage>`): proof that it runs,
+   that it sends at the speed the host listens at, and whether the host's bytes reach it.
+
+For the flash it switches the cache off (clock gates of the cache and the QSPI controller switched on first), sets up
+the QSPI controller for plain single-line SPI at 10 MHz (AHB / 16; / 4 on the crystal), wakes the flash from deep
+power-down (`AB`), and uses the standard commands: `9F` JEDEC id, `4B` unique id, `05` / `35` / `15` status, `03` read,
+`06` write enable (the latch is checked), `02` page program, `20` 4 k sector and `D8` 64 k block erase, `01` status
+write, all waiting for WIP with a time-out, and `48` (security register 0x100) for the MAC, as Lightning's SDK keeps it
+there.
+
+A fault prints `C3LN fault <exception> pc <address> lr <address>`. All of it shows in the [UART log](#uart-log) of the
+session.
+
+The protocol (the full description is at the top of `loader.c`): text lines between frames, `version` (answered
+`C3LN 2 ready`, or `C3LN 2 error <code> at <stage>`, so the host tells it from the ROM and from Lightning's
+`RAMCODE`) and `baudrate <digits>` (no answer, switched after the line end); everything else is a frame
+`C0 escaped(type, seq, status, length, data, CRC-32) C1`, little-endian, with C0 C1 DB CR LF inside sent as DB,
+byte ^ 0x20. Commands: `01` info (stage, error, JEDEC id, size, status registers, unique id, MAC, the clocks set, a
+core clock measured over the banner, bytes and errors received, the registers as the ROM left them), `02` read (up
+to 4 k), `03` CRC-32 of a range, `04` erase (whole 4 k sectors), `05` write (up to 4 k, no erase), `06` status, `07`
+status write, `08` reboot. An answer carries the type
+with bit 7 set and a status; an error has a 32-bit detail (an address or a status register). Resynchronisation: C0
+always starts a new frame, a frame the loader cannot read is answered at once with type FF and the reason, and a
+flash change repeated with the same seq and CRC right after (its answer was lost) is answered again, not done again.
+
+Rebuild after a change, with PlatformIO's Arm toolchain (`~/.platformio/packages/toolchain-gccarmnoneeabi`, or `--cc`):
+
+    python3 loaders/ln882h/build.py            # build, fill the boot header, embed into tlsr_c3.py
+    python3 loaders/ln882h/build.py --check    # is the embedded one this build?
+
+### First run on a real chip
+
+Our loader has not worked on a chip yet (protocol 1 failed on the first one; protocol 2 sets the clocks and UART0
+itself). Lightning's loader is the reference for the first run:
+
+1. `--ln --ln-loader vendor info`, then `--ln --ln-loader vendor rf 0 0 vendor.bin`: a backup, and proof that the
+   wiring and the ROM's load path work.
+2. `--ln info` with ours. What the output and the UART log (`python3 tlsr_c3.py log`) tell:
+   - `C3LN 2 rom clock` readable right after the last YMODEM ACK: the ROM's UART divider still fit at the hand-over;
+     garbled bytes there: it did not (that alone is no failure, the loader sets its own clocks next).
+   - `C3LN 2 init 1 ...` readable: the clocks and UART0 set by the loader work. The numbers show how far the start got;
+     a start that stops at a number hangs in that stage (2 cache, 3 QSPI, 4 / 5 flash commands).
+   - `C3LN 2 wait rx 0 err 0 ...` repeated: it runs and is heard, but the host's bytes do not reach it (RX side: pin
+     function of A3, UART0 receive); `rx N err M` with errors: its receiver is at another speed than its transmitter.
+     The host stops there with that diagnosis (no other speeds are tried: they would not help).
+   - Nothing readable at 115200: the host listens at other speeds (921600, 460800, 230400, 1843200, 57600, 28800,
+     14400, 1000000, 2000000). A loader that runs sends its wait line every 200 ms there, so a speed where `C3LN`
+     appears is the one its UART came up at (the clock is not what the SDK says: `--ln info` at that speed shows the
+     registers); if it also answers, the session goes on at that speed.
+   - Nothing at any speed, not even the hello: the loader stopped before or while setting the clocks (or the ROM did not
+     start it).
+   - When it answers: the `Clock:` line (what it set, the core clock measured against the UART), `ROM:` (the clock and
+     bit rate the ROM's registers mean) and `Regs:` (all of them); the flash id, status and MAC should match what the
+     vendor loader said.
+3. `--ln rf 0 0 own.bin --twice` and compare: `cmp vendor.bin own.bin`.
+4. Only then a write, best a small one at an unused place first (`--ln wf 0x1f0000 test.bin`, read it back), then the
+   image.
+
+When something fails, send the output of the command and of `python3 tlsr_c3.py log` (the UART log of the session:
+the hello, the start line, wait lines, a fault line, every frame). `--ln-loader vendor` stays available for flashing
+meanwhile.
 
 Wiring (see [Wiring](#wiring)): TX0 (A2) to the SWS wire, RX0 (A3) to GPIO 21, BOOT (A9) to the BOOT wire (the C3's
 GPIO 0), CEN to the reset wire, 3V3 to the power pins, GND. The pad names of a Tuya module are in its data sheet. The
-power pins carry the chip in download mode; mains-powered boards are not isolated, so disconnect the mains first.
+power pins carry the chip in download mode, but not its Wi-Fi: on the first LN-02 (2026-11-27) ESPHome restarted at
+every Wi-Fi start while powered from them, and ran from the C3 board's 3V3 pin. Flash from the power pins, run from
+a real 3.3 V supply. Mains-powered boards are not isolated, so disconnect the mains first.
 
 ## Realtek AmebaZ (RTL8710B) over UART
 
@@ -789,7 +903,7 @@ switches when esptool's CHANGE_BAUDRATE has been answered by the target. Each ne
     esptool --port /dev/ttyACM0 --baud 921600 --before no-reset --after no-reset flash-id
     python3 tlsr_c3.py -p /dev/ttyACM0 bridge-exit
 
-`--follow ln` (firmware 0.26) is the same for the LN882H RAM loader: the bridge switches at the end of a host line
+`--follow ln` (firmware 0.26) is the same for the LN882H RAM loaders: the bridge switches at the end of a host line
 `baudrate N` (it starts after CR / LF and holds printable characters only, see `src/lnscan.h`).
 
 `--follow ucfg` (firmware 0.28) is the same for the Realtek AmebaZ2 ROM console's `ucfg <baud> …` line.
@@ -1129,11 +1243,14 @@ L0 / L1, whose erased flash reads 0x00). The old text commands stay for single b
 - `src/sniffring.h`: the logger's live output: frames in a ring that never makes the capture wait (builds natively).
 - `src/wifilink.cpp` / `.h`: the Wi-Fi link: settings in NVS, access point or station, mDNS, the TCP server with
   its one client as a Stream, the key, and the WIFI command.
-- `tlsr_c3.py`: the command line tool on the computer (Python 3, `pyserial`).
+- `tlsr_c3.py`: the command line tool on the computer (Python 3, `pyserial`), with our LN882H loader built in.
+- `loaders/ln882h/`: our LN882H RAM loader (C, start-up code, linker script) and `build.py`, which builds it with
+  PlatformIO's Arm toolchain and embeds it into `tlsr_c3.py`.
 - `tests/`: checks without hardware (stream protocol, SPI host logic, JTAG against a simulated chain, the WCH
   firmware and host against a simulated CH32V003, the BK72xx firmware and host against a simulated BootROM /
   bootloader, the UART log from the firmware's encoder to the host's text, the LN882H host and the bridge's speed
-  following against a model of the ROM and the RAM loader, the RTL8710B host against a model of its ROM that also
+  following against a model of the ROM and both RAM loaders, ours built natively and its binary emulated, the
+  RTL8710B host against a model of its ROM that also
   checks and runs the RAM programs, the RTL8720C host against a model of its ROM console, the host over TCP against
   a model of the flasher's command side, the logger's live ring natively and its host side and Tuya decoder against
   a fake flasher).
@@ -1190,9 +1307,23 @@ Lightning LN882H:
 - ltchiptool by Etienne Le Cousin and Kuba Szczodrzyński (MIT; <https://github.com/libretiny-eu/ltchiptool>,
   `ltchiptool/soc/ln882h`): the sequence (ROM link, RAM loader over YMODEM, speed change, `flash_read` with its CRC,
   `startaddr` + `upgrade`), the wiring and the RAM loader binary it ships (Lightning's, not included here).
-- OpenLN882H SDK (<https://github.com/openshwprojects/OpenLN882H>, Shanghai Lightning Semiconductor's SDK):
-  the source of the RAM loader (`project/bootcode/ramcode_dl`): its commands, the YMODEM receiver, and the erase of
-  the received range that makes the host send whole sectors. LibreTiny: the UF2 family id.
+- OpenLN882H SDK (<https://github.com/openshwprojects/OpenLN882H>, Shanghai Lightning Semiconductor's SDK; it has
+  no license, so nothing of it is copied here: our loader is written from the facts read in it): the source of
+  Lightning's RAM loader (`project/bootcode/ramcode_dl`): its commands, the YMODEM receiver, the erase of the received
+  range that makes the host send whole sectors, the boot header layout, and what that loader sets up (the clocks in
+  `SetSysClock`, `mcu/ln882h/system_ln882h.c` and `hal_clock.c`; UART0 on A2 / A3 with `hal_uart.c` and `hal_gpio.c`,
+  the BRR formula; the flash cache switched off, the QSPI controller); the register addresses and bits of the clock
+  tree (`reg_sysc_awo.h`, `reg_sysc_cmp.h`: clock source, PLL, AHB / APB0 dividers and their update bits, band gap and
+  LDO settings), UART0, the pin functions, GPIOA, the QSPI controller (a DesignWare SSI), the flash cache, the clock
+  gates, the resets, the pad enable and the chip reset (`mcu/driver_ln882h`); the
+  transfer sequences of its flash driver and the flash commands it uses, the MAC address in the flash's security
+  register at 0x100 (`components/fs/nvds`), and how its build tools fill the boot header's length and CRCs
+  (`tools/python_scripts`). LibreTiny: the UF2 family id.
+- ltchiptool's copy of the SDK's boot header model (`ltchiptool/soc/ln882h/util/models/boot_header.py`): the same
+  header fields; `loaders/ln882h/build.py` fills them in its own code and reproduces the header of Lightning's loader
+  binary exactly (checked by `tests/test_ln_loader.py` when that binary is at hand). The start of that binary
+  (disassembled, nothing taken from it but the order and values of its clock and UART set-up) confirmed that it runs
+  the SDK's `SetSysClock` with the PLL, multiplier 8, APB0 / 4, and sets UART0 to 115200 with 8x oversampling.
 
 ## License
 

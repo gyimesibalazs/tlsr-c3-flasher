@@ -35,7 +35,7 @@
 #include "bk72xx.h"
 
 #define FW_NAME "tlsr-c3-flasher"
-#define FW_VERSION "0.30"
+#define FW_VERSION "0.31"
 
 enum SwsMode { MODE_UART = 0, MODE_RMT = 1 };
 
@@ -1290,7 +1290,8 @@ static const char *x_mode_check(char c) {
   if (c == 'P') return spif_active() ? NULL : "not in SPI mode";
   if (c == 'C') return wch_active() ? NULL : "not in WCH mode";
   if (c == 'B') return bk_linked() ? NULL : "not linked to a BK72xx (BK, BKL first)";
-  return "source / destination: F, S, M, P, C or B";
+  if (c == 'L') return NULL;                // the UART log: a source only (x_write_cmd refuses it)
+  return "source / destination: F, S, M, P, C, B or L";
 }
 
 static void x_read_cmd(char src, uint32_t addr, uint32_t len) {
@@ -1314,6 +1315,7 @@ static void x_read_cmd(char src, uint32_t addr, uint32_t len) {
 }
 
 static void x_write_cmd(char dst, uint32_t addr, uint32_t len, uint32_t unit, bool skip) {
+  if (dst == 'L') return err("the UART log is read only");
   const char *why = x_mode_check(dst);
   if (why) return err(why);
   if (dst == 'F' || dst == 'P') unit = 256;
