@@ -12,13 +12,13 @@ Examples:
     python3 tlsr_c3.py -p /dev/ttyACM0 --wch info                     # WCH CH32V003 over SWIO, caught at power-up
     python3 tlsr_c3.py -p /dev/ttyACM0 --bk info                      # Beken BK7231N / T over its UART download port
     python3 tlsr_c3.py -p /dev/ttyACM0 --bk rf 0 0 backup.bin --twice # whole flash
-    python3 tlsr_c3.py -p /dev/ttyACM0 --bk wf 0 firmware.uf2 --run   # LibreTiny / ESPHome UF2
+    python3 tlsr_c3.py -p /dev/ttyACM0 --bk --run wf 0 firmware.uf2   # LibreTiny / ESPHome UF2
     python3 tlsr_c3.py -p /dev/ttyACM0 --esp info                     # ESP32 / ESP8266 ROM download mode (esptool)
     python3 tlsr_c3.py -p /dev/ttyACM0 --esp rf 0 0 backup.bin        # whole flash (esptool 5; give the size on 4)
     python3 tlsr_c3.py -p /dev/ttyACM0 --esp wf 0 firmware.bin
     python3 tlsr_c3.py -p /dev/ttyACM0 --ln info                      # Lightning LN882H over its UART download mode
     python3 tlsr_c3.py -p /dev/ttyACM0 --ln rf 0 0 backup.bin --twice # whole flash
-    python3 tlsr_c3.py -p /dev/ttyACM0 --ln wf 0 firmware.uf2 --run   # LibreTiny / ESPHome UF2
+    python3 tlsr_c3.py -p /dev/ttyACM0 --ln --run wf 0 firmware.uf2   # LibreTiny / ESPHome UF2
     python3 tlsr_c3.py -p /dev/ttyACM0 --rtl info                     # Realtek RTL8710BN over its UART download mode
     python3 tlsr_c3.py -p /dev/ttyACM0 --rtl rf 0 0 backup.bin        # whole flash, checked by the chip's MD5
     python3 tlsr_c3.py -p /dev/ttyACM0 --rtl2 info                    # Realtek RTL8720CF over its UART download mode
@@ -2008,6 +2008,8 @@ def bk_main(f, args):
 def bk_ops(f, args):
     if args.op not in ('info', 'rf', 'wf', 'es', 'ea'):
         raise FlasherError('BK72xx: info, rf, wf, es, ea')
+    if args.op == 'wf' and getattr(args, 'no_erase', False):
+        raise FlasherError('BK72xx: wf always erases the sectors it writes (no --no-erase)')
     t = bk_info(f, args, say=print if args.op == 'info' else (lambda *a: None))
     if args.op == 'info':
         pass
@@ -2608,6 +2610,8 @@ def esp_speeds(first):
 
 def esp_main(f, args, follow=True):
     """follow: the firmware follows esptool's speed change (0.25 and newer)."""
+    if args.op == 'wf' and (getattr(args, 'no_erase', False) or getattr(args, 'no_verify', False)):
+        raise FlasherError('ESP: esptool always erases what it writes and checks it by MD5 (no --no-erase / --no-verify)')
     try:
         import esptool
     except ImportError:
@@ -4609,7 +4613,8 @@ def wifi_main(f, args):
 
 
 def main():
-    ap = argparse.ArgumentParser(description='ESP32-C3 Telink TLSR825x SWire flasher')
+    ap = argparse.ArgumentParser(description='ESP32-C3 flasher: Telink SWS, Arm SWD, cJTAG, JTAG, SPI flash, WCH SWIO, Beken, LN882H, Realtek and '
+                                             'ESP UART download modes, UART bridge, UART logger. Global options go before the command.')
     ap.add_argument('-p', '--port', default='/dev/ttyACM0')
     ap.add_argument('--host', default='',
                     help='reach the flasher over Wi-Fi instead of USB: NAME[:PORT] (default port %d; firmware 0.29), '
@@ -4628,8 +4633,9 @@ def main():
                     help='bytes read per burst, 1 = slow and safe (default 64)')
     ap.add_argument('-r', '--run', action='store_true', help='restart the target CPU at the end')
     ap.add_argument('--swd', action='store_true',
-                    help='Arm SWD target (EFR32, nRF52, STM32): SWDIO on the SWS wire, SWCLK on GPIO 0; '
-                         'EFR32 Series 1/2, nRF52, STM32 F0/F1/F3/F4/G0/G4/L4/WB, RP2040; info, rf, wf, es, ea')
+                    help='Arm SWD target: SWDIO on the SWS wire, SWCLK on GPIO 0; EFR32 Series 1/2, nRF52 / nRF5340, '
+                         'STM32 F0/F1/F3/F4/G0/G4/L0/L1/L4/U5/WB/C0, SAM D/E, RP2040, GD32 / CH32 (F1 type), '
+                         'Puya PY32F002B / MS32C001; info, rf, wf, es, ea')
     ap.add_argument('--swd-khz', type=auto_int, default=1000, help='SWD / JTAG clock in kHz (default 1000)')
     ap.add_argument('--jtag', action='store_true',
                     help='four-wire JTAG (TCK on GPIO 0, TMS on GPIO 20, TDI on the SWS wire, TDO on GPIO 21): '
@@ -4663,7 +4669,7 @@ def main():
     ap.add_argument('--yes-erase-all', action='store_true',
                     help='WCH: confirm unlock (removing the read protection erases the whole user flash)')
     ap.add_argument('--bk', action='store_true',
-                    help='Beken BK72xx (BK7231N, BK7231T: CB2S, CB3S, WB2S ...) over its UART download port: TX1 on '
+                    help='Beken BK72xx (BK7231N, BK7231T, BK7238: CB2S, CB3S, WB2S, T1 ...) over its UART download port: TX1 on '
                          'the SWS wire, RX1 on GPIO 21, CEN on the reset wire, 3V3 on the power pins')
     ap.add_argument('--bk-baud', type=auto_int, default=921600,
                     help='BK72xx: speed after the link at 115200 (default 921600; 115200 when it fails)')
@@ -4749,7 +4755,7 @@ def main():
                    help='rtl: restart the target with its TX wire (the SWS wire) pulled low, the download strap of a '
                         'Realtek AmebaZ (firmware 0.27)')
     sub.add_parser('bridge-exit', help='leave the UART bridge')
-    p = sub.add_parser('log', help='save the UART log of the last UART session (bridge, --esp, --bk) as text: '
+    p = sub.add_parser('log', help='save the UART log of the last UART session (bridge, sniff, --esp, --bk, --ln, --rtl, --rtl2) as text: '
                                    'every byte to and from the target with its time, speed changes, resets')
     p.add_argument('filename', nargs='?', default='uart_log.txt')
     p.add_argument('--bin', default='', help='also save the stored blocks as they are')

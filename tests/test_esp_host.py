@@ -124,3 +124,12 @@ for op in ('selftest', 'pins'):
         pass
 
 print('esp host: all checks passed')
+
+# --no-erase / --no-verify are refused: esptool always erases and verifies
+for flag in ('no_erase', 'no_verify'):
+    try:
+        run(args('wf', filename='x.bin', **{flag: True}), fake_esptool('5.1.0'))
+        raise AssertionError('accepted --%s' % flag.replace('_', '-'))
+    except T.FlasherError as e:
+        assert 'no --no-erase' in str(e), e
+print('--no-erase / --no-verify refused: ok')
