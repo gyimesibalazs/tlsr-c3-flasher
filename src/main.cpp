@@ -22,6 +22,11 @@
 #include "driver/rmt_tx.h"
 #include "driver/uart.h"
 #include "config.h"
+#include "tuart.h"
+#include "uartlog.h"
+#include "lnscan.h"
+#include "wifilink.h"
+#include "sniff.h"
 #include "swd.h"
 #include "swdflash.h"
 #include "spiflash.h"
@@ -30,7 +35,7 @@
 #include "bk72xx.h"
 
 #define FW_NAME "tlsr-c3-flasher"
-#define FW_VERSION "0.24"
+#define FW_VERSION "0.30"
 
 enum SwsMode { MODE_UART = 0, MODE_RMT = 1 };
 
@@ -44,7 +49,19 @@ static SwsMode mode = MODE_UART;
 static int read_burst = 64;             // bytes requested in one go (1 = one byte at a time)
 
 static uint8_t data_buf[MAX_READ];
-static char line[1400];
+static char line[1400];                 // the command line from USB
+static char tcp_line[1400];             // and from the Wi-Fi client
+static int usb_len = 0, tcp_len = 0;       // the parts of a command line read so far into line / tcp_line
+
+// Where commands come from and answers go: the C3's USB port or the Wi-Fi client (wifilink.h). The answer goes to
+// the one the command line came from; the UART bridge belongs to the one that opened it.
+static Stream *host = &Serial;
+static void host_flush() {
+  if (host == &Serial) Serial.flush();
+  else host->flush();                        // the Wi-Fi client gathers its output into lines: send what is there
+}
+// false when the Wi-Fi client the command came from has gone (a stream stops at once instead of waiting it out)
+static bool host_alive() { return host == &Serial || wifi_alive(host); }
 
 // ================================================================ UART mode
 
@@ -372,7 +389,8 @@ static bool swd_on = false;
 static bool jtag_on = false;                 // swd_on is set too: the memory / flash commands work over JTAG
 static void bridge_end();
 
-static bool set_mode(SwsMode m) {
+// every mode off, the SWS wire's drivers too
+static void modes_off() {
   bridge_end();
   spif_end();
   wch_end();
@@ -383,6 +401,10 @@ static bool set_mode(SwsMode m) {
   }
   uart_teardown();
   rmt_teardown();
+}
+
+static bool set_mode(SwsMode m) {
+  modes_off();
   mode = m;
   return m == MODE_UART ? uart_setup() : rmt_setup();
 }
@@ -724,7 +746,7 @@ static void reply_hex(const uint8_t *d, int n) {
   out[k++] = 'O'; out[k++] = 'K'; out[k++] = ' ';
   for (int i = 0; i < n; i++) { out[k++] = hx[d[i] >> 4]; out[k++] = hx[d[i] & 15]; }
   out[k++] = '\n';
-  Serial.write((const uint8_t *)out, k);
+  host->write((const uint8_t *)out, k);
 }
 
 // The link to the computer is the slow part of a read (about 45 kbytes/s on the C3's USB port), so the
@@ -751,8 +773,8 @@ static void reply_b64(const uint8_t *d, int n) {
   }
   out[k++] = '\n';
   uint32_t t0 = micros();
-  Serial.write((const uint8_t *)out, k);
-  Serial.flush();
+  host->write((const uint8_t *)out, k);
+  host_flush();
   stat_reply_us += micros() - t0;
 }
 
@@ -766,19 +788,19 @@ static uint32_t crc32_update(uint32_t crc, const uint8_t *d, int n) {
   return ~crc;
 }
 
-static void ok() { Serial.print("OK\n"); }
+static void ok() { host->print("OK\n"); }
 static void out_line(const char *s) {
-  Serial.print(s);
-  Serial.print("\n");
+  host->print(s);
+  host->print("\n");
 }
-static void err(const char *why) { Serial.print("ERR "); Serial.print(why); Serial.print("\n"); }
+static void err(const char *why) { host->print("ERR "); host->print(why); host->print("\n"); }
 
 // Line test without a target: send an END byte and look at what comes back on the RX pin.
 static void selftest() {
   if (mode == MODE_UART) {
     u_flush_in();
     if (!u_stop()) return err("no echo: check TX - resistor - RX");
-    Serial.printf("OK uart echo at %u baud\n", (unsigned)sws_baud);
+    host->printf("OK uart echo at %u baud\n", (unsigned)sws_baud);
     return;
   }
   rmt_receive_config_t rc = {};
@@ -789,15 +811,15 @@ static void selftest() {
   int k = r_enc_end(r_sym);
   if (!r_send(r_sym, k) || xQueueReceive(r_rxq, &got, pdMS_TO_TICKS(60)) != pdTRUE)
     return err("no pulses seen: check TX - resistor - RX");
-  if ((int)got != k) { Serial.printf("ERR saw %d pulses, sent %d\n", (int)got, k); return; }
+  if ((int)got != k) { host->printf("ERR saw %d pulses, sent %d\n", (int)got, k); return; }
   for (int i = 0; i < k; i++) {
     uint32_t want = r_sym[i].duration0, have = r_rxsym[i].duration0;
     if (have * 4 < want * 3 || have * 4 > want * 5 + 8) {
-      Serial.printf("ERR pulse %d is %u ticks, sent %u\n", i, (unsigned)have, (unsigned)want);
+      host->printf("ERR pulse %d is %u ticks, sent %u\n", i, (unsigned)have, (unsigned)want);
       return;
     }
   }
-  Serial.printf("OK rmt loopback, unit %u ticks (%.0f ns), long pulse measured %u ticks\n",
+  host->printf("OK rmt loopback, unit %u ticks (%.0f ns), long pulse measured %u ticks\n",
                 (unsigned)r_unit, r_unit * 12.5, (unsigned)r_rxsym[0].duration0);
 }
 
@@ -805,9 +827,15 @@ static void selftest() {
 // The computer talks straight to the target's UART (bootloaders of BL702, Beken, ESP chips; serial consoles).
 // RX is the SWS wire, TX the PIN_BRIDGE_TX wire. Leave it by sending ESCAPE after a pause of a second.
 
-static const uart_port_t BRIDGE_UART = UART_NUM_1;
 static const char ESCAPE[] = "~~~X";
 static bool bridge_on = false;
+// The bridge belongs to the source that opened it. Over Wi-Fi that is whichever TCP client is admitted, as the host
+// tool closes its connection after BRIDGE and the target tool (esptool with socket://) or the host connects next;
+// while it lasts, the owner's address needs no key (wifilink.h). With no TCP client for BRIDGE_ALONE_MS it ends by
+// itself; a command line from USB ends it too (USB stays the way back in).
+static bool bridge_tcp = false;
+static uint32_t bridge_alone_ms = 0;
+static const uint32_t BRIDGE_ALONE_MS = 60000;
 static uint32_t bridge_last_ms = 0;
 static int esc_pos = -1;
 static SwsMode mode_before_bridge = MODE_RMT;
@@ -817,13 +845,62 @@ static const uint32_t BRIDGE_CATCH_MS = 1500;
 static bool bridge_catch = false, bridge_linked = false;
 static uint32_t bridge_reset_ms = 0;
 static uint8_t bridge_prev_rx = 0;
+// "esp" follow: esptool connects at 115200, loads its stub and then sends CHANGE_BAUDRATE (SLIP frame, command 0x0F,
+// the new speed in the first 4 data bytes). The bridge reads the host's frames for it and switches its own UART to
+// the new speed once the target's answer to it has passed (the target answers at the old speed, then switches).
+struct SlipScan {
+  bool in = false, esc = false;
+  int pos = 0;            // decoded bytes of the current frame
+  int len = 0;            // decoded bytes of the frame that ended last
+  uint8_t head[12];       // direction, command, size (2), checksum (4), first 4 data bytes
+  // feeds one byte; returns true at the end of a frame of at least 2 bytes (head[0..1] = direction, command)
+  bool feed(uint8_t b) {
+    if (b == 0xC0) {
+      bool done = in && pos >= 2;
+      if (done) len = pos;
+      in = true;
+      esc = false;
+      pos = 0;
+      return done;
+    }
+    if (!in) return false;
+    if (esc) {
+      esc = false;
+      b = b == 0xDC ? 0xC0 : b == 0xDD ? 0xDB : b;
+    } else if (b == 0xDB) {
+      esc = true;
+      return false;
+    }
+    if (pos < (int)sizeof(head)) head[pos] = b;
+    pos++;
+    return false;
+  }
+};
+static const uint8_t ESP_CHANGE_BAUDRATE = 0x0F;
+static bool bridge_esp = false;
+static SlipScan esp_host_scan, esp_target_scan;
+static uint32_t esp_pending_baud = 0;   // asked for by the host, set when the target's answer has passed
+// "ln" / "ucfg" follow: the LN882H's RAM loader ("baudrate N") and the Realtek AmebaZ2 ROM ("ucfg N ...") switch at
+// the end of that line, without an answer at the old speed (lnscan.h). The bridge sends the host's bytes up to that
+// line end at the old speed, then switches and sends the rest.
+static bool bridge_ln = false;
+static LineBaudScan ln_scan;
+// "rtl": a Realtek AmebaZ (RTL8710B) starts its UART download mode when its log TX (PA30) is low as it comes out of
+// reset. The flasher pulls the target's TX wire (the SWS wire) low through GPIO 4's resistor across the restart.
+static bool bridge_rtl = false;
+static bool bridge_ucfg = false;
+static const uint32_t RTL_STRAP_HOLD_MS = 50;
+// Speed escape: after a pause of a second, "~~~S<baud>\n" sets the bridge's speed (for protocols whose speed
+// command the bridge does not read itself); nothing of it reaches the target.
+static const char SPEED_ESCAPE[] = "~~~S";
 
 static void bridge_end() {
   if (!bridge_on) return;
   bridge_on = false;
-  if (uart_is_driver_installed(BRIDGE_UART)) uart_driver_delete(BRIDGE_UART);
-  pinMode(PIN_BRIDGE_TX, INPUT);
+  tuart_end();
   pinMode(PIN_BOOT, INPUT);
+  if (bridge_tcp) wifi_bridge_owner(false);
+  bridge_tcp = false;
 }
 
 // boot: 1 = BOOT pin high, 0 = low, -1 = left open; the target is restarted with that level
@@ -837,70 +914,260 @@ static void bridge_begin(uint32_t baud, int boot) {
   bk_end();
   uart_teardown();
   rmt_teardown();
-  pinMode(PIN_SWS_TX, INPUT);                // the resistor side of the SWS wire stays quiet
   if (boot >= 0) {
     pinMode(PIN_BOOT, OUTPUT);
     digitalWrite(PIN_BOOT, boot ? HIGH : LOW);
   } else {
     pinMode(PIN_BOOT, INPUT);
   }
-  uart_config_t cfg = {};
-  cfg.baud_rate = (int)baud;
-  cfg.data_bits = UART_DATA_8_BITS;
-  cfg.parity = UART_PARITY_DISABLE;
-  cfg.stop_bits = UART_STOP_BITS_1;
-  cfg.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
-  cfg.source_clk = UART_SCLK_DEFAULT;
-  if (uart_driver_install(BRIDGE_UART, 4096, 4096, 0, NULL, 0) != ESP_OK) return;
-  uart_param_config(BRIDGE_UART, &cfg);
-  uart_set_pin(BRIDGE_UART, PIN_BRIDGE_TX, PIN_SWS_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-  gpio_pullup_en((gpio_num_t)PIN_SWS_RX);
+  char session[48];
+  snprintf(session, sizeof(session), "bridge, boot %s%s", boot < 0 ? "open" : boot ? "high" : "low",
+           bridge_catch ? ", catch bk" : bridge_esp ? ", follow esp" : bridge_ucfg ? ", follow ucfg" : bridge_ln ? ", follow ln" :
+           bridge_rtl ? ", rtl download strap" : "");
+  if (!tuart_begin(baud, 4096, 4096, session)) return;
   mode_before_bridge = mode;
   bridge_on = true;
   bridge_last_ms = millis();
   esc_pos = -1;
+  tuart_event("target reset");
+  if (bridge_rtl) {
+    tuart_event("TX wire held low across the restart");
+    pinMode(PIN_SWS_TX, OUTPUT);             // through the resistor: the target's TX is an input at reset
+    digitalWrite(PIN_SWS_TX, LOW);
+  }
   target_reset_pulse();                      // the target starts with the BOOT level applied
+  if (bridge_rtl) {
+    delay(RTL_STRAP_HOLD_MS);
+    pinMode(PIN_SWS_TX, INPUT);
+  }
   bridge_reset_ms = millis();
   bridge_linked = false;
   bridge_prev_rx = 0;
-  uart_flush_input(BRIDGE_UART);
+  esp_host_scan = SlipScan();
+  esp_target_scan = SlipScan();
+  esp_pending_baud = 0;
+  ln_scan = bridge_ucfg ? LineBaudScan("ucfg ", true) : LineBaudScan("baudrate ", false);
+  tuart_flush_input();
 }
 
 static void bridge_pump() {
   static uint8_t buf[512];
-  int n = Serial.available();
+  int n = host->available();
   if (n > 0) {
-    n = Serial.readBytes(buf, min(n, (int)sizeof(buf)));
+    n = host->readBytes(buf, min(n, (int)sizeof(buf)));
     uint32_t now = millis();
     for (int i = 0; i < n; i++) {
       if (esc_pos < 0 && i == 0 && now - bridge_last_ms >= 1000) esc_pos = 0;
       if (esc_pos >= 0) esc_pos = buf[i] == (uint8_t)ESCAPE[esc_pos] ? esc_pos + 1 : -1;
       if (esc_pos == (int)sizeof(ESCAPE) - 1) {
+        host->print("OK bridge closed\n");   // first: closing a Wi-Fi bridge may drop a client let in without the key
+        if (host != &Serial) host->flush();
         bridge_end();
         set_mode(mode_before_bridge);
-        Serial.print("OK bridge closed\n");
+        return;
+      }
+    }
+    if (n >= 6 && now - bridge_last_ms >= 1000 && !memcmp(buf, SPEED_ESCAPE, 4) && buf[n - 1] == '\n') {
+      uint32_t baud = 0;
+      bool ok = true;
+      for (int i = 4; i < n - 1 && ok; i++) {
+        ok = buf[i] >= '0' && buf[i] <= '9' && baud < 100000000u;
+        baud = baud * 10 + (buf[i] - '0');
+      }
+      if (ok && baud >= 1200 && baud <= 5000000) {
+        bridge_last_ms = now;
+        tuart_wait_tx(50);
+        tuart_event("speed escape");
+        tuart_set_baud(baud);
         return;
       }
     }
     bridge_last_ms = now;
-    uart_write_bytes(BRIDGE_UART, buf, n);
+    if (bridge_esp) {
+      for (int i = 0; i < n; i++) {
+        if (esp_host_scan.feed(buf[i]) && esp_host_scan.head[0] == 0x00 &&
+            esp_host_scan.head[1] == ESP_CHANGE_BAUDRATE && esp_host_scan.len >= 12) {
+          const uint8_t *d = esp_host_scan.head + 8;
+          uint32_t baud = d[0] | d[1] << 8 | d[2] << 16 | (uint32_t)d[3] << 24;
+          if (baud >= 1200 && baud <= 5000000) esp_pending_baud = baud;
+        }
+      }
+    }
+    int from = 0;
+    if (bridge_ln) {
+      for (int i = 0; i < n; i++) {
+        uint32_t baud = ln_scan.feed(buf[i]);
+        if (!baud) continue;
+        tuart_write(buf + from, i + 1 - from);
+        from = i + 1;
+        tuart_wait_tx(50);
+        // the loader echoes each character as it comes in: the echo of the line's last one must be in before the
+        // switch (two character times); what was received stays readable at the new speed
+        delayMicroseconds(20000000u / tuart_baud() + 50);
+        tuart_event("speed command line sent");
+        tuart_set_baud(baud);
+      }
+    }
+    tuart_write(buf + from, n - from);
     if (bridge_catch && !bridge_linked && now - bridge_reset_ms >= BRIDGE_CATCH_MS) {
+      tuart_event("target reset (catch)");
       target_reset_pulse();                  // the host's next link checks reach the ROM right after the reset
       bridge_reset_ms = millis();
     }
   }
-  size_t avail = 0;
-  uart_get_buffered_data_len(BRIDGE_UART, &avail);
+  size_t avail = tuart_available();
   if (avail) {
-    int got = uart_read_bytes(BRIDGE_UART, buf, min(avail, sizeof(buf)), 0);
+    int got = tuart_read(buf, (int)min(avail, sizeof(buf)), 0);
     if (got > 0) {
+      int switch_after = -1;                 // the target's answer to CHANGE_BAUDRATE ends at this byte
       for (int i = 0; i < got; i++) {        // 04 0E: an HCI-style answer of the Beken ROM
         if (bridge_prev_rx == 0x04 && buf[i] == 0x0E) bridge_linked = true;
         bridge_prev_rx = buf[i];
+        bool frame_end = bridge_esp && esp_target_scan.feed(buf[i]);
+        if (frame_end && esp_pending_baud && switch_after < 0 && esp_target_scan.head[0] == 0x01 &&
+            esp_target_scan.head[1] == ESP_CHANGE_BAUDRATE)
+          switch_after = i;
       }
-      Serial.write(buf, got);
+      host->write(buf, got);
+      if (host != &Serial) host->flush();
+      if (switch_after >= 0) {
+        // bytes after the answer (none expected) were received at the old speed and are passed on as they are
+        tuart_wait_tx(20);
+        tuart_event("esptool CHANGE_BAUDRATE answered");
+        tuart_set_baud(esp_pending_baud);
+        esp_pending_baud = 0;
+      }
     }
   }
+}
+
+// ================================================================ two-line UART logger (sniff.h)
+// SNIFF <baud A> [<baud B>]: both lines into the UART log and, live, to the host that started it in binary frames
+// (sniffring.h), until the bridge's escape (a pause of a second, then ESCAPE): "OK sniff closed" after the last frame.
+// The host tells the answer from a frame by its first byte (frames start with 1..3). The host's other bytes are
+// ignored.
+// Over Wi-Fi the live output belongs to the TCP connection that started it (the host tool keeps it open for the
+// whole run). When that connection is gone (closed, broken, or replaced by a newly admitted one) the live output ends
+// at once, without the bridge's 60 s of waiting: a client that connects next expects answers, not frames. The capture
+// into the log goes on, as one started at power-up (SNIFFBOOT) does, until a command line comes from USB or a TCP
+// client: that ends it and is then handled as usual; LOG and XR L read the log. A command line from USB also ends a
+// capture whose live output goes to a TCP client (USB stays the way back in).
+static bool sniff_tcp = false;
+static Stream *sniff_host = &Serial;
+static uint32_t sniff_seq = 0;               // the TCP client of the live output
+static uint32_t sniff_last_ms = 0;           // the owner's last byte: the escape needs a pause before it
+static int sniff_esc = -1;
+static const uint32_t SNIFF_STALL_MS = 3000; // closing: an owner that takes nothing for this long is not waited for
+
+static void handle(char *ln);
+
+// nothing driven: the board has its own supply and both lines have their own drivers
+static void sniff_pins() {
+  modes_off();
+  target_power_release();
+  pinMode(PIN_RST, INPUT);
+  pinMode(PIN_BOOT, INPUT);
+  pinMode(PIN_BRIDGE_TX, INPUT);
+  pinMode(PIN_JTAG_TMS, INPUT);
+  pinMode(PIN_SWS_TX, INPUT);
+}
+
+// the capture ends; the reset wire is a released open-drain output again and the SWS mode is set up as before
+static void sniff_stop(const char *why) {
+  sniff_end(why);
+  sniff_live_off();
+  gpio_set_level((gpio_num_t)PIN_RST, 1);
+  pinMode(PIN_RST, OUTPUT_OPEN_DRAIN | PULLUP);
+  digitalWrite(PIN_RST, HIGH);
+  set_mode(mode);
+}
+
+// the live ring lives in the RMT mode's symbol buffer, unused while the logger runs (no static RAM of its own)
+static bool sniff_start(uint32_t a, uint32_t b, bool live) {
+  sniff_pins();
+  return sniff_begin(a, b, live ? (uint8_t *)r_sym : NULL, sizeof(r_sym));
+}
+
+// what the owner takes now without waiting; -1: it is gone
+static int sniff_send(const uint8_t *d, int n) {
+  if (sniff_tcp) return wifi_send_now(d, n);
+  int w = Serial.availableForWrite();        // the USB port's transmit buffer: writing up to its room never waits
+  if (w <= 0) return 0;
+  return (int)Serial.write(d, min(w, n));
+}
+
+// false: the owner is gone
+static bool sniff_drain() {
+  SniffRing &r = sniff_ring();
+  for (int part = 0; part < 2; part++) {     // the ring's end, then its start
+    const uint8_t *p;
+    const int k = r.peek(&p);
+    if (!k) break;
+    const int w = sniff_send(p, k);
+    if (w < 0) return false;
+    r.consume(w);
+    if (w < k) break;
+  }
+  r.report();
+  return true;
+}
+
+static bool sniff_owner_here() {
+  return !sniff_tcp || (wifi_alive(sniff_host) && wifi_client_seq() == sniff_seq);
+}
+
+// the escape: the capture ends, the frames still in the ring go out, then the answer line
+static void sniff_close() {
+  sniff_end("closed by the host");
+  uint32_t last = millis();
+  while (sniff_ring().len && sniff_owner_here() && millis() - last < SNIFF_STALL_MS) {
+    const uint32_t before = sniff_ring().len;
+    if (!sniff_drain()) break;
+    if (sniff_ring().len < before) last = millis();
+    else delay(1);
+  }
+  const bool done = !sniff_ring().len && sniff_owner_here();
+  sniff_stop(NULL);
+  if (!done) return;                         // the rest of a frame is missing: the answer would not be read as one
+  host = sniff_host;
+  host->print("OK sniff closed\n");
+  host_flush();
+}
+
+static void sniff_service() {
+  const bool busy = sniff_capture();
+  if (sniff_tcp) {
+    while (Serial.available()) {             // a command line from USB ends it
+      char c = (char)Serial.read();
+      if (c != '\n') {
+        if (usb_len < (int)sizeof(line) - 1) line[usb_len++] = c;
+        continue;
+      }
+      line[usb_len] = 0;
+      usb_len = 0;
+      sniff_stop("closed by a command from USB");
+      host = &Serial;
+      handle(line);
+      return;
+    }
+  }
+  if (!sniff_owner_here()) {
+    sniff_event("live output ended: the TCP client is gone; the capture goes on until a command comes");
+    sniff_live_off();
+    return;
+  }
+  host = sniff_host;
+  while (host->available() > 0) {            // only the escape counts
+    const int c = host->read();
+    if (c < 0) break;
+    const uint32_t now = millis();
+    if (sniff_esc < 0 && now - sniff_last_ms >= 1000) sniff_esc = 0;
+    if (sniff_esc >= 0) sniff_esc = c == (uint8_t)ESCAPE[sniff_esc] ? sniff_esc + 1 : -1;
+    sniff_last_ms = now;
+    if (sniff_esc == (int)sizeof(ESCAPE) - 1) return sniff_close();
+  }
+  if (!sniff_drain()) return;                // gone: noticed on the next pass
+  if (!busy) delay(1);
 }
 
 // ================================================================ binary streams (XR / XW)
@@ -913,8 +1180,9 @@ static void bridge_pump() {
 //                          ahead: the next frames wait in the receive buffer while one is programmed.
 // src / dst: F = Telink flash over SWS, S = SWD flash (write) / memory (read), M = SWD memory (write),
 // P = SPI flash, C = WCH CH32V003 memory (read) / flash in 64-byte pages or RAM (write), B = Beken BK72xx flash
-// (read: every 4 k block checked by the target's CRC; write: whole erased 4 k sectors). unit: the write is
-// split at these boundaries (flash page); skip 1: parts that are all 0xff are not written (erased flash).
+// (read: every 4 k block checked by the target's CRC; write: whole erased 4 k sectors), L = the UART log (read; see
+// uartlog.h, LOG first). unit: the write is split at these boundaries (flash page); skip 1: parts that are all 0xff
+// are not written (erased flash).
 
 static const int XBLK = 4096;
 static uint8_t xbuf[XBLK + 8];
@@ -922,11 +1190,11 @@ static uint8_t xbuf[XBLK + 8];
 static bool x_send(const uint8_t *d, int n) {
   uint32_t t0 = millis();
   while (n > 0) {
-    int w = Serial.write(d, n);
+    int w = host->write(d, n);
     d += w;
     n -= w;
     if (w > 0) t0 = millis();
-    else if (millis() - t0 > 3000) return false;   // the host stopped reading
+    else if (!host_alive() || millis() - t0 > 3000) return false;   // the host stopped reading, or has gone
   }
   return true;
 }
@@ -948,8 +1216,8 @@ static void x_error(const char *why) { x_frame('E', (const uint8_t *)why, strlen
 static void x_write_error(const char *why) {
   uint32_t last = millis();
   while (millis() - last < 300) {
-    if (Serial.available()) {
-      while (Serial.available()) Serial.read();
+    if (host->available()) {
+      while (host->available()) host->read();
       last = millis();
     }
     delay(1);
@@ -977,6 +1245,9 @@ static const char *x_read(char src, uint32_t addr, uint8_t *buf, int n) {
       int r = bk_read(addr, buf, n);
       return r == BK_OK ? NULL : bk_err_text(r);
     }
+    case 'L':
+      ulog_export(addr, buf, n);
+      return NULL;
   }
   return "source";
 }
@@ -1026,11 +1297,12 @@ static void x_read_cmd(char src, uint32_t addr, uint32_t len) {
   const char *why = x_mode_check(src);
   if (why) return err(why);
   if ((src == 'S' || src == 'C') && ((addr | len) & 3)) return err("address and length in whole words");
-  Serial.printf("OK %u\n", (unsigned)len);
+  host->printf("OK %u\n", (unsigned)len);
   while (len > 0) {
     // anything from the host stops the stream: a client that was interrupted (Ctrl-C) leaves it running,
     // and the next one must get an answer; its bytes stay for the command parser
-    if (Serial.available()) return x_error("aborted by the host");
+    if (host->available()) return x_error("aborted by the host");
+    if (!host_alive()) return;               // a Wi-Fi client that has gone: nobody to send the rest to
     int n = (int)min((uint32_t)XBLK, len);
     why = x_read(src, addr, xbuf, n);
     if (why) return x_error(why);
@@ -1054,10 +1326,10 @@ static void x_write_cmd(char dst, uint32_t addr, uint32_t len, uint32_t unit, bo
   ok();
   while (len > 0) {
     uint8_t h[2];
-    if (Serial.readBytes(h, 2) != 2) return x_write_error("frame header timeout");
+    if (host->readBytes(h, 2) != 2) return x_write_error("frame header timeout");
     int n = h[0] | (h[1] << 8);
     if (n < 1 || n > XBLK || (uint32_t)n > len) return x_write_error("frame length");
-    if (Serial.readBytes(xbuf, n + 4) != (size_t)(n + 4)) return x_write_error("frame data timeout");
+    if (host->readBytes(xbuf, n + 4) != (size_t)(n + 4)) return x_write_error("frame data timeout");
     uint32_t crc;
     memcpy(&crc, xbuf + n, 4);
     if (crc != crc32_update(0, xbuf, n)) return x_write_error("frame CRC");
@@ -1083,7 +1355,7 @@ static void x_write_cmd(char dst, uint32_t addr, uint32_t len, uint32_t unit, bo
 
 static bool swd_check(int r) {
   if (r == SWD_OK) return true;
-  Serial.printf("ERR swd %s\n", swdf_err_name(r));
+  host->printf("ERR swd %s\n", swdf_err_name(r));
   return false;
 }
 
@@ -1096,8 +1368,14 @@ static void handle(char *ln) {
   uint32_t a1 = argc > 1 ? strtoul(argv[1], NULL, 0) : 0;
   uint32_t a2 = argc > 2 ? strtoul(argv[2], NULL, 0) : 0;
 
-  if (!strcmp(cmd, "V")) {
-    Serial.printf("OK %s %s mode=%s baud=%u rate=%u burst=%d tx=%d rx=%d rst=%d pwr=%d+%d more\n", FW_NAME, FW_VERSION,
+  if (!strcmp(cmd, "WIFI")) {               // WIFI [OFF | AP .. | STA .. | KEY .. | NAME ..] (wifilink.cpp)
+    wifi_command(argc, argv, *host);
+    for (int i = 2; i < argc; i++) memset(argv[i], 0, strlen(argv[i]));   // a password or key in hex
+    return;
+  } else if (!strcmp(cmd, "AUTH")) {         // taken out at the start of a TCP connection; a late one is a no-op
+    return out_line("OK auth");
+  } else if (!strcmp(cmd, "V")) {
+    host->printf("OK %s %s mode=%s baud=%u rate=%u burst=%d tx=%d rx=%d rst=%d pwr=%d+%d more\n", FW_NAME, FW_VERSION,
                   mode == MODE_UART ? "uart" : "rmt", (unsigned)sws_baud, (unsigned)sws_rate, read_burst,
                   PIN_SWS_TX, PIN_SWS_RX, PIN_RST, pwr_pins[0], (int)sizeof(pwr_pins) - 1);
   } else if (!strcmp(cmd, "MODE")) {         // MODE uart | rmt
@@ -1137,14 +1415,14 @@ static void handle(char *ln) {
       int div = uart_match_speed();
       if (!div) return err(hint);
       if (!sws_readback_check()) return err(check_dbg);
-      Serial.printf("OK mode=uart div=%d (works %d..%d) clk_mhz=%.1f bitrate=%u\n", div, match_first, match_last,
+      host->printf("OK mode=uart div=%d (works %d..%d) clk_mhz=%.1f bitrate=%u\n", div, match_first, match_last,
                     sws_baud * div / 2000000.0, (unsigned)(sws_baud / 10));
     } else {
       double clk = 0;
       int div = rmt_match_speed(&clk);
       if (!div) return err(hint);
       if (!sws_readback_check()) return err(check_dbg);
-      Serial.printf("OK mode=rmt div=%d clk_mhz=%.1f bitrate=%u\n", div, clk / 1e6,
+      host->printf("OK mode=rmt div=%d clk_mhz=%.1f bitrate=%u\n", div, clk / 1e6,
                     (unsigned)(RMT_HZ / (5 * r_unit)));
     }
   } else if (!strcmp(cmd, "G")) {            // G <addr> <len>: read registers / RAM
@@ -1176,15 +1454,15 @@ static void handle(char *ln) {
     uint32_t crc = 0;
     read_dbg[0] = 0;
     for (uint32_t done = 0; done < a2;) {
-      if (Serial.available()) return err("aborted by the host");
+      if (host->available()) return err("aborted by the host");
       int cnt = (int)min((uint32_t)MAX_READ, a2 - done);
       if (!flash_read(a1 + done, data_buf, cnt)) return err(read_dbg[0] ? read_dbg : "read failed");
       crc = crc32_update(crc, data_buf, cnt);
       done += cnt;
     }
-    Serial.printf("OK %08x\n", (unsigned)crc);
+    host->printf("OK %08x\n", (unsigned)crc);
   } else if (!strcmp(cmd, "STAT")) {         // timing since the last STAT, then reset
-    Serial.printf("OK read_ms=%u read_bytes=%u reply_ms=%u\n", (unsigned)(stat_read_us / 1000),
+    host->printf("OK read_ms=%u read_bytes=%u reply_ms=%u\n", (unsigned)(stat_read_us / 1000),
                   (unsigned)stat_read_bytes, (unsigned)(stat_reply_us / 1000));
     stat_read_us = stat_reply_us = 0;
     stat_read_bytes = 0;
@@ -1196,7 +1474,7 @@ static void handle(char *ln) {
     uint8_t st;
     int r = flash_unlock(&st);
     if (r == 1) return err("flash status cannot be read reliably, refusing to erase or write");
-    if (r == 2) { Serial.printf("ERR flash still protected, status=%02x\n", st); return; }
+    if (r == 2) { host->printf("ERR flash still protected, status=%02x\n", st); return; }
     ok();
   } else if (!strcmp(cmd, "FE")) {           // FE <addr>: erase the 4 k sector
     if (!flash_erase_sector(a1)) return err("flash not ready");
@@ -1209,6 +1487,17 @@ static void handle(char *ln) {
     if (n < 1) return err("data");
     if (!flash_write_page(a1, data_buf, n)) return err("write failed");
     ok();
+  } else if (!strcmp(cmd, "LOG")) {         // LOG: the UART log stored so far (read it with XR L); LOG 0: clear it
+    if (argc > 1 && !strcmp(argv[1], "0")) {
+      ulog_clear();
+      return ok();
+    }
+    ulog_flush();
+    UlogStats st = ulog_stats();
+    host->printf("OK log stored=%u blocks=%u raw=%u dropped=%u tx=%u rx=%u heap=%u heap_min=%u cap=%u\n",
+                  (unsigned)st.stored, (unsigned)st.blocks, (unsigned)st.raw, (unsigned)st.dropped, (unsigned)st.tx,
+                  (unsigned)st.rx, (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size(),
+                  (unsigned)st.capacity);
   } else if (!strcmp(cmd, "XR")) {           // XR <src> <addr> <len>: binary stream read (see above)
     if (argc < 4) return err("src addr len");
     x_read_cmd(argv[1][0], strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));
@@ -1234,7 +1523,7 @@ static void handle(char *ln) {
       rmt_teardown();
     }
     spif_begin(khz);
-    Serial.printf("OK %u\n", (unsigned)spif_khz());
+    host->printf("OK %u\n", (unsigned)spif_khz());
   } else if (cmd[0] == 'P' && cmd[1] && !cmd[2] && strchr("TJABCEXWS", cmd[1]) && !spif_active()) {
     err("not in SPI mode (send SPI first)");
   } else if (!strcmp(cmd, "PT")) {           // PT <hex out> [n in]: one raw transaction, OK <hex in>
@@ -1264,13 +1553,13 @@ static void handle(char *ln) {
     if (a2 < 1 || a2 > 0x1000000) return err("len 1..16 M");
     uint32_t crc = 0;
     for (uint32_t done = 0; done < a2;) {
-      if (Serial.available()) return err("aborted by the host");
+      if (host->available()) return err("aborted by the host");
       int cnt = (int)min((uint32_t)MAX_READ, a2 - done);
       spif_read(a1 + done, data_buf, cnt);
       crc = crc32_update(crc, data_buf, cnt);
       done += cnt;
     }
-    Serial.printf("OK %08x\n", (unsigned)crc);
+    host->printf("OK %08x\n", (unsigned)crc);
   } else if (!strcmp(cmd, "PE")) {           // PE <addr> [opcode]: erase 0x20 = 4 k (default), 0x52 32 k, 0xD8 64 k
     uint8_t op = argc > 2 ? (uint8_t)a2 : 0x20;
     if (op != 0x20 && op != 0x52 && op != 0xD8) return err("opcode 0x20, 0x52 or 0xD8");
@@ -1288,7 +1577,7 @@ static void handle(char *ln) {
     if (r) return err(r == SPIF_ERR_WEL ? "write enable refused (WP pin or status protection)" : "timeout");
     ok();
   } else if (!strcmp(cmd, "PS")) {           // PS: status register 1
-    Serial.printf("OK %02x\n", spif_status());
+    host->printf("OK %02x\n", spif_status());
   } else if (!strcmp(cmd, "SWD")) {          // SWD: switch the pins to SWD, target power on
     bridge_end();
     spif_end();
@@ -1317,7 +1606,7 @@ static void handle(char *ln) {
     swd_on = jtag_on = true;
     target_power(true);
     digitalWrite(PIN_RST, HIGH);
-    Serial.printf("OK %u\n", (unsigned)swd_khz());
+    host->printf("OK %u\n", (unsigned)swd_khz());
   } else if (cmd[0] == 'J' && strcmp(cmd, "JTAG") && !jtag_on) {
     err("not in JTAG mode (send JTAG first)");
   } else if (!strcmp(cmd, "JS")) {           // JS: scan the chain, OK <total IR bits> <id> ... (TDO side first)
@@ -1325,13 +1614,13 @@ static void handle(char *ln) {
     int n = 0, irlen = 0;
     int r = jtag_scan(ids, 32, &n, &irlen);
     if (r != SWD_OK) {
-      Serial.printf("ERR chain: %d devices, %s (TDO stuck? TMS / TCK wired?)\n", n,
+      host->printf("ERR chain: %d devices, %s (TDO stuck? TMS / TCK wired?)\n", n,
                     n >= 32 ? "no end found" : "no instruction register");
       return;
     }
-    Serial.printf("OK %d", irlen);
-    for (int i = 0; i < n; i++) Serial.printf(" %08x", (unsigned)ids[i]);
-    Serial.print("\n");
+    host->printf("OK %d", irlen);
+    for (int i = 0; i < n; i++) host->printf(" %08x", (unsigned)ids[i]);
+    host->print("\n");
   } else if (!strcmp(cmd, "JSEL")) {         // JSEL <pre IR bits> <post IR bits> <pre devices> <post devices>
     if (argc < 5) return err("pre_ir post_ir pre_dr post_dr");
     jtag_select(a1, a2, strtoul(argv[3], NULL, 0), strtoul(argv[4], NULL, 0));
@@ -1341,7 +1630,7 @@ static void handle(char *ln) {
     int r = jtag_dp_connect(&id);
     if (r == SWD_OK) r = swd_power_up();
     if (!swd_check(r)) return;
-    Serial.printf("OK %08x\n", (unsigned)id);
+    host->printf("OK %08x\n", (unsigned)id);
   } else if (!strcmp(cmd, "JRST")) {         // JRST: TAP reset (TMS high), then Run-Test/Idle
     jtag_reset();
     ok();
@@ -1359,7 +1648,7 @@ static void handle(char *ln) {
   } else if (!strcmp(cmd, "SWCLK")) {        // SWCLK <kHz>
     if (a1 < 10 || a1 > 4000) return err("10..4000 kHz");
     swd_set_khz(a1);
-    Serial.printf("OK %u\n", (unsigned)swd_khz());
+    host->printf("OK %u\n", (unsigned)swd_khz());
   } else if (!swd_on && ((cmd[0] == 'S' && cmd[1] && strchr("CDAMFHR", cmd[1]) && strcmp(cmd, "SELFTEST") &&
                            strcmp(cmd, "STAT") && strcmp(cmd, "SRST")) || !strcmp(cmd, "TC"))) {
     err("not in SWD mode (send SWD first)");
@@ -1370,30 +1659,30 @@ static void handle(char *ln) {
                                                 : swd_connect(&id);
     if (r == SWD_OK) r = swd_power_up();
     if (!swd_check(r)) return;
-    Serial.printf("OK %08x\n", (unsigned)id);
+    host->printf("OK %08x\n", (unsigned)id);
   } else if (!strcmp(cmd, "TC")) {           // TC: cJTAG (OScan1) through a TI ICEPick, then JTAG-DP power-up
     uint32_t icepick = 0, dap = 0;
     int r = ti_cjtag_connect(&icepick, &dap);
     if (r == SWD_OK) r = swd_power_up();
     if (r != SWD_OK) {
-      Serial.printf("ERR cjtag %s (ICEPick id %08x)\n", swd_ack_name(r), (unsigned)icepick);
+      host->printf("ERR cjtag %s (ICEPick id %08x)\n", swd_ack_name(r), (unsigned)icepick);
       return;
     }
-    Serial.printf("OK %08x %08x\n", (unsigned)icepick, (unsigned)dap);
+    host->printf("OK %08x %08x\n", (unsigned)icepick, (unsigned)dap);
   } else if (!strcmp(cmd, "SRST")) {         // SRST 0|1: release or hold the reset wire
     digitalWrite(PIN_RST, a1 ? HIGH : LOW);
     ok();
   } else if (!strcmp(cmd, "SDR")) {          // SDR <addr>: DP register read
     uint32_t v = 0;
     if (!swd_check(swd_dp_read(a1, &v))) return;
-    Serial.printf("OK %08x\n", (unsigned)v);
+    host->printf("OK %08x\n", (unsigned)v);
   } else if (!strcmp(cmd, "SDW")) {          // SDW <addr> <value>
     if (!swd_check(swd_dp_write(a1, a2))) return;
     ok();
   } else if (!strcmp(cmd, "SAR")) {          // SAR <ap> <addr>: AP register read
     uint32_t v = 0;
     if (!swd_check(swd_ap_read(a1, a2, &v))) return;
-    Serial.printf("OK %08x\n", (unsigned)v);
+    host->printf("OK %08x\n", (unsigned)v);
   } else if (!strcmp(cmd, "SAW")) {          // SAW <ap> <addr> <value>
     uint32_t v = argc > 3 ? strtoul(argv[3], NULL, 0) : 0;
     if (!swd_check(swd_ap_write(a1, a2, v))) return;
@@ -1433,7 +1722,7 @@ static void handle(char *ln) {
     for (int i = 4; i < argc && nargs < 4; i++) args[nargs++] = strtoul(argv[i], NULL, 0);
     uint32_t r0 = 0;
     if (!swd_check(swdf_call(a1, a2, strtoul(argv[3], NULL, 0), args, nargs, 20000, &r0))) return;
-    Serial.printf("OK %08x\n", (unsigned)r0);
+    host->printf("OK %08x\n", (unsigned)r0);
   } else if (!strcmp(cmd, "SRUN")) {         // SRUN: debug off, reset, run
     if (!swd_check(swdf_run())) return;
     ok();
@@ -1452,13 +1741,13 @@ static void handle(char *ln) {
     if ((a1 | a2) & 3 || a2 < 4 || a2 > 65536) return err("addr and len: multiples of 4, len <= 65536");
     uint32_t crc = 0;
     for (uint32_t done = 0; done < a2;) {
-      if (Serial.available()) return err("aborted by the host");
+      if (host->available()) return err("aborted by the host");
       int cnt = (int)min((uint32_t)MAX_READ, a2 - done);
       if (!swd_check(swd_mem_read(0, a1 + done, data_buf, cnt))) return;
       crc = crc32_update(crc, data_buf, cnt);
       done += cnt;
     }
-    Serial.printf("OK %08x\n", (unsigned)crc);
+    host->printf("OK %08x\n", (unsigned)crc);
   } else if (cmd[0] == 'W') {               // WCH CH32V003 over SWIO: WCH, WT, WA, WR, WW, WH, ... (wchflash.cpp)
     if (!strcmp(cmd, "WCH") && !(argc > 1 && a1 == 0) && !wch_active()) {
       bridge_end();
@@ -1485,15 +1774,47 @@ static void handle(char *ln) {
       rmt_teardown();
     }
     if (!bk_command(argc, argv, out_line)) err("unknown command");
-  } else if (!strcmp(cmd, "BRIDGE")) {       // BRIDGE <baud> [hi|lo|z] [bk]: transparent UART bridge
+  } else if (!strcmp(cmd, "BRIDGE")) {       // BRIDGE <baud> [hi|lo|z] [bk|esp|ln|ucfg|rtl]: transparent UART bridge
     int boot = -1;
     if (argc > 2) boot = !strcmp(argv[2], "hi") ? 1 : !strcmp(argv[2], "lo") ? 0 : -1;
     bridge_catch = argc > 3 && !strcmp(argv[3], "bk");
-    if (a1 < 1200 || a1 > 3000000) return err("baud 1200..3000000");
-    Serial.printf("OK bridge %u baud, boot %s; leave with a 1 s pause and %s\n", (unsigned)a1,
+    bridge_esp = argc > 3 && !strcmp(argv[3], "esp");   // follow esptool's CHANGE_BAUDRATE
+    bridge_ucfg = argc > 3 && !strcmp(argv[3], "ucfg"); // follow the AmebaZ2 ROM's "ucfg N ..." line
+    bridge_ln = bridge_ucfg || (argc > 3 && !strcmp(argv[3], "ln"));   // follow the LN882H loader's "baudrate N"
+    bridge_rtl = argc > 3 && !strcmp(argv[3], "rtl");   // Realtek AmebaZ: TX held low across the restart
+    if (a1 < 1200 || a1 > 5000000) return err("baud 1200..5000000");
+    host->printf("OK bridge %u baud, boot %s; leave with a 1 s pause and %s\n", (unsigned)a1,
                   boot < 0 ? "open" : boot ? "high" : "low", ESCAPE);
-    Serial.flush();
+    host_flush();
     bridge_begin(a1, boot);
+    bridge_tcp = bridge_on && host != &Serial;
+    bridge_alone_ms = millis();
+    if (bridge_tcp) wifi_bridge_owner(true);
+  } else if (!strcmp(cmd, "SNIFF")) {        // SNIFF <baud A> [<baud B>]: two-line UART logger with live output
+    const uint32_t b = argc > 2 ? a2 : a1;
+    if (a1 < 1200 || a1 > 5000000 || b < 1200 || b > 5000000) return err("baud 1200..5000000");
+    if (!sniff_start(a1, b, true)) {
+      sniff_stop(NULL);
+      return err("UART driver install failed");
+    }
+    sniff_tcp = host != &Serial;
+    sniff_host = host;
+    sniff_seq = wifi_client_seq();
+    sniff_last_ms = millis();
+    sniff_esc = -1;
+    // the frames follow this line (the loop sends them); a TCP client gets it at once (take_lines flushes)
+    host->printf("OK sniff A %u B %u; frames follow, leave with a 1 s pause and %s\n", (unsigned)a1, (unsigned)b,
+                 ESCAPE);
+  } else if (!strcmp(cmd, "SNIFFBOOT")) {    // SNIFFBOOT [<baud A> [<baud B>] | 0]: capture from power-up (NVS)
+    if (argc > 1) {
+      const uint32_t b = a1 && argc > 2 ? a2 : a1;
+      if (a1 && (a1 < 1200 || a1 > 5000000 || b < 1200 || b > 5000000)) return err("baud 1200..5000000, or 0");
+      sniff_boot_set(a1, b);
+    }
+    uint32_t a, b;
+    sniff_boot_get(&a, &b);
+    if (!a) return out_line("OK sniffboot off");
+    host->printf("OK sniffboot A %u B %u\n", (unsigned)a, (unsigned)b);
   } else if (!strcmp(cmd, "RUN")) {          // restart the target's CPU
     sws_write1(0x006f, 0x22);
     ok();
@@ -1521,27 +1842,99 @@ void setup() {
   pinMode(PIN_BRIDGE_TX, INPUT);
   wchf_set_power(target_power);              // WCH mode: power cycle and catch the target at start
   bk_set_reset(target_reset_pulse);          // BK72xx: reset (CEN) and power cycle while catching the ROM
-  set_mode(SWS_MODE_DEFAULT ? MODE_RMT : MODE_UART);
+  uint32_t sniff_a, sniff_b;
+  sniff_boot_get(&sniff_a, &sniff_b);        // SNIFFBOOT: listen from power-up, touch nothing (no activation)
+  if (sniff_a) {
+    mode = SWS_MODE_DEFAULT ? MODE_RMT : MODE_UART;   // set up when the capture ends
+    sniff_pins();
+  } else {
+    set_mode(SWS_MODE_DEFAULT ? MODE_RMT : MODE_UART);
 #if AUTO_ACTIVATE_MS > 0
-  activate(AUTO_ACTIVATE_MS);                // leaves the target's CPU stopped, if it was caught
+    activate(AUTO_ACTIVATE_MS);              // leaves the target's CPU stopped, if it was caught
 #endif
+  }
+  wifi_setup();                              // what NVS holds: off, access point or station
+  if (sniff_a) {                             // after Wi-Fi: the log's store is sized to the heap it leaves
+    if (sniff_start(sniff_a, sniff_b, false)) sniff_event("started at power-up; a command from a host stops it");
+    else sniff_stop(NULL);
+  }
+}
+
+static uint32_t tcp_seq = 0;                 // the Wi-Fi client tcp_line belongs to
+
+// Command lines from one source: each whole line is handled with its answers going back there.
+static void take_lines(Stream *s, char *buf, int &len, int cap) {
+  // after BRIDGE the bytes that follow are the target's, after SNIFF only the escape counts (sniff_service)
+  while (!bridge_on && !sniff_live_on() && s->available()) {
+    char c = (char)s->read();
+    if (c == '\n') {
+      buf[len] = 0;
+      len = 0;
+      host = s;
+      // a capture without live output (from power-up, or its TCP client gone) ends at the first line from a host
+      if (sniff_on()) sniff_stop(s == &Serial ? "stopped by a command from USB" : "stopped by a command over TCP");
+      handle(buf);
+      if (host != &Serial) host->flush();
+    } else if (len < cap - 1) {
+      buf[len++] = c;
+    }
+  }
+}
+
+static void bridge_service() {
+  if (!bridge_tcp) {
+    host = &Serial;
+    return bridge_pump();
+  }
+  while (Serial.available()) {               // a command line from USB ends a bridge that belongs to Wi-Fi
+    char c = (char)Serial.read();
+    if (c != '\n') {
+      if (usb_len < (int)sizeof(line) - 1) line[usb_len++] = c;
+      continue;
+    }
+    line[usb_len] = 0;
+    usb_len = 0;
+    tuart_event("closed by a command from USB");
+    bridge_end();
+    set_mode(mode_before_bridge);
+    host = &Serial;
+    handle(line);
+    return;
+  }
+  Stream *c = wifi_client();
+  if (!c) {
+    if (millis() - bridge_alone_ms >= BRIDGE_ALONE_MS) {
+      tuart_event("no TCP client for %u s", (unsigned)(BRIDGE_ALONE_MS / 1000));
+      bridge_end();
+      set_mode(mode_before_bridge);
+    }
+    delay(1);
+    return;                                  // the target's bytes wait in the UART driver for the next client
+  }
+  bridge_alone_ms = millis();
+  host = c;
+  bridge_pump();
 }
 
 void loop() {
-  static int len = 0;
+  wifi_poll();
   if (bridge_on) {
-    bridge_pump();
+    bridge_service();
     return;
   }
-  while (Serial.available()) {
-    char c = (char)Serial.read();
-    if (c == '\n') {
-      line[len] = 0;
-      handle(line);
-      len = 0;
-    } else if (len < (int)sizeof(line) - 1) {
-      line[len++] = c;
+  if (sniff_on() && sniff_live_on()) {
+    sniff_service();
+    return;
+  }
+  if (sniff_on()) sniff_capture();
+  take_lines(&Serial, line, usb_len, sizeof(line));
+  Stream *c = wifi_client();
+  if (c && !bridge_on) {
+    if (wifi_client_seq() != tcp_seq) {      // another client: what the one before left unfinished is dropped
+      tcp_seq = wifi_client_seq();
+      tcp_len = 0;
     }
+    take_lines(c, tcp_line, tcp_len, sizeof(tcp_line));
   }
   delay(1);
 }

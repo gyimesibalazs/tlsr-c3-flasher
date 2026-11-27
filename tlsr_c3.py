@@ -16,12 +16,29 @@ Examples:
     python3 tlsr_c3.py -p /dev/ttyACM0 --esp info                     # ESP32 / ESP8266 ROM download mode (esptool)
     python3 tlsr_c3.py -p /dev/ttyACM0 --esp rf 0 0 backup.bin        # whole flash (esptool 5; give the size on 4)
     python3 tlsr_c3.py -p /dev/ttyACM0 --esp wf 0 firmware.bin
+    python3 tlsr_c3.py -p /dev/ttyACM0 --ln info                      # Lightning LN882H over its UART download mode
+    python3 tlsr_c3.py -p /dev/ttyACM0 --ln rf 0 0 backup.bin --twice # whole flash
+    python3 tlsr_c3.py -p /dev/ttyACM0 --ln wf 0 firmware.uf2 --run   # LibreTiny / ESPHome UF2
+    python3 tlsr_c3.py -p /dev/ttyACM0 --rtl info                     # Realtek RTL8710BN over its UART download mode
+    python3 tlsr_c3.py -p /dev/ttyACM0 --rtl rf 0 0 backup.bin        # whole flash, checked by the chip's MD5
+    python3 tlsr_c3.py -p /dev/ttyACM0 --rtl2 info                    # Realtek RTL8720CF over its UART download mode
     python3 tlsr_c3.py -p /dev/ttyACM0 bridge 115200 --boot hi        # UART bridge, BOOT pin high
     python3 tlsr_c3.py -p /dev/ttyACM0 bridge-exit
+    python3 tlsr_c3.py -p /dev/ttyACM0 wifi join MyNetwork           # Wi-Fi link (firmware 0.29): join a network
+    python3 tlsr_c3.py -p /dev/ttyACM0 wifi key                      # set the key a TCP client must give
+    python3 tlsr_c3.py --host c3-flasher.local --bk info              # any command over TCP instead of USB
+    python3 tlsr_c3.py -p /dev/ttyACM0 sniff 9600 --tuya             # two-line UART logger (firmware 0.30), live
+    python3 tlsr_c3.py -p /dev/ttyACM0 sniff 9600 --at-boot           # capture from every power-up, read with log
 """
 import argparse
 import base64
+import getpass
+import hashlib
+import itertools
 import os
+import re
+import select
+import socket
 import sys
 import time
 import zlib
@@ -38,34 +55,184 @@ class FlasherError(RuntimeError):
     pass
 
 
+# ================================================================ the link to the flasher: USB or TCP (Wi-Fi)
+# Over Wi-Fi (firmware 0.29) the flasher takes the same commands on a TCP port; its address is given as
+# socket://NAME:PORT wherever a serial port goes, so esptool can use it as it is. With a key set on the flasher every
+# connection starts with "AUTH <key>" (answer "OK auth"); while a bridge opened over TCP is on, connections from the
+# same computer need no key (esptool cannot send it).
+
+WIFI_PORT = 7171
+
+
+def is_tcp(port):
+    return port.startswith('socket://')
+
+
+def tcp_url(host):
+    """--host NAME[:PORT] -> socket://NAME:PORT"""
+    name, sep, port = host.rpartition(':')
+    if not sep or not port.isdigit():
+        name, port = host, str(WIFI_PORT)
+    if not name:
+        raise FlasherError('--host: NAME or NAME:PORT')
+    return 'socket://%s:%s' % (name, port)
+
+
+class TcpPort:
+    """A TCP connection with the parts of serial.Serial this script uses. pyserial's own socket:// port reports at
+    most one byte in in_waiting, so every read(in_waiting) would take a single byte; this one buffers what came."""
+    def __init__(self, url, timeout=0.1, connect_timeout=5.0):
+        self.name = url
+        host, _, port = url[len('socket://'):].rpartition(':')
+        try:
+            self.sock = socket.create_connection((host, int(port)), timeout=connect_timeout)
+        except (OSError, ValueError) as e:
+            raise FlasherError('cannot reach the flasher at %s:%s (%s)' % (host, port, e))
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.sock.settimeout(30)                   # sendall: a flasher that takes nothing for this long is gone
+        self.timeout = timeout
+        self.buf = bytearray()
+        self.is_open = True
+        self.closed_why = None                     # the flasher closed the connection: the error to raise
+
+    def _pull(self, wait):
+        """Takes what has come within wait seconds; False when nothing came."""
+        if self.closed_why or not select.select([self.sock], [], [], max(wait, 0))[0]:
+            return False
+        try:
+            chunk = self.sock.recv(65536)
+        except OSError as e:
+            raise serial.SerialException('the connection to the flasher failed: %s' % e)
+        if not chunk:
+            # what was received before is still read; its last words may say why (e.g. "ERR auth: ...")
+            last = bytes(self.buf).decode(errors='replace').strip().splitlines()[-1:]
+            self.closed_why = 'the flasher closed the connection' + (
+                ' (%s)' % last[0] if last and last[0].startswith('ERR') else '')
+            return False
+        self.buf += chunk
+        return True
+
+    def _check_closed(self):
+        if self.closed_why and not self.buf:
+            raise serial.SerialException(self.closed_why)
+
+    @property
+    def in_waiting(self):
+        self._pull(0)
+        self._check_closed()
+        return len(self.buf)
+
+    def read(self, size=1):
+        deadline = time.time() + (self.timeout or 0)
+        while len(self.buf) < size and self._pull(deadline - time.time()):
+            pass
+        self._check_closed()
+        out = bytes(self.buf[:size])
+        del self.buf[:size]
+        return out
+
+    def read_until(self, expected=b'\n', size=None):
+        deadline = time.time() + (self.timeout or 0)
+        while expected not in self.buf and (size is None or len(self.buf) < size):
+            if not self._pull(deadline - time.time()):
+                break
+        self._check_closed()
+        end = self.buf.find(expected)
+        n = end + len(expected) if end >= 0 else len(self.buf)
+        if size is not None:
+            n = min(n, size)
+        out = bytes(self.buf[:n])
+        del self.buf[:n]
+        return out
+
+    def write(self, data):
+        try:
+            self.sock.sendall(data)
+        except OSError as e:
+            raise serial.SerialException('the connection to the flasher failed: %s' % e)
+        return len(data)
+
+    def flush(self):
+        pass
+
+    def reset_input_buffer(self):
+        while self._pull(0):
+            pass
+        self.buf.clear()
+
+    def close(self):
+        if self.is_open:
+            self.is_open = False
+            self.sock.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def tcp_open(url, key=None, timeout=0.1):
+    """Connects and gives the key first when there is one. The key is never printed."""
+    port = TcpPort(url, timeout=timeout)
+    if key:
+        port.write(b'AUTH ' + key.encode() + b'\n')
+        saved, port.timeout = port.timeout, 5.0
+        try:
+            answer = port.read_until(b'\n').decode(errors='replace').strip()
+        except serial.SerialException:
+            answer = ''
+        port.timeout = saved
+        if answer != 'OK auth':
+            port.close()
+            if answer.startswith('ERR auth'):
+                raise FlasherError('the flasher at %s did not take the key' % url[len('socket://'):])
+            raise FlasherError('the flasher at %s did not answer the key (%r)' % (url[len('socket://'):], answer))
+    return port
+
+
 class Flasher:
-    def __init__(self, port, baud=460800):
+    def __init__(self, port, baud=460800, key=None):
         self.rxbuf = b''
-        self.ser = serial.Serial()
-        self.ser.port = port
-        self.ser.baudrate = baud
-        # fixed and short: changing it per command reconfigures the port, which costs about 25 ms on Windows
-        self.ser.timeout = 0.1
-        # keep the control lines quiet, they reset some C3 boards
-        self.ser.dtr = False
-        self.ser.rts = False
-        self.ser.open()
-        time.sleep(1.5)
+        tcp = is_tcp(port)
+        if tcp:
+            self.ser = tcp_open(port, key)
+        else:
+            self.ser = serial.Serial()
+            self.ser.port = port
+            self.ser.baudrate = baud
+            # fixed and short: changing it per command reconfigures the port, which costs about 25 ms on Windows
+            self.ser.timeout = 0.1
+            # keep the control lines quiet, they reset some C3 boards
+            self.ser.dtr = False
+            self.ser.rts = False
+            self.ser.open()
+            time.sleep(1.5)
         last = None
         for _ in range(8):
             # an empty line stops a stream an interrupted client left running (firmware 0.20) and is
             # otherwise ignored; then drop whatever that stream had still sent
-            self.ser.write(b'\n')
-            time.sleep(0.3)
-            self.ser.reset_input_buffer()
-            self.rxbuf = b''
             try:
+                self.ser.write(b'\n')
+                time.sleep(0.3)
+                self.ser.reset_input_buffer()
+                self.rxbuf = b''
                 self.version = self.cmd('V', timeout=1)
                 return
-            except FlasherError as e:
+            except (FlasherError, serial.SerialException) as e:
                 last = e
+                if not tcp and isinstance(e, serial.SerialException):
+                    raise
+                if tcp and 'ERR auth' in str(e):
+                    self.ser.close()
+                    raise FlasherError('the flasher at %s wants its key: --key or C3_FLASHER_KEY'
+                                       % port[len('socket://'):])
+                if tcp and isinstance(e, serial.SerialException):
+                    self.ser.close()
+                    raise
+        self.ser.close()
         raise FlasherError('the flasher does not answer on %s (%s); if it was left in the UART bridge, '
-                           'run bridge-exit, otherwise unplug it and plug it in again' % (port, last))
+                           'run bridge-exit (it also ends the UART logger), otherwise unplug it and plug it in again' % (port, last))
 
     def stop(self):
         """After Ctrl-C: tell the flasher to stop a stream it may still be sending."""
@@ -1479,9 +1646,11 @@ BK_FLASH_SR = {
 BK_FLASH_VENDORS = {0x0B: 'XTX', 0x1C: 'ESMT / EON', 0x20: 'XMC', 0x51: 'GigaDevice (MD)', 0x5E: 'XTX / Zbit',
                     0x68: 'Boya', 0x85: 'Puya', 0xA1: 'Fudan', 0xC2: 'Macronix', 0xC4: 'Giantec', 0xC8: 'GigaDevice',
                     0xCD: 'TH', 0xE0: 'Boya', 0xEB: 'TH', 0xEF: 'Winbond'}
-# RF calibration with the MAC address (TLV) at these addresses, as ltchiptool reads it
-BK_CALIBRATION = {'BK7231N': 0x1D0000, 'BK7231T': 0x1E0000}
-UF2_FAMILIES = {0x7B3EF230: 'BK7231N', 0x675A40B0: 'BK7231T', 0xAFE81D49: 'BK7231Q'}
+# RF calibration with the MAC address (TLV) at these addresses, as ltchiptool reads it; BK7238: the Tuya T1 layout
+# (LibreTiny boards/_base/beken-7238-tuya.json)
+BK_CALIBRATION = {'BK7231N': 0x1D0000, 'BK7231T': 0x1E0000, 'BK7238': 0x1E3000}
+UF2_FAMILIES = {0x7B3EF230: 'BK7231N', 0x675A40B0: 'BK7231T', 0xAFE81D49: 'BK7231Q', 0x159AC324: 'BK7238',
+                0xA38090A8: 'LN882H', 0x22E0D6FC: 'RTL8710B', 0xE08F7564: 'RTL8720C'}
 
 
 class BkTarget:
@@ -1728,7 +1897,7 @@ def bk_verify(f, t, addr, data):
     return addr
 
 
-def uf2_parts(raw, chip=''):
+def uf2_parts(raw, chip='', scheme=3):
     """A LibreTiny / ESPHome UF2 (ltchiptool's uf2tool, OTA format 2): the parts written over UART (the "flasher"
     OTA scheme) as [(flash offset, data)]. A block's address is relative to the partition that the last
     OTA_PART_INFO tag names for that scheme; the partitions' offsets are in the FAL_PTABLE tag of the header."""
@@ -1765,7 +1934,7 @@ def uf2_parts(raw, chip=''):
         if 0xC0EE0C in tags:                # OTA_PART_INFO: 6 nibbles (partition index per scheme), names
             info = tags[0xC0EE0C]
             names = [x.decode() for x in info[3:].split(b'\0') if x]
-            index = int(info[0:3].hex()[3])     # scheme 3: FLASHER_SINGLE
+            index = int(info[0:3].hex()[scheme])  # 3: FLASHER_SINGLE, 4 / 5: FLASHER_DUAL_1 / 2
             part = names[index - 1] if index else None
         if not part:
             continue
@@ -1802,7 +1971,7 @@ def bk_image(f, t, args):
     if not raw:
         raise FlasherError('empty file')
     if raw[:4] == b'UF2\n':
-        parts = uf2_parts(raw, t.chip if t.chip in ('BK7231N', 'BK7231T') else '')
+        parts = uf2_parts(raw, t.chip if t.chip in ('BK7231N', 'BK7231T', 'BK7238') else '')
         if args.address not in (0, parts[0][0]):
             raise FlasherError('a UF2 says itself where it goes: give the address 0')
         return parts
@@ -1901,19 +2070,488 @@ def bk_ops(f, args):
     return t
 
 
+# ================================================================ UART log
+# The flasher keeps what went over the target's UART in the last UART session (bridge, --esp, --bk) in RAM, in
+# blocks compressed with LZ4 (see src/uartlog.h for the format): the start of the session for good, the end in a
+# ring. `log` reads it (LOG, then XR L) and writes it as text.
+
+ULOG_DIR = {1: '>', 2: '<', 3: '#'}      # host -> target, target -> host, event
+SNIFF_DIR = {1: 'B', 2: 'A', 3: '#'}     # the two-line logger (sniff): line B, line A, event
+
+
+def lz4_block_decompress(src, raw_len):
+    out = bytearray()
+    i = 0
+    while i < len(src):
+        tok = src[i]
+        i += 1
+        lit = tok >> 4
+        if lit == 15:
+            while True:
+                b = src[i]
+                i += 1
+                lit += b
+                if b != 255:
+                    break
+        out += src[i:i + lit]
+        i += lit
+        if i >= len(src):
+            break
+        off = src[i] | src[i + 1] << 8
+        i += 2
+        m = tok & 15
+        if m == 15:
+            while True:
+                b = src[i]
+                i += 1
+                m += b
+                if b != 255:
+                    break
+        m += 4
+        if off == 0 or off > len(out):
+            raise FlasherError('UART log: bad LZ4 offset')
+        for _ in range(m):                    # byte by byte: a match may overlap what it copies
+            out.append(out[-off])
+    if len(out) != raw_len:
+        raise FlasherError('UART log: block unpacked to %d bytes instead of %d' % (len(out), raw_len))
+    return bytes(out)
+
+
+def _varint(b, i):
+    v = shift = 0
+    while True:
+        c = b[i]
+        i += 1
+        v |= (c & 0x7F) << shift
+        shift += 7
+        if not c & 0x80:
+            return v, i
+
+
+def ulog_parse(data):
+    """The stored blocks -> a list of (t_us, tag, payload), with ('gap', blocks) where the ring dropped blocks.
+    Times count from the first block."""
+    out = []
+    i = 0
+    base = prev_t0 = prev_seq = None
+    u16 = lambda at: int.from_bytes(data[at:at + 2], 'little')
+    while i + 20 <= len(data):
+        if data[i:i + 2] != b'UL' or data[i + 3] != 2:
+            raise FlasherError('UART log: no block header (version 2) at %d' % i)
+        flags, pay_len, pay_stored = data[i + 2], u16(i + 4), u16(i + 6)
+        seq, t0 = int.from_bytes(data[i + 8:i + 12], 'little'), int.from_bytes(data[i + 12:i + 16], 'little')
+        rec_len, rec_stored = u16(i + 16), u16(i + 18)
+        p = i + 20
+        recs = data[p:p + rec_stored]
+        pay = data[p + rec_stored:p + rec_stored + pay_stored]
+        i = p + rec_stored + pay_stored
+        recs = recs if flags & 2 else lz4_block_decompress(recs, rec_len)
+        pay = pay if flags & 1 else lz4_block_decompress(pay, pay_len)
+        if base is None:
+            base = 0
+        else:
+            if seq != prev_seq + 1:
+                out.append(('gap', seq - prev_seq - 1))
+            base += (t0 - prev_t0) & 0xFFFFFFFF
+        prev_t0, prev_seq = t0, seq
+        t = base
+        j = k = 0
+        while j < len(recs):
+            tag = recs[j]
+            dt, j = _varint(recs, j + 1)
+            ln, j = _varint(recs, j)
+            t += dt
+            out.append((t, tag, pay[k:k + ln]))
+            k += ln
+        if k != len(pay):
+            raise FlasherError('UART log: block %d has %d bytes of data, its records %d' % (seq, len(pay), k))
+    return out
+
+
+def _period(payload):
+    """The length of a short pattern the payload repeats at least 3 times exactly, else 0."""
+    for p in range(1, 65):
+        if len(payload) >= 3 * p and len(payload) % p == 0 and payload == payload[:p] * (len(payload) // p):
+            return p
+    return 0
+
+
+def _hex_lines(head, payload):
+    """16 bytes a line; a run of lines equal to the one before is one line saying how many (as hexdump's *)."""
+    lines, prev, same = [], None, 0
+    for off in range(0, len(payload), 16):
+        chunk = payload[off:off + 16]
+        if chunk == prev and len(chunk) == 16:
+            same += 1
+            continue
+        if same:
+            lines.append('%14s (the same line %d more times)' % ('', same))
+            same = 0
+        text = ''.join(chr(c) if 0x20 <= c < 0x7F else '.' for c in chunk)
+        lines.append('%s %-47s  %s' % (head if not lines else ' ' * 14, chunk.hex(' '), text))
+        prev = chunk
+    if same:
+        lines.append('%14s (the same line %d more times)' % ('', same))
+    return lines
+
+
+def _record_lines(t, tag, payload, dirs=ULOG_DIR):
+    """One record: time in seconds, direction, hex and ASCII 16 bytes a line (an event as its text). A record made of
+    one short pattern (link checks sent back to back) shows the pattern once with its count."""
+    head = '%12.6f %s' % (t / 1e6, dirs.get(tag, '?'))
+    if tag == 3:
+        return ['%s %s' % (head, payload.decode(errors='replace'))]
+    p = _period(payload)
+    if p:
+        return _hex_lines(head, payload[:p]) + ['%14s (this %d-byte pattern %d times in a row)' % ('', p, len(payload) // p)]
+    return _hex_lines(head, payload)
+
+
+def ulog_dirs(entries):
+    """The direction letters of a log: A / B for a session of the two-line logger, else > / <."""
+    for e in entries:
+        if e[0] != 'gap' and e[1] == 3:
+            return SNIFF_DIR if e[2].startswith(b'sniff') else ULOG_DIR
+    return ULOG_DIR
+
+
+def ulog_text(entries, annotate=None):
+    """Readable lines (see _record_lines); a record repeated back to back is shown once with its count.
+    annotate(tag, payload): extra lines after each data record (the Tuya decoder); records are not merged then."""
+    dirs = ulog_dirs(entries)
+    lines = []
+    k = 0
+    while k < len(entries):
+        e = entries[k]
+        if e[0] == 'gap':
+            lines.append('          ... %d blocks dropped by the ring ...' % e[1])
+            if annotate:
+                annotate(None, None)                 # the decoders start over
+            k += 1
+            continue
+        t, tag, payload = e
+        rep = 1
+        while not annotate and k + rep < len(entries) and entries[k + rep][0] != 'gap' and \
+                entries[k + rep][1:] == (tag, payload) and tag != 3:
+            rep += 1
+        lines += _record_lines(t, tag, payload, dirs)
+        if annotate and tag != 3:
+            lines += ['%14s %s' % ('', x) for x in annotate(tag, payload)]
+        if rep > 1:
+            lines.append('%14s (the same %d more times, until %.6f)' % ('', rep - 1, entries[k + rep - 1][0] / 1e6))
+        k += rep
+    return '\n'.join(lines) + '\n'
+
+
+def log_main(f, args):
+    if args.clear:
+        f.cmd('LOG 0')
+        print('UART log cleared.')
+        return
+    answer = f.cmd('LOG')
+    st = dict(kv.split('=') for kv in answer.split()[2:])
+    stored = int(st['stored'])
+    print('UART log: %s blocks, %s bytes of records in %d bytes stored, %s blocks dropped by the ring; '
+          '%s bytes to the target, %s from it' % (st['blocks'], st['raw'], stored, st['dropped'], st['tx'], st['rx']))
+    if 'heap' in st:
+        print('Flasher RAM: %s bytes of heap free, %s at the least since it started%s' % (
+            st['heap'], st['heap_min'], '; log store %d k' % (int(st['cap']) // 1024) if 'cap' in st else ''))
+    if not stored:
+        print('The log is empty (no UART session since the flasher started, or LOG 0).')
+        return
+    data = f.stream_read('L', 0, stored, label='Log')
+    if args.bin:
+        with open(args.bin, 'wb') as out:
+            out.write(data)
+    entries = ulog_parse(data)
+    with open(args.filename, 'w', encoding='utf-8') as out:
+        out.write(ulog_text(entries, TuyaLines() if getattr(args, 'tuya', False) else None))
+    print('Written: %s (%d records)' % (args.filename, sum(1 for e in entries if e[0] != 'gap')))
+
+
+# ================================================================ Tuya MCU serial protocol (sniff --tuya, log --tuya)
+# Between a Tuya Wi-Fi module and the board's MCU: frames 55 AA <version> <command> <length:u16 BE> <data> <checksum:
+# the sum of all bytes before it, mod 256>, the same in both directions. Data points (commands 06, 07, 22): dpid,
+# type, length:u16 BE, value.
+
+TUYA_COMMANDS = {0x00: 'heartbeat', 0x01: 'product info', 0x02: 'working mode', 0x03: 'network status',
+                 0x04: 'reset (Wi-Fi)', 0x05: 'reset (select mode)', 0x06: 'DP command', 0x07: 'DP report',
+                 0x08: 'DP query', 0x1C: 'local time', 0x22: 'DP report (record)'}
+TUYA_DP_TYPES = {0: 'raw', 1: 'bool', 2: 'value', 3: 'string', 4: 'enum', 5: 'bitmap'}
+TUYA_MAX_LEN = 1500        # a longer length field is taken for garbage, not waited for
+
+
+def tuya_dp_value(typ, v):
+    if typ == 1 and len(v) == 1:
+        return 'true' if v[0] else 'false'
+    if typ == 2 and len(v) == 4:
+        u = int.from_bytes(v, 'big')
+        return '%d' % u if u < 0x80000000 else '%d (%d signed)' % (u, u - (1 << 32))
+    if typ == 3:
+        return repr(v.decode('utf-8', 'replace'))
+    if typ in (4, 5) and 1 <= len(v) <= 4:
+        u = int.from_bytes(v, 'big')
+        return '%d' % u if typ == 4 else '0x%0*x' % (2 * len(v), u)
+    return v.hex(' ') or '(empty)'
+
+
+def tuya_dps(d):
+    """The data points of a DP command / report as text, or None when the data is not a list of them."""
+    parts, i = [], 0
+    while i < len(d):
+        if i + 4 > len(d):
+            return None
+        dpid, typ, n = d[i], d[i + 1], int.from_bytes(d[i + 2:i + 4], 'big')
+        v = d[i + 4:i + 4 + n]
+        if len(v) < n:
+            return None
+        parts.append('dp %d %s len %d = %s' % (dpid, TUYA_DP_TYPES.get(typ, 'type %d' % typ), n, tuya_dp_value(typ, v)))
+        i += 4 + n
+    return parts
+
+
+def tuya_frame_text(frame):
+    ver, cmd, data = frame[2], frame[3], frame[6:-1]
+    name = TUYA_COMMANDS.get(cmd)
+    text = 'tuya v%d %s' % (ver, '%s (0x%02x)' % (name, cmd) if name else 'command 0x%02x' % cmd)
+    dps = tuya_dps(data) if cmd in (0x06, 0x07, 0x22) and data else None
+    if dps:
+        return '%s: %s' % (text, '; '.join(dps))
+    if cmd == 0x01 and data:
+        return '%s: %r' % (text, data.decode('utf-8', 'replace'))
+    if cmd == 0x1C and len(data) == 8 and data[0]:
+        return '%s: 20%02d-%02d-%02d %02d:%02d:%02d, weekday %d' % ((text,) + tuple(data[1:8]))
+    return '%s%s' % (text, ', data ' + data.hex(' ') if data else '')
+
+
+class TuyaDecoder:
+    """Frames of one line, reassembled across records; bytes outside frames are reported and skipped, a frame with a
+    bad checksum is shown and the search goes on right after its 55 AA."""
+    def __init__(self):
+        self.buf = bytearray()
+
+    def feed(self, data):
+        self.buf += data
+        out = []
+        while self.buf:
+            i = self.buf.find(b'\x55\xaa')
+            if i < 0:
+                i = len(self.buf) - (1 if self.buf[-1] == 0x55 else 0)   # a last 55 may start a frame
+            if i > 0:
+                out.append('tuya: %d bytes outside frames: %s' % (i, bytes(self.buf[:min(i, 32)]).hex(' ') +
+                                                                    (' ...' if i > 32 else '')))
+                del self.buf[:i]
+            if len(self.buf) < 6:
+                break
+            n = int.from_bytes(self.buf[4:6], 'big')
+            if n > TUYA_MAX_LEN:
+                out.append('tuya: 55 aa with a length of %d: not a frame' % n)
+                del self.buf[:2]
+                continue
+            if len(self.buf) < 7 + n:
+                break
+            frame = bytes(self.buf[:7 + n])
+            want = sum(frame[:-1]) & 0xFF
+            if frame[-1] != want:
+                out.append('tuya: bad checksum %02x (should be %02x): %s' % (frame[-1], want, frame.hex(' ')))
+                del self.buf[:2]
+                continue
+            out.append(tuya_frame_text(frame))
+            del self.buf[:7 + n]
+        return out
+
+
+class TuyaLines:
+    """A decoder per line, as ulog_text's annotate: (tag, payload) -> lines; (None, None): start over (a gap)."""
+    def __init__(self):
+        self.dec = {}
+
+    def __call__(self, tag, payload):
+        if tag is None:
+            self.dec = {}
+            return []
+        return self.dec.setdefault(tag, TuyaDecoder()).feed(payload)
+
+
+# ================================================================ two-line UART logger (firmware 0.30)
+# SNIFF <baud A> [<baud B>]: the flasher listens to line A (the SWS wire) and line B (GPIO 20) without driving
+# anything. Answer "OK sniff ...", then binary frames <tag:u8> <t_us:u32 LE> <n:u16 LE> <data> (tag 1 = line B, 2 =
+# line A, 3 = event text) until the escape (a pause of a second, then ~~~X), answered by "OK sniff closed" after the
+# last frame; a frame starts with 1..3, a text line with a letter. Everything also goes into the UART log (log).
+# SNIFFBOOT <a> <b> | 0: capture from the flasher's power-up without a host, until a host's first command.
+
+SNIFF_ESCAPE = b'~~~X'
+
+
+class SniffParser:
+    """Live output -> items: ('frame', tag, t_us, data) or ('line', text)."""
+    def __init__(self):
+        self.buf = bytearray()
+
+    def feed(self, data):
+        self.buf += data
+        out = []
+        while self.buf:
+            if self.buf[0] in (1, 2, 3):
+                if len(self.buf) < 7:
+                    break
+                n = int.from_bytes(self.buf[5:7], 'little')
+                if len(self.buf) < 7 + n:
+                    break
+                out.append(('frame', self.buf[0], int.from_bytes(self.buf[1:5], 'little'), bytes(self.buf[7:7 + n])))
+                del self.buf[:7 + n]
+            else:
+                end = self.buf.find(b'\n')
+                if end < 0:
+                    break
+                out.append(('line', bytes(self.buf[:end]).decode(errors='replace').strip()))
+                del self.buf[:end + 1]
+        return out
+
+
+class UsClock:
+    """The flasher's 32-bit microsecond times -> microseconds since the first one (across the wrap)."""
+    def __init__(self):
+        self.prev = None
+        self.total = 0
+
+    def __call__(self, t):
+        if self.prev is not None:
+            self.total += (t - self.prev) & 0xFFFFFFFF
+        self.prev = t
+        return self.total
+
+
+class SniffView:
+    """Live frames -> printed lines (as the log's text, A / B), optionally decoded; counts what came."""
+    def __init__(self, tuya=False, out=None, say=print):
+        self.clock = UsClock()
+        self.tuya = TuyaLines() if tuya else None
+        self.out, self.say = out, say
+        self.bytes = {1: 0, 2: 0}
+        self.dropped = 0
+
+    def frame(self, tag, t_us, data):
+        lines = _record_lines(self.clock(t_us), tag, data, SNIFF_DIR)
+        if tag in self.bytes:
+            self.bytes[tag] += len(data)
+            if self.tuya:
+                lines += ['%14s %s' % ('', x) for x in self.tuya(tag, data)]
+        else:
+            m = re.match(rb'live output: (\d+) bytes dropped', data)
+            if m:
+                self.dropped += int(m.group(1))
+        for x in lines:
+            self.say(x)
+            if self.out:
+                self.out.write(x + '\n')
+
+
+def sniff_live(f, baud_a, baud_b, seconds=0, view=None):
+    """SNIFF, show the frames until `seconds` have passed or Ctrl-C, then the escape; returns the closing answer."""
+    view = view or SniffView()
+    answer = f.cmd('SNIFF %d %d' % (baud_a, baud_b))
+    t_cmd = time.time()
+    view.say('Listening: %s' % answer.split(';')[0])
+    view.say('Ctrl-C ends it%s.' % (' (or %g s)' % seconds if seconds else ''))
+    parser = SniffParser()
+    pending, f.rxbuf = f.rxbuf, b''
+    closed = None
+
+    def take(data):
+        nonlocal closed
+        for item in parser.feed(data):
+            if item[0] == 'frame':
+                view.frame(*item[1:])
+            elif item[1].startswith('OK sniff closed'):
+                closed = item[1]
+            else:
+                view.say('# flasher: %s' % item[1])
+
+    try:
+        take(pending)
+        while not seconds or time.time() - t_cmd < seconds:
+            take(f.ser.read(max(1, f.ser.in_waiting)))
+    except KeyboardInterrupt:
+        pass
+    # the escape needs a second without bytes from the host before it, as the flasher sees it: Wi-Fi may hold the
+    # escape back longer than it held the answer, so half a second more
+    while time.time() - t_cmd < 1.5:
+        take(f.ser.read(max(1, f.ser.in_waiting)))
+    f.ser.write(SNIFF_ESCAPE)
+    deadline = time.time() + 10
+    while closed is None and time.time() < deadline:
+        take(f.ser.read(max(1, f.ser.in_waiting)))
+    if closed is None:
+        raise FlasherError('the flasher did not close the logger (no "OK sniff closed"); try bridge-exit')
+    f.rxbuf = bytes(parser.buf)
+    return closed
+
+
+def sniff_main(f, args):
+    if args.no_at_boot:
+        f.cmd('SNIFFBOOT 0')
+        print('Capture at power-up: off.')
+        return
+    if not args.sniff_baud:
+        raise FlasherError('sniff: give the speed of line A (and --baud-b for line B when it differs)')
+    a, b = args.sniff_baud, args.baud_b or args.sniff_baud
+    if args.at_boot:
+        print('Capture at power-up: %s' % f.cmd('SNIFFBOOT %d %d' % (a, b)).replace('sniffboot ', ''))
+        print('From the next power-up the flasher listens on its own (power bank, nothing on its USB port). The first')
+        print('command of a host stops it (this script too); then read the log with: log [--tuya]. The log is in RAM:')
+        print('it is lost when the flasher loses power. Off again with: sniff --no-at-boot')
+        return
+    out = open(args.out, 'w', encoding='utf-8') if args.out else None
+    try:
+        view = SniffView(tuya=args.tuya, out=out)
+        sniff_live(f, a, b, args.seconds, view)
+    finally:
+        if out:
+            out.close()
+    print('Closed. Line A %d bytes, line B %d bytes%s; all of it is in the UART log (log [--tuya]).' % (
+        view.bytes[2], view.bytes[1], ', %d bytes dropped from the live output (the host was too slow)' %
+        view.dropped if view.dropped else ''))
+
+
 # ================================================================ ESP32 / ESP8266 over the UART bridge
 # The flasher restarts the target with its GPIO 0 (the BOOT wire) held low, which starts the ROM's serial download
-# mode, and esptool talks to the ROM through the bridge. The bridge's speed is fixed by the BRIDGE command (the C3's
-# USB port ignores the host's setting), and the ROM finds it from esptool's first sync, so esptool runs at that same
-# speed and never resets the target itself. At the end the bridge is closed and the target restarted with GPIO 0
-# released, so it runs its firmware.
+# mode, and esptool talks to the ROM through the bridge, never resetting the target itself. The C3's USB port ignores
+# the host's speed setting, so the bridge cannot see esptool change its port's speed. From firmware 0.25 the bridge
+# follows esptool instead ("BRIDGE 115200 lo esp"): esptool connects at 115200, loads its stub and asks for the
+# speed of --esp-baud with CHANGE_BAUDRATE; the bridge reads that command and switches its own UART once the target
+# has answered. Older firmware: the bridge runs at --esp-baud from the start and the ROM finds that speed from
+# esptool's first sync. When a run fails, it is repeated at the next lower speed (ESP_SPEEDS), with the target
+# restarted in download mode. At the end the bridge is closed and the target restarted with GPIO 0 released, so it
+# runs its firmware.
 
-def bridge_exit(port):
-    """Leave the bridge: the flasher in the bridge does not answer commands, so send the escape after a pause."""
-    with serial.Serial(port, 115200, timeout=2, dsrdtr=False, rtscts=False) as s:
+ESP_SPEEDS = (921600, 460800, 115200)
+ESP_ROM_BAUD = 115200
+
+def _exit_answer(s):
+    """After the escape: the bridge's or the logger's closing line; target bytes or logger frames may come first."""
+    data = b''
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        data += s.read(max(1, s.in_waiting))
+        m = re.search(rb'OK (?:bridge|sniff) closed[^\n]*\n', data)
+        if m:
+            return m.group(0).decode().strip()
+    return data.split(b'\n')[0][:200].decode(errors='replace').strip()
+
+
+def bridge_exit(port, key=None):
+    """Leave the bridge or the two-line logger: neither answers commands, so send the escape after a pause."""
+    if is_tcp(port):
+        with tcp_open(port, key, timeout=0.2) as s:
+            time.sleep(1.2)
+            s.reset_input_buffer()                 # the target's bytes that waited for this connection
+            s.write(b'~~~X')
+            return _exit_answer(s)
+    with serial.Serial(port, 115200, timeout=0.2, dsrdtr=False, rtscts=False) as s:
         time.sleep(1.2)
         s.write(b'~~~X')
-        return s.read_until(b'\n', 200).decode(errors='replace').strip()
+        return _exit_answer(s)
 
 
 def esptool_commands(op_args, major):
@@ -1962,7 +2600,13 @@ def run_esptool(esptool, argv):
         raise FlasherError('esptool: %s' % e)
 
 
-def esp_main(f, args):
+def esp_speeds(first):
+    """The speeds to try: the asked one, then the lower ones of ESP_SPEEDS."""
+    return [first] + [b for b in ESP_SPEEDS if b < first]
+
+
+def esp_main(f, args, follow=True):
+    """follow: the firmware follows esptool's speed change (0.25 and newer)."""
     try:
         import esptool
     except ImportError:
@@ -1972,19 +2616,42 @@ def esp_main(f, args):
     except (AttributeError, ValueError):
         major = 4
     runs = esptool_commands(args, major)
-    # Restart the target with GPIO 0 low: ROM download mode. The bridge stays at this speed.
-    print(f.cmd('BRIDGE %d lo' % args.esp_baud))
-    f.ser.close()
-    time.sleep(0.1)
+    key = getattr(args, 'key', None)
+    baud = args.esp_baud or (ESP_SPEEDS[0] if follow else ESP_ROM_BAUD)
+    speeds = esp_speeds(baud)
     error = None
-    try:
-        for run in runs:
-            run_esptool(esptool, esptool_argv(args.port, args.esp_baud, args.esp_chip, major, run))
-    except FlasherError as e:
-        error = e
-    answer = bridge_exit(args.port)
-    if not answer.startswith('OK'):
-        print('Leaving the bridge: %s' % (answer or 'no answer'))
+    g = f
+    for run in runs:
+        while True:
+            baud = speeds[0]
+            if g is None:
+                g = Flasher(args.port, key=key)
+            # Restart the target with GPIO 0 low: ROM download mode. Every run starts from the ROM, as a stub left
+            # running by the run before stays at its raised speed. Over Wi-Fi esptool gets the flasher's socket://
+            # address and needs no key: the bridge was opened from this computer.
+            if follow:
+                print(g.cmd('BRIDGE %d lo esp' % ESP_ROM_BAUD))
+            else:
+                print(g.cmd('BRIDGE %d lo' % baud))
+            g.ser.close()
+            g = None
+            time.sleep(0.1)
+            try:
+                run_esptool(esptool, esptool_argv(args.port, baud, args.esp_chip, major, run))
+                error = None
+            except FlasherError as e:
+                error = e
+            answer = bridge_exit(args.port, key)
+            if not answer.startswith('OK'):
+                print('Leaving the bridge: %s' % (answer or 'no answer'))
+            if error is None or len(speeds) == 1:
+                break
+            print('%s at %d baud; trying again at %d baud' % (error, baud, speeds[1]))
+            speeds = speeds[1:]
+        if error is not None:
+            break
+    if error is None:
+        print('esptool ran at %d baud.' % speeds[0])
     if error is None and args.op == 'rf' and args.twice:
         with open(args.filename, 'rb') as a, open(args.filename + '.2', 'rb') as b:
             same = a.read() == b.read()
@@ -1994,7 +2661,7 @@ def esp_main(f, args):
         else:
             print('Both reads are the same.')
     if not args.esp_stay:
-        g = Flasher(args.port)
+        g = Flasher(args.port, key=key)
         try:
             g.cmd('RST')
         finally:
@@ -2004,9 +2671,1341 @@ def esp_main(f, args):
         raise error
 
 
+# ================================================================ Lightning LN882H over UART
+# The flasher is a UART bridge (firmware 0.26: "BRIDGE 115200 lo ln") with the BOOT wire (GPIO 0) on the chip's BOOT pin
+# (GPIOA9) held low, so the chip starts its ROM download mode. The ROM takes text commands at 115200 and loads a RAM
+# loader ("ramcode", Lightning's, as ltchiptool ships it) over YMODEM. The loader reads and erases the flash on text
+# commands and writes it from a YMODEM transfer; "baudrate N" raises its speed, which the bridge follows.
+
+LN_ROM_BAUD = 115200
+LN_SPEEDS = (1000000, 460800, 115200)
+LN_RAM_ADDR = 0x20000000
+LN_READ_CHUNK = 256                      # the loader's flash_read takes at most 256 bytes
+LN_RAMCODE_NAME = 'ln882h_ramcode.bin'
+LN_RAMCODE_SHA256 = '6bd437c6f8366b9cca0fb8de0c80c70788516e3681c6c43d654512feb7a0c723'
+LN_RAMCODE_URL = ('https://github.com/libretiny-eu/ltchiptool/raw/410874f66b60da1dd667dbba69f499acbf16eb03/'
+                  'ltchiptool/soc/ln882h/util/ramcode.bin')
+# a line the bridge would take for the loader's speed change (src/lnscan.h); never sent inside a YMODEM transfer
+LN_BAUD_LINE = re.compile(rb'[\r\n]baudrate [0-9]+[\r\n]')
+LN_ROM_VERSION = re.compile(rb'[ -~]{11}/[0-9:]{8}')    # the ROM's build date, e.g. "Mar 14 2021/00:23:32"
+YM_SOH, YM_EOT, YM_ACK, YM_NAK, YM_CAN, YM_C = 0x01, 0x04, 0x06, 0x15, 0x18, 0x43
+BRIDGE_PAUSE = 1.2                       # the bridge takes its escape only after a pause of a second
+
+
+def crc16_xmodem(data, crc=0):
+    for b in data:
+        crc ^= b << 8
+        for _ in range(8):
+            crc = (crc << 1 ^ 0x1021) if crc & 0x8000 else crc << 1
+        crc &= 0xFFFF
+    return crc
+
+
+def ln_ramcode(path=''):
+    """The LN882H RAM loader: --ln-ramcode, else ln882h_ramcode.bin next to this script, else the copy in an installed
+    ltchiptool."""
+    candidates = [path] if path else [os.path.join(os.path.dirname(os.path.abspath(__file__)), LN_RAMCODE_NAME)]
+    if not path:
+        try:
+            import importlib.util
+            spec = importlib.util.find_spec('ltchiptool')
+            if spec and spec.origin:
+                candidates.append(os.path.join(os.path.dirname(spec.origin), 'soc', 'ln882h', 'util', 'ramcode.bin'))
+        except (ImportError, ValueError):
+            pass
+    for c in candidates:
+        if os.path.isfile(c):
+            with open(c, 'rb') as fh:
+                data = fh.read()
+            if hashlib.sha256(data).hexdigest() != LN_RAMCODE_SHA256:
+                print('Note: %s is not the RAM loader build this script was checked against' % c)
+            if LN_BAUD_LINE.search(data):
+                raise FlasherError('%s holds a "baudrate N" line, which the bridge would take for a speed change' % c)
+            return data
+    raise FlasherError('the LN882H RAM loader is missing: download it from\n  %s\nas %s next to tlsr_c3.py (or give '
+                       '--ln-ramcode, or pip install ltchiptool)' % (LN_RAMCODE_URL, LN_RAMCODE_NAME))
+
+
+class LnLink:
+    """The LN882H's ROM, then its RAM loader, through the flasher's UART bridge (ser is the flasher's port)."""
+
+    def __init__(self, ser):
+        self.ser = ser
+        self.buf = b''
+        self.ramcode = False
+
+    def write(self, data):
+        self.ser.write(data)
+
+    def _more(self):
+        chunk = self.ser.read(max(1, self.ser.in_waiting))
+        self.buf += chunk
+        return bool(chunk)
+
+    def wait_for(self, pattern, timeout):
+        """Reads until the regex pattern is in what came; returns the match (the buffer keeps what follows it)."""
+        deadline = time.time() + timeout
+        while True:
+            m = pattern.search(self.buf)
+            if m:
+                self.buf = self.buf[m.end():]
+                return m
+            if not self._more() and time.time() >= deadline:
+                return None
+
+    def quiet(self, gap=0.15, limit=2.0):
+        """Reads until nothing came for gap seconds; returns it and empties the buffer."""
+        deadline = time.time() + limit
+        last = time.time()
+        while time.time() < deadline:
+            if self._more():
+                last = time.time()
+            elif time.time() - last >= gap:
+                break
+        out, self.buf = self.buf, b''
+        return out
+
+    def command(self, text, expect, timeout=2.0, end=b'\r\n'):
+        """Sends a command line; returns the match of expect (a regex) in the answer, None when it did not come."""
+        self.buf = b''
+        self.write(text.encode() + end)
+        return self.wait_for(expect, timeout)
+
+    def link(self, timeout):
+        """version until the ROM (its build date) or the loader (RAMCODE) answers; returns the answer."""
+        deadline = time.time() + timeout
+        while True:
+            m = self.command('version', re.compile(LN_ROM_VERSION.pattern + rb'|RAMCODE'), timeout=0.4)
+            if m:
+                self.ramcode = m.group(0) == b'RAMCODE'
+                return m.group(0).decode()
+            if time.time() >= deadline:
+                return None
+
+    def ymodem_send(self, name, data, first_ack=10.0, ack=10.0, progress=None):
+        """YMODEM with 128-byte packets and CRC-16, the receiver starting with 'C'. first_ack: the wait for the
+        answer to the header packet (the loader erases the whole range before it answers)."""
+        def packet(seq, payload):
+            payload = payload.ljust(128, b'\x1a' if seq else b'\0')
+            return bytes([YM_SOH, seq & 0xFF, 0xFF - (seq & 0xFF)]) + payload + crc16_xmodem(payload).to_bytes(2, 'big')
+
+        def answer(timeout, wanted=(YM_ACK, YM_NAK, YM_CAN)):
+            deadline = time.time() + timeout
+            while True:
+                for i, b in enumerate(self.buf):
+                    if b in wanted:
+                        self.buf = self.buf[i + 1:]
+                        return b
+                self.buf = b''
+                if not self._more() and time.time() >= deadline:
+                    return None
+
+        def send(seq, payload, timeout):
+            for _ in range(10):
+                self.write(packet(seq, payload))
+                a = answer(timeout)
+                if a == YM_ACK:
+                    return
+                if a == YM_CAN:
+                    raise FlasherError('YMODEM: the receiver cancelled at packet %d' % seq)
+            raise FlasherError('YMODEM: no ACK for packet %d' % seq)
+
+        if answer(5.0, (YM_C,)) is None:
+            raise FlasherError('YMODEM: the receiver did not start (no "C")')
+        send(0, name.encode() + b'\0' + str(len(data)).encode() + b'\0', first_ack)
+        answer(2.0, (YM_C,))                         # the receiver asks for the data
+        for k, pos in enumerate(range(0, len(data), 128)):
+            send(k + 1, data[pos:pos + 128], ack)
+            if progress:
+                progress(min(pos + 128, len(data)))
+        for _ in range(10):                          # EOT: the loader answers the first with NAK, the second with ACK
+            self.write(bytes([YM_EOT]))
+            if answer(1.0) == YM_ACK:
+                break
+        else:
+            raise FlasherError('YMODEM: no ACK for EOT')
+        answer(1.0, (YM_C,))
+        self.write(packet(0, b''))                   # the empty header: end of the batch
+        answer(1.0, (YM_ACK,))
+
+    def set_baud(self, baud):
+        self.buf = b''
+        self.write(b'baudrate %d\r' % baud)          # only CR: the bridge switches at the line end (src/lnscan.h)
+        time.sleep(0.05)
+        self.quiet(0.05, 0.3)
+
+    def flash_read(self, addr, n):
+        """n <= 256 bytes; the loader answers in hex with a CRC-16 (XMODEM) of the data at the end."""
+        text = 'flash_read 0x%X 0x%X' % (addr, n)
+        for attempt in range(3):
+            self.buf = b''
+            self.write(text.encode() + b'\r\n')
+            if self.wait_for(re.compile(re.escape(text.encode())), 1.0) is None:
+                continue
+            want = 2 * (n + 2)
+            deadline = time.time() + 1.0
+            hexd = b''
+            while True:
+                hexd = re.sub(rb'\s', b'', self.buf)
+                if len(hexd) >= want or (not self._more() and time.time() >= deadline):
+                    break
+            if len(hexd) < want or not re.fullmatch(rb'[0-9A-Fa-f]+', hexd[:want]):
+                continue
+            raw = bytes.fromhex(hexd[:want].decode())
+            if crc16_xmodem(raw[:n]) == int.from_bytes(raw[n:], 'big'):
+                self.buf = b''
+                return raw[:n]
+        raise FlasherError('LN882H: flash_read at 0x%x: no valid answer' % addr)
+
+
+class LnTarget:
+    def __init__(self):
+        self.rom = ''
+        self.flash_id = 0
+        self.size = 0
+        self.uid = ''
+        self.mac = ''
+        self.baud = LN_ROM_BAUD
+
+
+def ln_leave_bridge(f):
+    time.sleep(BRIDGE_PAUSE)
+    f.ser.reset_input_buffer()
+    f.rxbuf = b''
+    f.ser.write(b'~~~X')
+    return f.readline(3).decode(errors='replace').strip()
+
+
+def ln_connect(f, args, baud, say=print):
+    """Bridge on, ROM linked, loader loaded and linked, speed raised to baud: (LnLink, LnTarget)."""
+    say(f.cmd('BRIDGE %d lo ln' % LN_ROM_BAUD))
+    link = LnLink(f.ser)
+    t = LnTarget()
+    answer = link.link(args.ln_seconds)
+    if answer is None:
+        raise FlasherError('LN882H: no answer from the ROM. Check TX0 (A2) on the SWS wire, RX0 (A3) on GPIO 21, BOOT '
+                           '(A9) on GPIO 0, CEN on the reset wire, 3V3 on the power pins')
+    if not link.ramcode:
+        t.rom = answer
+        ramcode = ln_ramcode(args.ln_ramcode)
+        say('ROM:     %s; loading the RAM loader (%d bytes)' % (answer, len(ramcode)))
+        link.buf = b''
+        link.write(b'download [rambin] [0x%X] [%d]\r\n' % (LN_RAM_ADDR, len(ramcode)))
+        link.ymodem_send('ramcode.bin', ramcode, first_ack=5.0, ack=3.0)
+        if link.link(8.0) != 'RAMCODE':
+            raise FlasherError('LN882H: the RAM loader does not answer after loading')
+    if baud != LN_ROM_BAUD:
+        link.set_baud(baud)
+        if link.link(1.5) != 'RAMCODE':
+            raise FlasherError('LN882H: no answer at %d baud' % baud)
+    t.baud = baud
+    m = link.command('flash_info', re.compile(rb'id:0x([0-9A-Fa-f]+),flash size:(\d+)M'))
+    if not m:
+        raise FlasherError('LN882H: no answer to flash_info')
+    t.flash_id = int(m.group(1), 16)
+    t.size = 1 << (t.flash_id & 0xFF) if 16 <= (t.flash_id & 0xFF) <= 25 else int(m.group(2)) << 20
+    m = link.command('flash_uid', re.compile(rb'flash uid:0x([0-9A-Fa-f]+)'))
+    t.uid = m.group(1).decode() if m else ''
+    m = link.command('get_mac_in_flash_otp', re.compile(rb'(?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}(?![0-9A-Fa-f:])'), timeout=0.5)
+    t.mac = m.group(0).decode().upper() if m else ''
+    link.quiet(0.05, 0.3)
+    return link, t
+
+
+def ln_read(link, addr, size, progress=True):
+    out = bytearray()
+    t0 = time.time()
+    for pos in range(addr, addr + size, LN_READ_CHUNK):
+        out += link.flash_read(pos, min(LN_READ_CHUNK, addr + size - pos))
+        if progress and (len(out) % 0x10000 == 0 or len(out) == size):
+            el = max(time.time() - t0, 1e-3)
+            print('\r  read 0x%06x / 0x%06x (%.0f kB/s)' % (len(out), size, len(out) / el / 1000), end='', flush=True)
+    if progress:
+        print()
+    return bytes(out)
+
+
+def ln_image(args, t):
+    with open(args.filename, 'rb') as fh:
+        raw = fh.read()
+    if not raw:
+        raise FlasherError('empty file')
+    if raw[:4] == b'UF2\n':
+        parts = uf2_parts(raw, 'LN882H')
+        if args.address not in (0, parts[0][0]):
+            raise FlasherError('a UF2 says itself where it goes: give the address 0')
+        return parts
+    return [(args.address, raw)]
+
+
+def ln_write(link, t, addr, data):
+    """The loader erases the range itself when the YMODEM header comes and writes the data. It rounds the length up
+    to 4 k but not the start: from an unaligned start it erases into the sector after the end. So the range sent is
+    whole sectors: what is on the chip before the start and after the end in them is read first and sent along."""
+    end = addr + len(data)
+    if end > t.size:
+        raise FlasherError('0x%x bytes at 0x%x: beyond the flash (%d kbytes)' % (len(data), addr, t.size // 1024))
+    head, tail = addr % SECTOR, -end % SECTOR
+    if head:
+        data = ln_read(link, addr - head, head, progress=False) + data
+        addr -= head
+    if tail:
+        data = data + ln_read(link, end, tail, progress=False)
+    if LN_BAUD_LINE.search(data):
+        raise FlasherError('the data holds a line "baudrate <digits>", which the bridge would take for the loader\'s '
+                           'speed change in the middle of the transfer (src/lnscan.h); write it in two parts around it')
+    m = link.command('startaddr 0x%X' % addr, re.compile(rb'pppp|ffff'))
+    if not m or m.group(0) != b'pppp':
+        raise FlasherError('LN882H: startaddr 0x%x %s' % (addr, 'not answered' if not m else 'refused'))
+    link.buf = b''
+    link.write(b'upgrade\r')                          # only CR: the loader is in YMODEM after it
+    t0 = time.time()
+
+    def progress(n):
+        if n % 0x10000 < 128 or n == len(data):
+            el = max(time.time() - t0, 1e-3)
+            print('\r  write 0x%06x / 0x%06x (%.0f kB/s)' % (n, len(data), n / el / 1000), end='', flush=True)
+
+    link.ymodem_send('image.bin', data, first_ack=10 + len(data) / 20000, ack=10.0, progress=progress)
+    print()
+    if link.link(3.0) != 'RAMCODE':
+        raise FlasherError('LN882H: the loader does not answer after the write')
+
+
+def ln_main(f, args):
+    if args.op not in ('info', 'rf', 'wf', 'es', 'ea'):
+        raise FlasherError('LN882H: info, rf, wf, es, ea')
+    speeds = [args.ln_baud] if args.ln_baud else list(LN_SPEEDS)
+    error = None
+    for baud in speeds:
+        try:
+            link, t = ln_connect(f, args, baud)
+            error = None
+        except FlasherError as e:
+            error = e
+            answer = ln_leave_bridge(f)
+            if not answer.startswith('OK'):
+                print('Leaving the bridge: %s' % (answer or 'no answer'))
+            if baud == speeds[-1] or 'no answer from the ROM' in str(e) or 'RAM loader is missing' in str(e):
+                raise
+            print('%s; trying again at %d baud' % (e, speeds[speeds.index(baud) + 1]))
+            continue
+        break
+    try:
+        ln_ops(link, t, args)
+    finally:
+        answer = ln_leave_bridge(f)
+        if not answer.startswith('OK'):
+            print('Leaving the bridge: %s' % (answer or 'no answer'))
+    if args.run:
+        f.cmd('RST')
+        print('Target restarted with BOOT released.')
+
+
+def ln_ops(link, t, args):
+    if args.op == 'info':
+        if t.rom:
+            print('ROM:     %s' % t.rom)
+        print('Chip:    LN882H, RAM loader at %d baud' % t.baud)
+        print('Flash:   id 0x%06X, %d kbytes%s' % (t.flash_id, t.size // 1024, ', uid ' + t.uid if t.uid else ''))
+        if t.mac:
+            print('MAC:     %s (OTP)' % t.mac)
+    elif args.op == 'rf':
+        size = args.size or t.size - args.address
+        if args.address + size > t.size:
+            raise FlasherError('0x%x bytes at 0x%x: beyond the flash (%d kbytes)' % (size, args.address, t.size // 1024))
+        os.makedirs(os.path.dirname(os.path.abspath(args.filename)), exist_ok=True)
+        t1 = time.time()
+        data = ln_read(link, args.address, size)
+        print('Read 0x%x bytes in %.1f s at %d baud; every 256 bytes checked against the loader\'s CRC' % (
+            size, time.time() - t1, t.baud))
+        if args.twice:
+            if ln_read(link, args.address, size) != data:
+                with open(args.filename + '.pass1', 'wb') as fh:
+                    fh.write(data)
+                raise FlasherError('the two reads differ; the first was kept as %s.pass1' % args.filename)
+            print('Second read is the same.')
+        with open(args.filename, 'wb') as fh:
+            fh.write(data)
+        print('Saved %d bytes to %s' % (len(data), args.filename))
+    elif args.op == 'wf':
+        if args.no_erase:
+            raise FlasherError('LN882H: the loader always erases what it writes (no --no-erase)')
+        parts = ln_image(args, t)
+        for addr, data in parts:
+            print('Write 0x%06x..0x%06x' % (addr, addr + len(data)))
+            ln_write(link, t, addr, data)
+        if not args.no_verify:
+            for addr, data in parts:
+                back = ln_read(link, addr, len(data), progress=False)
+                if back != data:
+                    bad = next(i for i in range(len(data)) if back[i] != data[i])
+                    raise FlasherError('verify failed at 0x%06x' % (addr + bad))
+            print('Verified (read back).')
+    elif args.op == 'es':
+        start = args.address - args.address % SECTOR
+        end = args.address + max(args.size, 1)
+        end = min(end + (-end % SECTOR), t.size)
+        m = link.command('ferase 0x%X 0x%X' % (start, end - start), re.compile(rb'pppp|ffff'),
+                         timeout=5 + (end - start) / 20000)
+        if not m or m.group(0) != b'pppp':
+            raise FlasherError('LN882H: ferase failed (%s)' % ('no answer' if not m else 'refused'))
+        print('Erased 0x%06x..0x%06x' % (start, end))
+    elif args.op == 'ea':
+        print('Erasing the whole flash (also the boot loader and the partition table; the ROM download mode stays)')
+        m = link.command('ferase_all', re.compile(rb'pppp|ffff'), timeout=120)
+        if not m or m.group(0) != b'pppp':
+            raise FlasherError('LN882H: ferase_all failed (%s)' % ('no answer' if not m else 'refused'))
+        print('Erased.')
+
+
+# ================================================================ Realtek AmebaZ (RTL8710B) over UART
+# The flasher is a UART bridge (firmware 0.27: "BRIDGE 1500000 z rtl") that pulls the chip's log TX (PA30, on the SWS
+# wire) low across the restart, so the ROM starts its UART download mode on the log UART at 1500000 baud. The ROM
+# speaks single-byte commands; while idle it sends NAK now and then ("loud" handshake), an ACK from the host quiets
+# it. Flash is read in 1 k pieces each answered with ACK, and written over XMODEM (1 k packets that carry their
+# address, with a sum checksum); the ROM erases what it writes. Chip id, flash id, MAC and an MD5 of the flash come
+# from small programs run in the chip's RAM (from ltchiptool's AmbZCode), which print their result on the log UART
+# at 115200; the bridge changes its speed for that with its speed escape. After the program the ROM is back in
+# download mode at 1500000.
+
+RTL_ROM_BAUD = 1500000
+RTL_DIAG_BAUD = 115200
+RTL_BAUD_TABLE = (110, 300, 600, 1200, 2400, 4800, 9600, 14400, 19200, 28800, 38400, 57600, 76800, 115200, 128000,
+                  153600, 230400, 380400, 460800, 500000, 921600, 1000000, 1382400, 1444400, 1500000, 1843200,
+                  2000000, 2100000, 2764800, 3000000, 3250000, 3692300, 3750000, 4000000, 6000000)
+RTL_FLASH = 0x08000000
+RTL_RAM = 0x10002000
+RTL_DATA = 0x10003000
+RTL_SYSTEM = 0x9000                      # system data: OTA2 address, OTA switch, flash and log UART settings
+RTL_MARK = b'AmbZTool_Marker!'
+RTL_ROM_BANNER = b'UARTIMG_Download'
+RTL_CHIPS = {0xE0: 'RTL8710BL', 0xFF: 'RTL8710BN', 0xFE: 'RTL8710BU', 0xF6: 'RTL8710BX', 0xFB: 'RTL8710L0',
+             0xFD: 'RTL8711BN', 0xFC: 'RTL8711BU'}
+RTL_CMD_BAUD, RTL_CMD_XMODEM, RTL_CMD_ERASE, RTL_CMD_READ, RTL_CMD_STATUS = 0x05, 0x07, 0x17, 0x19, 0x21
+NAK1, ACK1, CAN1, STX1, EOT1 = b'\x15', b'\x06', b'\x18', b'\x02', b'\x04'
+
+
+def _le32(v):
+    return (v & 0xFFFFFFFF).to_bytes(4, 'little')
+
+
+class RtlCode:
+    """Thumb code for the AmebaZ ROM, calling its functions: from ltchiptool (MIT, Kuba Szczodrzyński,
+    ltchiptool/soc/ambz/util/ambzcode.py); the comments there have the assembly."""
+
+    @staticmethod
+    def greeting(delay_ms, text):
+        return (b'\x05\x48\x03\x4b\x98\x47\x06\xa0\x04\x49\x02\x4b\x98\x47\x0f\xe0\x6d\x34\x00\x00\x49\xec\x00\x00'
+                + _le32(delay_ms) + _le32(len(text)) + text.ljust(16, b'\0'))
+
+    @staticmethod
+    def download_mode():
+        return (b'\x04\x4b\x18\x68\x04\x49\x08\x40\x18\x60\x02\x20\x00\x4b\x98\x47\x01\x09\x00\x00'
+                b'\x10\x02\x00\x40\xff\xff\xff\xef')
+
+    @staticmethod
+    def flash_id(offset):
+        return b'\x9f\x20\x03\x21\x02\x4a\x01\x4b\x98\x47\x03\xe0\x65\x74\x00\x00' + _le32(RTL_DATA + offset)
+
+    @staticmethod
+    def chip_id(offset):
+        return (b'\x03\x48\xf8\x21\x04\x4a\x07\x23\x02\x4c\xa0\x47\x06\xe0\x00\x00\xae\x26\x00\x00\x65\x6d\x00\x00'
+                + _le32(RTL_DATA + offset))
+
+    @staticmethod
+    def efuse_logical_map(offset):
+        return b'\x02\x48\x01\x4b\x98\x47\x03\xe0\x91\x70\x00\x00' + _le32(RTL_DATA + offset)
+
+    @staticmethod
+    def md5(address, length, offset):
+        return (b'\x0c\x48\x06\x4b\x98\x47\x0b\x48\x07\x49\x08\x4a\x04\x4b\x98\x47\x07\x48\x08\x49\x03\x4b\x98\x47'
+                b'\x0e\xe0\x00\x00\xf5\x1d\x01\x00\x25\x1e\x01\x00\xc9\x1e\x01\x00'
+                + _le32(address) + _le32(length) + _le32(RTL_DATA + offset) + _le32(RTL_DATA + offset + 16))
+
+    @staticmethod
+    def print_data(length, address=RTL_DATA):
+        return b'\x03\x48\x04\x49\x01\x4b\x98\x47\x06\xe0\x00\x00\x49\xec\x00\x00' + _le32(address) + _le32(length)
+
+
+class RtlLink:
+    def __init__(self, f):
+        self.f = f
+        self.ser = f.ser
+        self.buf = b''
+        self.baud = RTL_ROM_BAUD
+
+    def write(self, data):
+        self.ser.write(data)
+
+    def _more(self):
+        chunk = self.ser.read(max(1, self.ser.in_waiting))
+        self.buf += chunk
+        return bool(chunk)
+
+    def flush(self):
+        self.ser.reset_input_buffer()
+        self.buf = b''
+
+    def read(self, n, timeout=1.0):
+        deadline = time.time() + timeout
+        while len(self.buf) < n:
+            if not self._more() and time.time() >= deadline:
+                break
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def gather(self, seconds):
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            self._more()
+        out, self.buf = self.buf, b''
+        return out
+
+    def loud(self):
+        """Loud handshake: the ROM sends NAKs while it waits for a command."""
+        self.flush()
+        self.write(bytes([RTL_CMD_STATUS]))
+        got = self.read(6, 1.0)
+        if len(got) < 6 or got[-1:] != NAK1:
+            raise FlasherError('RTL8710B: no NAK from the ROM\'s download mode (got %s)' % (got.hex() or 'nothing'))
+
+    def link(self, timeout):
+        """Waits for the ROM's NAKs; on silence it tries to bring the ROM back (CAN, XMODEM handshake, CAN)."""
+        deadline = time.time() + timeout
+        seen = b''
+        while time.time() < deadline:
+            seen = (seen + self.gather(0.3))[-64:]
+            if seen.endswith(NAK1 * 4):
+                self.loud()
+                return True
+            self.write(bytes([0x18, RTL_CMD_XMODEM, 0x18]))
+        return False
+
+    def quiet(self, limit=10.0):
+        """Quiet handshake: ACK until the NAKs stop, so that a read is not mixed with them."""
+        deadline = time.time() + limit
+        while time.time() < deadline:
+            self.flush()
+            self.write(ACK1)
+            if not self.gather(0.1):
+                return
+        raise FlasherError('RTL8710B: the ROM does not go quiet')
+
+    def bridge_speed(self, baud):
+        """The bridge's speed escape (firmware 0.27): a pause of a second, then ~~~S<baud>."""
+        time.sleep(BRIDGE_PAUSE)
+        self.write(b'~~~S%d\n' % baud)
+        time.sleep(0.05)
+        self.baud = baud
+
+    def set_speed(self, baud):
+        """The ROM's speed command, answered with ACK at the old speed; then the bridge follows."""
+        self.flush()
+        self.write(bytes([RTL_CMD_BAUD, RTL_BAUD_TABLE.index(baud)]))
+        if self.read(1, 1.0) != ACK1:
+            raise FlasherError('RTL8710B: no ACK for the speed change to %d' % baud)
+        self.bridge_speed(baud)
+        self.loud()
+
+    def flash_read(self, addr, size, progress=None):
+        """Whole 4 k sectors: addr and size multiples of 4096. 64 k per read command, every 1 k answered with ACK."""
+        out = bytearray()
+        while len(out) < size:
+            n = min(0x10000, size - len(out))
+            for attempt in range(3):
+                try:
+                    out += self._read_run(addr + len(out), n)
+                    break
+                except FlasherError:
+                    if attempt == 2:
+                        raise
+                    time.sleep(0.2)
+                    self.write(ACK1 * (n // 1024 + 1))   # let the ROM finish the command
+                    time.sleep(0.2)
+            if progress:
+                progress(len(out))
+        return bytes(out)
+
+    def _read_run(self, addr, n):
+        self.quiet()
+        self.write(bytes([RTL_CMD_READ]) + addr.to_bytes(3, 'little') + (n // 4096).to_bytes(2, 'little'))
+        data = bytearray()
+        for _ in range(n // 1024):
+            piece = self.read(1024, 2.0)
+            if len(piece) != 1024:
+                raise FlasherError('RTL8710B: read at 0x%x stopped after %d bytes' % (addr, len(data) + len(piece)))
+            data += piece
+            self.write(ACK1)
+        self.write(ACK1)
+        return bytes(data)
+
+    def xmodem_write(self, addr, data, ram=False, progress=None):
+        """XMODEM with 1 k packets that start with their 4-byte address and end with a sum checksum."""
+        self.loud()
+        self.flush()
+        self.write(bytes([RTL_CMD_XMODEM]))
+        if self.read(1, 1.0) != ACK1:
+            raise FlasherError('RTL8710B: no ACK for the XMODEM handshake')
+        seq = 1
+        for pos in range(0, len(data), 1024):
+            body = _le32(addr + pos) + data[pos:pos + 1024].ljust(1024, b'\xff')
+            pkt = STX1 + bytes([seq, 0xFF - seq]) + body + bytes([sum(body) & 0xFF])
+            for _ in range(10):
+                self.flush()
+                self.write(pkt)
+                a = self.read(1, 3.0)
+                if a == ACK1:
+                    break
+                if a == CAN1:
+                    raise FlasherError('RTL8710B: the ROM cancelled the transfer at 0x%x' % (addr + pos))
+            else:
+                raise FlasherError('RTL8710B: no ACK for the packet at 0x%x' % (addr + pos))
+            seq = (seq + 1) & 0xFF
+            if progress:
+                progress(pos + 1024)
+        self.flush()
+        self.write(EOT1)
+        if ram:
+            return                              # the ROM jumps into the program; its ACK does not come
+        if self.read(1, 3.0) != ACK1:
+            raise FlasherError('RTL8710B: no ACK for EOT')
+        self.loud()
+
+    def run_code(self, code, timeout=8.0):
+        """Runs code in RAM and returns what it printed (between the marker and the ROM's banner)."""
+        self.set_speed(RTL_DIAG_BAUD)
+        code = RtlCode.greeting(400, RTL_MARK) + code + RtlCode.download_mode()
+        table = [0, 0x1000219A + 1, 0x100021EE + 1, 0x100020F4 + 1, 0x100021EE + 1, 0x08000540 + 1]
+        table[0] = (RTL_RAM + len(table) * 4) | 1
+        self.xmodem_write(RTL_RAM, b''.join(_le32(x) for x in table) + code, ram=True)
+        deadline = time.time() + timeout
+        resp = b''
+        while time.time() < deadline and RTL_ROM_BANNER not in resp:
+            self._more()
+            resp, self.buf = resp + self.buf, b''
+        self.bridge_speed(RTL_ROM_BAUD)         # the ROM is back in download mode at its own speed
+        if not self.link(5.0):
+            raise FlasherError('RTL8710B: the ROM did not come back after the RAM program')
+        if RTL_MARK not in resp:
+            raise FlasherError('RTL8710B: the RAM program did not answer (%r)' % resp[:80])
+        resp = resp.partition(RTL_MARK)[2]
+        return resp.partition(RTL_ROM_BANNER)[0]
+
+    def md5(self, addr, size):
+        return self.run_code(RtlCode.md5(RTL_FLASH | addr, size, 0) + RtlCode.print_data(16))[:16]
+
+
+class RtlTarget:
+    def __init__(self):
+        self.chip_id = 0
+        self.chip = ''
+        self.flash_id = b''
+        self.size = 0x200000
+        self.mac = ''
+
+
+def rtl_connect(f, args):
+    print(f.cmd('BRIDGE %d z rtl' % RTL_ROM_BAUD))
+    link = RtlLink(f)
+    if not link.link(args.rtl_seconds):
+        raise FlasherError('RTL8710B: no answer from the ROM. Check the log TX (PA30) on the SWS wire, the log RX '
+                           '(PA29) on GPIO 21, CEN on the reset wire, 3V3 on the power pins')
+    t = RtlTarget()
+    data = link.run_code(RtlCode.chip_id(0) + RtlCode.flash_id(1) + RtlCode.efuse_logical_map(16) +
+                         RtlCode.print_data(16 + 512))
+    if len(data) < 16 + 512:
+        raise FlasherError('RTL8710B: short answer from the RAM program (%d bytes)' % len(data))
+    t.chip_id = data[0]
+    t.chip = RTL_CHIPS.get(t.chip_id, 'unknown 0x%02X' % t.chip_id)
+    t.flash_id = data[1:4]
+    if 0x14 <= t.flash_id[2] <= 0x19:
+        t.size = 1 << t.flash_id[2]
+    t.mac = ':'.join('%02X' % b for b in data[16 + 0x11A:16 + 0x120])
+    return link, t
+
+
+def rtl_read(link, t, addr, size, progress=True):
+    """Any range: whole sectors are read, the MD5 of them is checked by the chip."""
+    start = addr - addr % SECTOR
+    end = addr + size
+    end += -end % SECTOR
+    t0 = time.time()
+
+    def show(n):
+        if progress:
+            el = max(time.time() - t0, 1e-3)
+            print('\r  read 0x%06x / 0x%06x (%.0f kB/s)' % (n, end - start, n / el / 1000), end='', flush=True)
+
+    data = link.flash_read(start, end - start, show)
+    if progress:
+        print()
+    if link.md5(start, end - start) != hashlib.md5(data).digest():
+        raise FlasherError('RTL8710B: the MD5 of 0x%x..0x%x on the chip differs from what was read' % (start, end))
+    return data[addr - start:addr - start + size]
+
+
+def rtl_write(link, t, addr, data, verify=True):
+    """The ROM erases what it writes; the range sent is whole sectors (the rest of the first and last ones is read
+    first and sent along). Checked by the chip's MD5 of the range."""
+    end = addr + len(data)
+    if end > t.size:
+        raise FlasherError('0x%x bytes at 0x%x: beyond the flash (%d kbytes)' % (len(data), addr, t.size // 1024))
+    head, tail = addr % SECTOR, -end % SECTOR
+    if head:
+        data = link.flash_read(addr - head, SECTOR)[:head] + data
+        addr -= head
+    if tail:
+        data = data + link.flash_read(end + tail - SECTOR, SECTOR)[SECTOR - tail:]
+    t0 = time.time()
+
+    def show(n):
+        if n % 0x10000 == 0 or n >= len(data):
+            el = max(time.time() - t0, 1e-3)
+            print('\r  write 0x%06x / 0x%06x (%.0f kB/s)' % (min(n, len(data)), len(data), n / el / 1000), end='',
+                  flush=True)
+
+    link.xmodem_write(RTL_FLASH | addr, data, progress=show)
+    print()
+    if verify and link.md5(addr, len(data)) != hashlib.md5(data).digest():
+        raise FlasherError('RTL8710B: verify failed: the MD5 of 0x%x..0x%x on the chip differs' % (addr, addr + len(data)))
+
+
+def rtl_erase(link, start, end):
+    for a in range(start, end, SECTOR):
+        link.loud()
+        link.flush()
+        link.write(bytes([RTL_CMD_ERASE]) + a.to_bytes(3, 'little') + (1).to_bytes(2, 'little'))
+        if link.read(1, 3.0) != ACK1:
+            raise FlasherError('RTL8710B: no ACK for the erase of 0x%x' % a)
+
+
+def rtl_image(link, t, args):
+    with open(args.filename, 'rb') as fh:
+        raw = fh.read()
+    if not raw:
+        raise FlasherError('empty file')
+    if raw[:4] != b'UF2\n':
+        return [(args.address, raw)]
+    if args.address != 0:
+        raise FlasherError('a UF2 says itself where it goes: give the address 0')
+    # the image goes into the OTA slot the bootloader starts: OTA1 unless the switch word has an odd number of 0 bits
+    sysdata = link.flash_read(RTL_SYSTEM, SECTOR)
+    ota2_addr, switch = int.from_bytes(sysdata[0:4], 'little'), int.from_bytes(sysdata[4:8], 'little')
+    slot = 1 + bin(switch ^ 0xFFFFFFFF).count('1') % 2
+    parts = uf2_parts(raw, 'RTL8710B', scheme=3 + slot)
+    print('OTA:     slot %d is the one that starts (switch 0x%08x, OTA2 at 0x%x)' % (slot, switch, ota2_addr & 0xFFFFFF))
+    if slot == 2 and parts and (ota2_addr & 0xFFFFFF) != parts[0][0]:
+        raise FlasherError('the chip starts OTA2 at 0x%x, the UF2 puts it at 0x%x; write a full image instead' % (
+            ota2_addr & 0xFFFFFF, parts[0][0]))
+    return parts
+
+
+def rtl_main(f, args):
+    if args.op not in ('info', 'rf', 'wf', 'es', 'ea'):
+        raise FlasherError('RTL8710B: info, rf, wf, es, ea')
+    try:
+        link, t = rtl_connect(f, args)
+        rtl_ops(link, t, args)
+    finally:
+        answer = ln_leave_bridge(f)
+        if not answer.startswith('OK'):
+            print('Leaving the bridge: %s' % (answer or 'no answer'))
+    if args.run:
+        f.cmd('RST')
+        print('Target restarted with its TX released.')
+
+
+def rtl_ops(link, t, args):
+    if args.op == 'info':
+        print('Chip:    %s (eFuse 0xF8 = 0x%02X)' % (t.chip, t.chip_id))
+        print('Flash:   id %s, %d kbytes' % (t.flash_id.hex().upper(), t.size // 1024))
+        print('MAC:     %s (eFuse)' % t.mac)
+        sysdata = link.flash_read(RTL_SYSTEM, SECTOR)
+        ota2, switch = int.from_bytes(sysdata[0:4], 'little'), int.from_bytes(sysdata[4:8], 'little')
+        print('OTA:     OTA2 at 0x%x, switch 0x%08x: slot %d starts' % (
+            ota2 & 0xFFFFFF, switch, 1 + bin(switch ^ 0xFFFFFFFF).count('1') % 2))
+    elif args.op == 'rf':
+        size = args.size or t.size - args.address
+        if args.address + size > t.size:
+            raise FlasherError('0x%x bytes at 0x%x: beyond the flash (%d kbytes)' % (size, args.address, t.size // 1024))
+        os.makedirs(os.path.dirname(os.path.abspath(args.filename)), exist_ok=True)
+        t1 = time.time()
+        data = rtl_read(link, t, args.address, size)
+        print('Read 0x%x bytes in %.1f s; checked against the MD5 computed by the chip' % (size, time.time() - t1))
+        if args.twice:
+            if rtl_read(link, t, args.address, size) != data:
+                with open(args.filename + '.pass1', 'wb') as fh:
+                    fh.write(data)
+                raise FlasherError('the two reads differ; the first was kept as %s.pass1' % args.filename)
+            print('Second read is the same.')
+        with open(args.filename, 'wb') as fh:
+            fh.write(data)
+        print('Saved %d bytes to %s' % (len(data), args.filename))
+    elif args.op == 'wf':
+        if args.no_erase:
+            raise FlasherError('RTL8710B: the ROM always erases what it writes (no --no-erase)')
+        for addr, data in rtl_image(link, t, args):
+            print('Write 0x%06x..0x%06x' % (addr, addr + len(data)))
+            rtl_write(link, t, addr, data, verify=not args.no_verify)
+        if not args.no_verify:
+            print('Verified (MD5 on the chip).')
+    elif args.op == 'es':
+        start = args.address - args.address % SECTOR
+        end = args.address + max(args.size, 1)
+        end = min(end + (-end % SECTOR), t.size)
+        rtl_erase(link, start, end)
+        print('Erased 0x%06x..0x%06x' % (start, end))
+    elif args.op == 'ea':
+        print('Erasing 0x0..0x%x sector by sector (also the boot loader and the system data; the ROM download '
+              'mode stays)' % t.size)
+        rtl_erase(link, 0, t.size)
+        print('Erased.')
+
+
+# ================================================================ Realtek AmebaZ2 (RTL8720C) over UART
+# The flasher is a UART bridge (firmware 0.28: "BRIDGE 115200 hi ucfg") with the BOOT wire (GPIO 0) high on the chip's
+# PA00, so its ROM starts the download console on the log UART (PA16 TX, PA15 RX) at 115200. The console takes text
+# commands: ping, ucfg <baud> (speed; the bridge follows the line, src/lnscan.h), DW / DB (dump words / bytes as text;
+# the flash is mapped at 0x98000000 once it is set up), EW (write words), fwd <flash settings> <offset> (an XMODEM
+# transfer written to the flash, erasing what it writes; it also sets where hashq starts), hashq <length> (SHA-256).
+# Chip type and MAC come from the eFuse, read by a small RAM program (ltchiptool's) started through an unused ROM
+# console command whose handler is pointed at it.
+
+RTL2_BAUD = 115200
+RTL2_SPEEDS = (1500000, 921600, 115200)
+RTL2_FLASH_MAP = 0x98000000
+RTL2_CODE = 0x10037000
+RTL2_DATA = 0x10038000
+RTL2_USED = ('ping', 'disc', 'ucfg', 'DW', 'DB', 'EW', 'EB', 'WDTRST', 'hashq', 'fwd', 'fwdram')
+RTL2_CHIPS = {0xFE: 'RTL87x0CF', 0xFD: 'RTL87x0CM'}
+RTL2_UCFG_LINE = re.compile(rb'[\r\n]ucfg [0-9]{1,9}(?: [ -~]*)?[\r\n]')
+# eFuse read program (ltchiptool, MIT, ltchiptool/soc/ambz2/util/ambz2code.py): 512 bytes into RTL2_DATA
+RTL2_EFUSE_CODE = (b'\x38\xb5\x00\x25\x07\x48\x29\x00\x09\x4a\x2a\x44\xaa\x23\x13\x70\x00\x23\x05\x4c\x08\x34\x24\x68'
+                   b'\xa0\x47\x04\x4b\x6d\x1c\x9d\x42\xf0\xd1\x38\xbd\x00\x00\x30\x33\x00\x05\x00\x00\x00\x02\x00\x00'
+                   b'\x00\x80\x03\x10')
+
+
+def efuse_logical(phys):
+    """Realtek eFuse physical map to logical map (ltchiptool, MIT, ltchiptool/soc/amb/efuse.py)."""
+    logical = bytearray(b'\xff' * 512)
+    pos = 0
+
+    def take():
+        nonlocal pos
+        b = phys[pos] if pos < len(phys) else 0xFF
+        pos += 1
+        return b
+
+    def copy(cell, word_map):
+        a = 8 * cell
+        for i in range(4):
+            if not word_map & (1 << i):
+                logical[a] = take()
+                logical[a + 1] = take()
+            a += 2
+
+    while pos < len(phys):
+        h = take()
+        if h == 0xFF:
+            break
+        if h & 0x1F != 0xF:
+            copy(h >> 4, h & 0xF)
+            continue
+        e = take()
+        if e & 0xF == 0xF:
+            continue
+        if e & 0x80:
+            for bit in (1, 2, 4, 8):
+                if not e & bit:
+                    take()
+                    take()
+            continue
+        copy((h >> 5) | ((e & 0xF0) >> 1), e & 0xF)
+    return bytes(logical)
+
+
+class Rtl2Link:
+    def __init__(self, ser):
+        self.ser = ser
+        self.buf = b''
+        self.cfg = '0 1'                     # flash speed (0: single IO) and pin mode
+
+    def write(self, data):
+        self.ser.write(data)
+
+    def _more(self):
+        chunk = self.ser.read(max(1, self.ser.in_waiting))
+        self.buf += chunk
+        return bool(chunk)
+
+    def flush(self):
+        self.ser.reset_input_buffer()
+        self.buf = b''
+
+    def read(self, n, timeout):
+        deadline = time.time() + timeout
+        while len(self.buf) < n:
+            if not self._more() and time.time() >= deadline:
+                break
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def command(self, text):
+        self.flush()
+        self.write(text.encode() + b'\n')
+
+    def lines(self, timeout):
+        """Yields text lines until nothing came for timeout seconds."""
+        deadline = time.time() + timeout
+        while True:
+            while b'\n' in self.buf:
+                line, _, self.buf = self.buf.partition(b'\n')
+                line = line.strip()
+                if line:
+                    deadline = time.time() + timeout
+                    yield line.decode(errors='replace')
+            if not self._more() and time.time() >= deadline:
+                return
+
+    def ping(self):
+        self.command('ping')
+        got = self.read(4, 0.5)
+        tail = self.read(64, 0.05)
+        return got == b'ping' and b'$8710c' not in tail
+
+    def link(self, timeout):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.ping():
+                return True
+            if b'$8710c' in self.buf:
+                break
+        return False
+
+    def dump_words(self, addr, count):
+        self.command('DW %X %d' % (addr, count))
+        words = []
+        for line in self.lines(1.0):
+            f = line.split()
+            if f[0].rstrip(':') == '[Addr]':
+                continue
+            if int(f[0].rstrip(':'), 16) != addr + 4 * len(words):
+                raise FlasherError('RTL8720C: DW answered for another address: %s' % line)
+            words += [int(x, 16) for x in f[1:5]]
+            if len(words) >= count:
+                return words[:count]
+        raise FlasherError('RTL8720C: DW %X: short answer' % addr)
+
+    def dump_bytes(self, addr, count, timeout=3.0):
+        self.command('DB %X %d' % (addr, count))
+        out = bytearray()
+        for line in self.lines(timeout):
+            f = line.split()
+            if f[0] == '[Addr]':
+                continue
+            if int(f[0].rstrip(':'), 16) != addr + len(out) or len(f) < 17:
+                raise FlasherError('RTL8720C: DB: unexpected line %r' % line)
+            out += bytes(int(x, 16) for x in f[1:17])
+            if len(out) >= count:
+                return bytes(out[:count])
+        raise FlasherError('RTL8720C: DB %X: short answer (%d of %d bytes)' % (addr, len(out), count))
+
+    def write_words(self, addr, data):
+        data = data + b'\0' * (-len(data) % 4)
+        words = ['%X' % int.from_bytes(data[i:i + 4], 'little') for i in range(0, len(data), 4)]
+        for i in range(0, len(words), 7):              # EW takes up to about 80 characters
+            chunk = words[i:i + 7]
+            self.command('EW %X %s' % (addr + 4 * i, ' '.join(chunk)))
+            got = list(itertools.islice(self.lines(0.5), len(chunk)))
+            if len(got) < len(chunk):
+                raise FlasherError('RTL8720C: EW %X: no answer' % (addr + 4 * i))
+
+    def set_speed(self, baud):
+        self.command('ucfg %d 0 0' % baud)            # the bridge switches at the line end, OK comes at the new speed
+        self.read(2, 1.0)                              # "OK"; a part of it may be lost in the switch
+        if not self.link(2.0):
+            raise FlasherError('RTL8720C: no answer at %d baud' % baud)
+
+    def flash_init(self):
+        mode = (self.dump_words(0x40000038, 1)[0] >> 5) & 3
+        self.write_words(0x40002800, (0x7EFFFFFF).to_bytes(4, 'little'))
+        self.cfg = '0 %d' % mode
+        self.hashq(0)                                  # sets the flash up in the ROM
+        return mode
+
+    def hashq(self, length):
+        self.command('hashq %d %s' % (length, self.cfg))
+        got = self.read(6 + 32, 5 + length / 150000)
+        if not got.startswith(b'hashs ') or len(got) < 38:
+            raise FlasherError('RTL8720C: hashq: unexpected answer %r' % got[:40])
+        return got[6:38]
+
+    def _xmodem(self, data, progress=None):
+        """XMODEM-1K as the receiver asks: NAK = sum checksum, 'C' = CRC-16."""
+        start = self.read(1, 4.0)
+        if start not in (b'\x15', b'C'):
+            raise FlasherError('RTL8720C: XMODEM did not start (got %r)' % start)
+        crc = start == b'C'
+        seq = 1
+        for pos in range(0, len(data), 1024):
+            body = data[pos:pos + 1024].ljust(1024, b'\xff')
+            tail = crc16_xmodem(body).to_bytes(2, 'big') if crc else bytes([sum(body) & 0xFF])
+            pkt = b'\x02' + bytes([seq, 0xFF - seq]) + body + tail
+            for _ in range(10):
+                self.flush()
+                self.write(pkt)
+                a = self.read(1, 3.0)
+                if a == b'\x06':
+                    break
+                if a == b'\x18':
+                    raise FlasherError('RTL8720C: the ROM cancelled the transfer at +0x%x' % pos)
+            else:
+                raise FlasherError('RTL8720C: no ACK for the packet at +0x%x' % pos)
+            seq = (seq + 1) & 0xFF
+            if progress:
+                progress(pos + 1024)
+        for _ in range(5):
+            self.flush()
+            self.write(b'\x04')
+            if self.read(1, 3.0) == b'\x06':
+                return
+        raise FlasherError('RTL8720C: no ACK for EOT')
+
+    def fwd(self, offset, data, progress=None):
+        """Writes data (whole sectors) to the flash at offset; afterwards hashq starts there."""
+        self.command('fwd %s %x' % (self.cfg, offset))
+        self._xmodem(data, progress)
+        if not self.link(3.0):
+            raise FlasherError('RTL8720C: no answer after the write')
+
+    def hash_from(self, offset):
+        """Sets where hashq starts: fwd with an empty, cancelled transfer."""
+        self.command('fwd %s %x' % (self.cfg, offset))
+        if self.read(1, 4.0) not in (b'\x15', b'C'):
+            raise FlasherError('RTL8720C: fwd did not start')
+        self.write(b'\x18\x18')
+        got = self.read(3, 2.0)
+        if got != b'\x18ER':
+            raise FlasherError('RTL8720C: unexpected answer to the cancelled fwd: %r' % got)
+        if not self.link(3.0):
+            raise FlasherError('RTL8720C: no answer after the cancelled fwd')
+
+    def run_code(self, code, addr=RTL2_CODE):
+        """Loads code with EW and runs it through an unused ROM console command (its handler pointed at it)."""
+        self.write_words(addr, code)
+        table = self.dump_words(0x1002F054, 1)[0]
+        target = None
+        for entry in range(table, table + 8 * 12, 12):
+            name_ptr = self.dump_words(entry, 1)[0]
+            if name_ptr == 0:
+                break
+            name = self.dump_bytes(name_ptr, 16).partition(b'\0')[0]
+            if not name or not name.isascii() or name.decode() in RTL2_USED:
+                continue
+            target = entry + 4, name.decode()
+        if target is None:
+            raise FlasherError('RTL8720C: no unused ROM console command to start a RAM program with')
+        self.write_words(target[0], ((addr | 1)).to_bytes(4, 'little'))
+        self.command(target[1])
+        time.sleep(0.2)
+        if not self.link(3.0):
+            raise FlasherError('RTL8720C: no answer after the RAM program')
+
+
+class Rtl2Target:
+    def __init__(self):
+        self.chip = ''
+        self.chip_id = 0
+        self.mode = 1
+        self.size = 0x200000
+        self.mac = self.mac_bt = ''
+        self.version = 0
+        self.baud = RTL2_BAUD
+
+
+def rtl2_connect(f, args, baud):
+    print(f.cmd('BRIDGE %d hi ucfg' % RTL2_BAUD))
+    link = Rtl2Link(f.ser)
+    time.sleep(0.2)
+    if not link.link(args.rtl_seconds):
+        if b'$8710c' in link.buf:
+            raise FlasherError('RTL8720C: the ROM console answered, not the download mode: is PA00 on the BOOT wire '
+                               '(GPIO 0, held high)?')
+        raise FlasherError('RTL8720C: no answer from the ROM. Check the log TX (PA16) on the SWS wire, the log RX '
+                           '(PA15) on GPIO 21, PA00 on GPIO 0 (held high), CEN on the reset wire, 3V3 on the power '
+                           'pins; PA13 (RX0) must not be pulled low')
+    t = Rtl2Target()
+    if baud != RTL2_BAUD:
+        link.set_speed(baud)
+    t.baud = baud
+    t.mode = link.flash_init()
+    t.size = 0x200000 if t.mode == 1 else 0x400000
+    t.version = (link.dump_words(0x400001F0, 1)[0] >> 4) & 0xF
+    return link, t
+
+
+def rtl2_efuse(link, t):
+    link.run_code(RTL2_EFUSE_CODE)
+    phys = link.dump_bytes(RTL2_DATA, 512)
+    logi = efuse_logical(phys)
+    t.chip_id = phys[0x1F8]
+    t.chip = RTL2_CHIPS.get(t.chip_id, 'unknown 0x%02X' % t.chip_id)
+    t.mac = ':'.join('%02X' % b for b in logi[0x11A:0x120])
+    t.mac_bt = ':'.join('%02X' % b for b in logi[0x190:0x196])
+
+
+def rtl2_read(link, t, addr, size, progress=True):
+    out = bytearray()
+    t0 = time.time()
+    chunk = 4096
+    for pos in range(addr, addr + size, chunk):
+        n = min(chunk, addr + size - pos)
+        for attempt in range(3):
+            try:
+                out += link.dump_bytes(RTL2_FLASH_MAP | pos, n, timeout=1.0 + 2e5 / t.baud)
+                break
+            except (FlasherError, ValueError):
+                if attempt == 2:
+                    raise
+                link.read(1 << 20, 0.5)               # let the rest of the dump pass
+        if progress and (len(out) % 0x10000 == 0 or len(out) == size):
+            el = max(time.time() - t0, 1e-3)
+            print('\r  read 0x%06x / 0x%06x (%.0f kB/s)' % (len(out), size, len(out) / el / 1000), end='', flush=True)
+    if progress:
+        print()
+    link.hash_from(addr)
+    if link.hashq(size) != hashlib.sha256(out).digest():
+        raise FlasherError('RTL8720C: the SHA-256 of 0x%x..0x%x on the chip differs from what was read' % (
+            addr, addr + size))
+    return bytes(out)
+
+
+def rtl2_write(link, t, addr, data, verify=True):
+    """fwd erases what it writes; whole sectors are sent (the rest of the first and last ones read first)."""
+    end = addr + len(data)
+    if end > t.size:
+        raise FlasherError('0x%x bytes at 0x%x: beyond the flash (%d kbytes)' % (len(data), addr, t.size // 1024))
+    head, tail = addr % SECTOR, -end % SECTOR
+    if head:
+        data = link.dump_bytes(RTL2_FLASH_MAP | (addr - head), head) + data
+        addr -= head
+    if tail:
+        data = data + link.dump_bytes(RTL2_FLASH_MAP | end, tail)
+    if RTL2_UCFG_LINE.search(data):
+        raise FlasherError('the data holds a line "ucfg <digits>", which the bridge would take for the ROM\'s speed '
+                           'change in the middle of the transfer (src/lnscan.h); write it in two parts around it')
+    t0 = time.time()
+
+    def show(n):
+        if n % 0x10000 == 0 or n >= len(data):
+            el = max(time.time() - t0, 1e-3)
+            print('\r  write 0x%06x / 0x%06x (%.0f kB/s)' % (min(n, len(data)), len(data), n / el / 1000), end='',
+                  flush=True)
+
+    link.fwd(addr, data, show)
+    print()
+    if verify and link.hashq(len(data)) != hashlib.sha256(data).digest():
+        raise FlasherError('RTL8720C: verify failed: the SHA-256 of 0x%x..0x%x on the chip differs' % (
+            addr, addr + len(data)))
+
+
+def rtl2_image(args):
+    with open(args.filename, 'rb') as fh:
+        raw = fh.read()
+    if not raw:
+        raise FlasherError('empty file')
+    if raw[:4] != b'UF2\n':
+        return [(args.address, raw)]
+    if args.address != 0:
+        raise FlasherError('a UF2 says itself where it goes: give the address 0')
+    return uf2_parts(raw, 'RTL8720C', scheme=4)     # always OTA1, as ltchiptool does
+
+
+def rtl2_main(f, args):
+    if args.op not in ('info', 'rf', 'wf', 'es', 'ea'):
+        raise FlasherError('RTL8720C: info, rf, wf, es, ea')
+    speeds = [args.rtl_baud] if args.rtl_baud else list(RTL2_SPEEDS)
+    link = t = None
+    for baud in speeds:
+        try:
+            link, t = rtl2_connect(f, args, baud)
+            break
+        except FlasherError as e:
+            answer = ln_leave_bridge(f)
+            if not answer.startswith('OK'):
+                print('Leaving the bridge: %s' % (answer or 'no answer'))
+            if baud == speeds[-1] or 'no answer from the ROM' in str(e) or 'ROM console' in str(e):
+                raise
+            print('%s; trying again at %d baud' % (e, speeds[speeds.index(baud) + 1]))
+    try:
+        rtl2_ops(link, t, args)
+    finally:
+        answer = ln_leave_bridge(f)
+        if not answer.startswith('OK'):
+            print('Leaving the bridge: %s' % (answer or 'no answer'))
+    if args.run:
+        f.cmd('RST')
+        print('Target restarted with PA00 released.')
+
+
+def rtl2_ops(link, t, args):
+    if args.op == 'info':
+        rtl2_efuse(link, t)
+        print('Chip:    %s (eFuse 0x1F8 = 0x%02X), ROM %s' % (t.chip, t.chip_id, 'v3.0' if t.version > 2 else 'v2.1'))
+        print('Flash:   %d kbytes (%s pins), console at %d baud' % (
+            t.size // 1024, 'RTL8720CF' if t.mode == 1 else 'RTL8720CX / CM', t.baud))
+        print('MAC:     %s (Wi-Fi), %s (BT) (eFuse)' % (t.mac, t.mac_bt))
+    elif args.op == 'rf':
+        size = args.size or t.size - args.address
+        if args.address + size > t.size:
+            raise FlasherError('0x%x bytes at 0x%x: beyond the flash (%d kbytes)' % (size, args.address, t.size // 1024))
+        os.makedirs(os.path.dirname(os.path.abspath(args.filename)), exist_ok=True)
+        t1 = time.time()
+        data = rtl2_read(link, t, args.address, size)
+        print('Read 0x%x bytes in %.1f s at %d baud; checked against the SHA-256 computed by the chip' % (
+            size, time.time() - t1, t.baud))
+        if args.twice:
+            if rtl2_read(link, t, args.address, size) != data:
+                with open(args.filename + '.pass1', 'wb') as fh:
+                    fh.write(data)
+                raise FlasherError('the two reads differ; the first was kept as %s.pass1' % args.filename)
+            print('Second read is the same.')
+        with open(args.filename, 'wb') as fh:
+            fh.write(data)
+        print('Saved %d bytes to %s' % (len(data), args.filename))
+    elif args.op == 'wf':
+        if args.no_erase:
+            raise FlasherError('RTL8720C: the ROM always erases what it writes (no --no-erase)')
+        for addr, data in rtl2_image(args):
+            print('Write 0x%06x..0x%06x' % (addr, addr + len(data)))
+            rtl2_write(link, t, addr, data, verify=not args.no_verify)
+        if not args.no_verify:
+            print('Verified (SHA-256 on the chip).')
+    elif args.op in ('es', 'ea'):
+        if args.op == 'es':
+            start = args.address - args.address % SECTOR
+            end = args.address + max(args.size, 1)
+            end = min(end + (-end % SECTOR), t.size)
+        else:
+            start, end = 0, t.size
+            print('Erasing the whole flash (also the boot loader and the partition table; the ROM download mode stays)')
+        # the ROM has no erase command: the range is written with 0xFF, which fwd erases first
+        rtl2_write(link, t, start, b'\xff' * (end - start))
+        print('Erased 0x%06x..0x%06x' % (start, end))
+
+
+# ================================================================ Wi-Fi settings (firmware 0.29)
+
+def wifi_status(answer):
+    """'wifi mode=sta ssid=<hex> pass=set ...' -> dict, the SSID decoded"""
+    st = dict(kv.split('=', 1) for kv in answer.split()[1:] if '=' in kv)
+    try:
+        st['ssid'] = '' if st.get('ssid', '-') == '-' else bytes.fromhex(st['ssid']).decode('utf-8', 'replace')
+    except ValueError:
+        pass
+    return st
+
+
+def wifi_show(st):
+    mode = {'ap': 'access point', 'sta': 'station', 'off': 'off'}.get(st.get('mode'), st.get('mode'))
+    if st.get('mode') == 'off':
+        print('Wi-Fi:   off%s' % (' (last network "%s")' % st['ssid'] if st.get('ssid') else ''))
+    else:
+        where = 'IP %s' % st.get('ip', 'none')
+        if st.get('state'):
+            where += ' (%s)' % st['state']
+        if st.get('rssi'):
+            where += ', RSSI %s dBm' % st['rssi']
+        if st.get('stations'):
+            where += ', %s stations' % st['stations']
+        print('Wi-Fi:   %s "%s", %s' % (mode, st.get('ssid', ''), where))
+    print('Name:    %s (%s.local), port %s' % (st.get('name'), st.get('name'), st.get('port')))
+    print('Secrets: password %s, key %s' % (st.get('pass'), st.get('key')))
+    if st.get('key') == 'none' and st.get('mode') != 'off':
+        print('         without a key anyone on the network can use the flasher (wifi key sets one)')
+    print('Client:  %s; heap %s bytes free, largest block %s' % (st.get('client'), st.get('heap'), st.get('largest')))
+
+
+def ask_secret(env, prompt, confirm=False):
+    """A password or key: from the environment variable env, or typed (never echoed, never printed)."""
+    value = os.environ.get(env)
+    if value is not None:
+        return value
+    value = getpass.getpass(prompt)
+    if confirm and value and getpass.getpass('Again: ') != value:
+        raise FlasherError('the two entries differ')
+    return value
+
+
+def wifi_hex(text):
+    return text.encode('utf-8').hex() if text else '-'
+
+
+def wifi_main(f, args):
+    over_tcp = is_tcp(args.port)
+    action, value = args.action, args.value
+    if action in ('ap', 'join', 'name') and not value:
+        raise FlasherError('wifi %s: give the %s' % (action, 'name' if action == 'name' else 'SSID'))
+    if action in ('status', 'off', 'key') and value:
+        raise FlasherError('wifi %s takes no value (passwords and keys are asked for)' % action)
+    if action == 'status':
+        wifi_show(wifi_status(f.cmd('WIFI')))
+        return
+    if action == 'off':
+        print(f.cmd('WIFI OFF'))
+        return
+    if action == 'name':
+        if not re.fullmatch(r'[A-Za-z0-9-]{1,31}', value):
+            raise FlasherError('the name: 1..31 letters, digits, -')
+        f.cmd('WIFI NAME %s' % value)
+        print('Name set to %s; used from the next start of Wi-Fi (wifi ap / join, or a restart).' % value)
+        return
+    if action == 'key':
+        key = ask_secret('C3_FLASHER_KEY', 'Key for TCP clients (empty: no key): ', confirm=True)
+        if key and not re.fullmatch(r'[!-~]{1,64}', key):
+            raise FlasherError('the key: 1..64 printable characters without spaces')
+        f.cmd('WIFI KEY %s' % wifi_hex(key))
+        print('Key %s.' % ('set' if key else 'removed: anyone on the network can use the flasher'))
+        if key:
+            print('Give it with --key or C3_FLASHER_KEY when connecting with --host.')
+        return
+    ssid = value
+    if not 1 <= len(ssid.encode('utf-8')) <= 32:
+        raise FlasherError('the SSID: 1..32 bytes')
+    if action == 'ap':
+        password = ask_secret('C3_FLASHER_WIFI_PASSWORD', 'Password for the access point (8..63 characters): ',
+                              confirm=True)
+        if not 8 <= len(password.encode('utf-8')) <= 63:
+            raise FlasherError('an access point needs a password of 8..63 characters')
+    else:
+        password = ask_secret('C3_FLASHER_WIFI_PASSWORD', 'Password of "%s" (empty for an open network): ' % ssid)
+        if password and not 8 <= len(password.encode('utf-8')) <= 63:
+            raise FlasherError('a network password has 8..63 characters')
+    f.cmd('WIFI %s %s %s' % ('AP' if action == 'ap' else 'STA', wifi_hex(ssid), wifi_hex(password)))
+    password = None
+    if over_tcp:
+        print('Wi-Fi restarts as %s "%s"; this connection ends. Reconnect with --host (the address may change).'
+              % ('an access point' if action == 'ap' else 'a station on', ssid))
+        return
+    st = wifi_status(f.cmd('WIFI'))
+    deadline = time.time() + 15
+    while action == 'join' and st.get('ip', 'none') == 'none' and time.time() < deadline:
+        time.sleep(1)
+        st = wifi_status(f.cmd('WIFI'))
+    wifi_show(st)
+    if action == 'join' and st.get('ip', 'none') == 'none':
+        print('Not connected yet: it keeps trying. Check the SSID and the password; wifi shows the state.')
+
+
 def main():
     ap = argparse.ArgumentParser(description='ESP32-C3 Telink TLSR825x SWire flasher')
     ap.add_argument('-p', '--port', default='/dev/ttyACM0')
+    ap.add_argument('--host', default='',
+                    help='reach the flasher over Wi-Fi instead of USB: NAME[:PORT] (default port %d; firmware 0.29), '
+                         'e.g. c3-flasher.local or 192.168.4.1' % WIFI_PORT)
+    ap.add_argument('--key', default='',
+                    help='the key the flasher asks of TCP clients (better: the environment variable C3_FLASHER_KEY)')
     ap.add_argument('-t', '--tact', type=auto_int, default=100,
                     help='activation time in ms after the reset pulse (0 = no reset, default 100)')
     ap.add_argument('-m', '--mode', choices=['uart', 'rmt'], default='rmt',
@@ -2068,13 +4067,37 @@ def main():
                     help='ESP32 / ESP8266 in its ROM download mode, through esptool: target TX on the SWS wire, RX '
                          'on GPIO 21, GPIO 0 (IO0) on the BOOT wire (GPIO 0), EN / RST on the reset wire; info, rf, '
                          'wf, es, ea')
-    ap.add_argument('--esp-baud', type=auto_int, default=115200,
-                    help='ESP: bridge speed (default 115200; the ROM finds the speed from the first sync, so 460800 can '
-                         'be tried with short wires)')
+    ap.add_argument('--esp-baud', type=auto_int, default=0,
+                    help='ESP: speed of esptool after its stub is loaded (default 921600; firmware older than 0.25: '
+                         'the bridge speed from the start, default 115200); a failed run is repeated at 460800, '
+                         'then 115200')
     ap.add_argument('--esp-chip', default='',
                     help='ESP: chip type for esptool (esp32, esp8266, esp32c3, ...; default: detected)')
     ap.add_argument('--esp-stay', action='store_true',
                     help='ESP: leave the target in download mode at the end (no restart)')
+    ap.add_argument('--ln', action='store_true',
+                    help='Lightning LN882H over its UART download mode: TX0 (A2) on the SWS wire, RX0 (A3) on GPIO 21, '
+                         'BOOT (A9) on GPIO 0, CEN on the reset wire, 3V3 on the power pins; info, rf, wf, es, ea')
+    ap.add_argument('--ln-baud', type=auto_int, default=0,
+                    help='LN882H: speed of the RAM loader (default 1000000; when that fails 460800, then 115200)')
+    ap.add_argument('--ln-ramcode', default='',
+                    help='LN882H: the RAM loader file (default: %s next to this script, or ltchiptool\'s)' %
+                         LN_RAMCODE_NAME)
+    ap.add_argument('--ln-seconds', type=auto_int, default=5,
+                    help='LN882H: how long to wait for the ROM after the restart (default 5)')
+    ap.add_argument('--rtl', action='store_true',
+                    help='Realtek AmebaZ (RTL8710BN, RTL8710BX ...: Tuya WR modules) over its UART download mode: log '
+                         'TX (PA30) on the SWS wire, log RX (PA29) on GPIO 21, CEN on the reset wire, 3V3 on the '
+                         'power pins; info, rf, wf, es, ea')
+    ap.add_argument('--rtl2', action='store_true',
+                    help='Realtek AmebaZ2 (RTL8720CF, RTL8710CX ...: Tuya WBR / CR modules) over its UART download mode: '
+                         'log TX (PA16) on the SWS wire, log RX (PA15) on GPIO 21, PA00 on GPIO 0 (held high), CEN '
+                         'on the reset wire, 3V3 on the power pins; info, rf, wf, es, ea')
+    ap.add_argument('--rtl-baud', type=auto_int, default=0,
+                    help='RTL8720C: console speed after the link at 115200 (default 1500000; when that fails 921600, '
+                         'then 115200)')
+    ap.add_argument('--rtl-seconds', type=auto_int, default=5,
+                    help='RTL8710B / RTL8720C: how long to wait for the ROM after the restart (default 5)')
     ap.add_argument('--wake', action='store_true',
                     help='after activation switch the clocks on and wake the flash from deep power-down '
                          '(for a flash that reads all zeros / JEDEC 000000)')
@@ -2104,7 +4127,36 @@ def main():
     p.add_argument('--catch', choices=['bk'],
                    help='bk: reset the target (power pins and RST) every 1.5 s while the host sends and no Beken '
                         'BK72xx ROM answer (04 0E) has come yet, so that a flash tool links without a manual reset')
+    p.add_argument('--follow', choices=['esp', 'ln', 'ucfg'],
+                   help='esp: follow esptool\'s speed change (CHANGE_BAUDRATE): start the bridge at 115200 and give '
+                        'esptool any --baud; the bridge switches when the target has answered (firmware 0.25). '
+                        'ln: follow the LN882H RAM loader\'s "baudrate N" line (firmware 0.26); ucfg: the Realtek '
+                        'AmebaZ2 ROM\'s "ucfg N ..." line (firmware 0.28)')
+    p.add_argument('--strap', choices=['rtl'],
+                   help='rtl: restart the target with its TX wire (the SWS wire) pulled low, the download strap of a '
+                        'Realtek AmebaZ (firmware 0.27)')
     sub.add_parser('bridge-exit', help='leave the UART bridge')
+    p = sub.add_parser('log', help='save the UART log of the last UART session (bridge, --esp, --bk) as text: '
+                                   'every byte to and from the target with its time, speed changes, resets')
+    p.add_argument('filename', nargs='?', default='uart_log.txt')
+    p.add_argument('--bin', default='', help='also save the stored blocks as they are')
+    p.add_argument('--clear', action='store_true', help='clear the log instead')
+    p.add_argument('--tuya', action='store_true', help='decode the Tuya MCU serial protocol (55 AA frames) under the '
+                                                       'records')
+    p = sub.add_parser('sniff', help='two-line UART logger (firmware 0.30): listen to both directions of a UART link '
+                                     'between two other parties without driving anything, line A on the SWS wire '
+                                     '(GPIO 5), line B on GPIO 20; live, and into the UART log (log)')
+    p.add_argument('sniff_baud', metavar='BAUD', nargs='?', type=auto_int, default=0,
+                   help='speed of line A (and of line B without --baud-b)')
+    p.add_argument('--baud-b', type=auto_int, default=0, help='speed of line B when it differs')
+    p.add_argument('--seconds', type=float, default=0, help='end after this many seconds (default: Ctrl-C)')
+    p.add_argument('--out', default='', help='also write the lines to this file')
+    p.add_argument('--tuya', action='store_true', help='decode the Tuya MCU serial protocol (55 AA frames)')
+    g = p.add_mutually_exclusive_group()
+    g.add_argument('--at-boot', action='store_true',
+                   help='do not listen now: capture from every power-up of the flasher, without a host, until a '
+                        'host\'s first command (read it with log)')
+    g.add_argument('--no-at-boot', action='store_true', help='switch the capture at power-up off')
     sub.add_parser('power-off', help='switch the target power pins off and make them inputs')
     p = sub.add_parser('led', help='drive every free pin low and then high for a moment, one after the other, '
                                    'to find the pin of an LED on an unknown board')
@@ -2117,15 +4169,33 @@ def main():
     p.add_argument('--seconds', type=float, default=30)
     p.add_argument('--pull', choices=['up', 'down', 'none'], default='up',
                    help='pull resistor on every pin while watching (default: 10 k pull-up)')
+    p = sub.add_parser('wifi', help='Wi-Fi link (firmware 0.29): status; off; ap SSID (an access point of its own); '
+                                    'join SSID (a network); key (the key TCP clients must give; empty: none); '
+                                    'name NAME (mDNS name). Passwords and the key are asked for, or taken from '
+                                    'C3_FLASHER_WIFI_PASSWORD / C3_FLASHER_KEY')
+    p.add_argument('action', nargs='?', choices=['status', 'off', 'ap', 'join', 'key', 'name'], default='status')
+    p.add_argument('value', nargs='?', default=None, help='the SSID (ap, join) or the name (name)')
     args = ap.parse_args()
 
     t0 = time.time()
+    args.key = args.key or os.environ.get('C3_FLASHER_KEY', '')
+    try:
+        if args.host:
+            args.port = tcp_url(args.host)
+    except FlasherError as e:
+        print('Error:', e)
+        sys.exit(1)
     if args.op == 'bridge-exit':
-        print(bridge_exit(args.port) or 'no answer (was the bridge open?)')
+        try:
+            print(bridge_exit(args.port, args.key) or 'no answer (was the bridge or the logger open? A logger whose '
+                  'TCP client has gone ends with any command, e.g. log)')
+        except (FlasherError, serial.SerialException) as e:
+            print('Error:', e)
+            sys.exit(1)
         return
     f = None
     try:
-        f = Flasher(args.port)
+        f = Flasher(args.port, key=args.key)
         print('Flasher:', f.version)
         try:
             fw = tuple(int(x) for x in f.version.split()[1].split('.'))
@@ -2133,6 +4203,21 @@ def main():
             fw = (0, 0)
         if fw < (0, 18):
             raise FlasherError('this script needs flasher firmware 0.18 or newer on the C3 (binary streams)')
+        if args.op == 'wifi':
+            if fw < (0, 29):
+                raise FlasherError('the Wi-Fi link needs flasher firmware 0.29 or newer on the C3')
+            wifi_main(f, args)
+            return
+        if args.op == 'sniff':
+            if fw < (0, 30):
+                raise FlasherError('the two-line UART logger needs flasher firmware 0.30 or newer on the C3')
+            sniff_main(f, args)
+            return
+        if args.op == 'log':
+            if fw < (0, 25):
+                raise FlasherError('the UART log needs flasher firmware 0.25 or newer on the C3')
+            log_main(f, args)
+            return
         if args.wch:
             if fw < (0, 22):
                 raise FlasherError('WCH mode needs flasher firmware 0.22 or newer on the C3')
@@ -2144,7 +4229,25 @@ def main():
         if args.esp:
             if fw < (0, 15):
                 raise FlasherError('the ESP mode needs flasher firmware 0.15 or newer on the C3 (UART bridge)')
-            esp_main(f, args)
+            esp_main(f, args, follow=fw >= (0, 25))
+            print('Done in %.1f s' % (time.time() - t0))
+            return
+        if args.rtl2:
+            if fw < (0, 28):
+                raise FlasherError('RTL8720C mode needs flasher firmware 0.28 or newer on the C3')
+            rtl2_main(f, args)
+            print('Done in %.1f s' % (time.time() - t0))
+            return
+        if args.rtl:
+            if fw < (0, 27):
+                raise FlasherError('RTL8710B mode needs flasher firmware 0.27 or newer on the C3')
+            rtl_main(f, args)
+            print('Done in %.1f s' % (time.time() - t0))
+            return
+        if args.ln:
+            if fw < (0, 26):
+                raise FlasherError('LN882H mode needs flasher firmware 0.26 or newer on the C3')
+            ln_main(f, args)
             print('Done in %.1f s' % (time.time() - t0))
             return
         if args.bk:
@@ -2182,6 +4285,14 @@ def main():
         if args.op in ('bridge', 'power-off') or args.swd:
             if fw < (0, 15):
                 raise FlasherError('this needs flasher firmware 0.15 or newer on the C3')
+        if args.op == 'bridge' and sum(bool(x) for x in (args.catch, args.follow, args.strap)) > 1:
+            raise FlasherError('--catch, --follow and --strap do not go together')
+        if args.op == 'bridge' and args.strap and fw < (0, 27):
+            raise FlasherError('--strap needs flasher firmware 0.27 or newer on the C3')
+        need = {'esp': (0, 25), 'ln': (0, 26), 'ucfg': (0, 28)}
+        if args.op == 'bridge' and args.follow and fw < need[args.follow]:
+            raise FlasherError('--follow %s needs flasher firmware %d.%d or newer on the C3' % (
+                (args.follow,) + need[args.follow]))
         if args.op == 'bridge' and args.catch and fw < (0, 23):
             raise FlasherError('--catch needs flasher firmware 0.23 or newer on the C3')
         if args.op == 'power-off':
@@ -2191,8 +4302,15 @@ def main():
             print('Target power off, power pins are inputs.')
             return
         if args.op == 'bridge':
-            print(f.cmd('BRIDGE %d %s%s' % (args.baud, args.boot, ' ' + args.catch if args.catch else '')))
+            mode = args.catch or args.follow or args.strap
+            print(f.cmd('BRIDGE %d %s%s' % (args.baud, args.boot, ' ' + mode if mode else '')))
             f.ser.close()
+            if is_tcp(args.port):
+                print('The target tool connects to %s now (from this computer no key is needed while the bridge is'
+                      % args.port)
+                print('open). With no connection for 60 s the bridge ends by itself. Leave with: --host %s bridge-exit'
+                      % args.host)
+                return
             print('The port is free for the target tool now. Do not let it toggle DTR / RTS (they reset the C3);')
             print('for example esptool --before no_reset --after no_reset. Leave with: bridge-exit')
             return

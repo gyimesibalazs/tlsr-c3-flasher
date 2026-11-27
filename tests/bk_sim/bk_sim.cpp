@@ -456,7 +456,8 @@ static void new_chip(const Chip &proto) {
   chip = proto;
   chip.flash.assign(chip.size, 0xFF);
   for (uint32_t a = 0; a < 0x100000 && a < chip.size; a++) chip.flash[a] = rnd();   // bootloader and app
-  uint32_t cal = chip.rom ? 0x1D0000 : 0x1E0000;  // RF calibration with the MAC address (TLV)
+  // RF calibration with the MAC address (TLV): BK7231N, BK7238 (Tuya T1 layout), BK7231T
+  uint32_t cal = !chip.rom ? 0x1E0000 : chip.chip_id == 0x7238 ? 0x1E3000 : 0x1D0000;
   if (cal + BK_SECTOR <= chip.size) {
     static const uint8_t tag[8] = {0x02, 0x11, 0x11, 0x11, 0x06, 0x00, 0x00, 0x00};
     static const uint8_t mac[6] = {0xC8, 0x47, 0x8C, 0x12, 0x34, 0x56};
@@ -644,7 +645,7 @@ static void serve() {
     for (char *tok = strtok(ln, " \t\r\n"); tok && argc < 12; tok = strtok(NULL, " \t\r\n")) argv[argc++] = tok;
     if (!argc) continue;
     if (!strcmp(argv[0], "SIM")) {
-      // SIM new [rom=0] [present=0] [reset=0] [window=us] [ready=us] [maxbaud=n] [noise=n] [id=hex6]
+      // SIM new [rom=0] [chip=hex] [present=0] [reset=0] [window=us] [ready=us] [maxbaud=n] [noise=n] [id=hex6]
       //         [sr1=hex] [sr2=hex] [srbytes=1|2] [midlen=5|6] [size=n]
       // SIM peek <addr> <len>, SIM poke <addr> <hex>, SIM fill <addr> <len> <byte>, SIM stat
       static std::string o;
@@ -657,6 +658,7 @@ static void serve() {
           const char *k = argv[i], *v = eq + 1;
           uint32_t n = strtoul(v, NULL, 0);
           if (!strcmp(k, "rom")) p.rom = n != 0, p.chip_id = n ? 0x7231C : 0;
+          if (!strcmp(k, "chip")) p.chip_id = strtoul(v, NULL, 16);
           if (!strcmp(k, "present")) p.present = n != 0;
           if (!strcmp(k, "reset")) p.reset_wired = n != 0;
           if (!strcmp(k, "window")) p.window_us = n;

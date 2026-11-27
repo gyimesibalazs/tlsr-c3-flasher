@@ -56,6 +56,12 @@
 #define PIN_SPI_DO PIN_BRIDGE_TX  // flash DO (MISO) = the UART bridge TX wire, an input here
 #define SPI_KHZ_DEFAULT 4000
 
+// ---- two-line UART logger (sniff): line A is the SWS wire (GPIO 5 reads, GPIO 4 an input), line B its own wire.
+// Line B is GPIO 20 (the JTAG TMS / SPI CS wire), not the bridge's GPIO 21: at every power-up and reset the C3's ROM
+// and bootloader drive GPIO 21 (UART0 TX) with their boot messages, which would fight the line being listened to and
+// reach the party at its other end; GPIO 20 (UART0 RX) is an input from reset on.
+#define PIN_SNIFF_B PIN_JTAG_TMS
+
 // ---- WCH CH32V003 single-wire debug (SDI, the "SWIO" pin), on the SWS wire: GPIO 4 drives it through the
 // resistor (the line idles high through it), GPIO 5 reads it. The RMT peripheral times the pulses (12.5 ns).
 // Bit timing of the debug interface (QingKe V2 debug manual, normal "2x" mode after reset, T = 125 ns):

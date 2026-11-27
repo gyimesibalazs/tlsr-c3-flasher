@@ -26,11 +26,10 @@
 #include <Arduino.h>
 #include <stdarg.h>
 #include "driver/gpio.h"
-#include "driver/uart.h"
 #include "config.h"
 #include "bk72xx.h"
+#include "tuart.h"
 
-static const uart_port_t BK_UART = UART_NUM_1;
 static const uint32_t BK_LINK_BAUD = 115200;    // the ROM's speed after reset
 static const uint32_t BK_CYCLE_MS = 1200;       // reset period while catching (power-off time included)
 static const uint8_t BK_BAUD_DELAY_MS = 50;     // the ROM switches its speed this long after the command
@@ -38,7 +37,6 @@ static const uint32_t BK_PROBE_ADDR = BK_BOOT_END;   // a block every protocol c
 
 static void (*reset_fn)() = NULL;
 static bool on = false, linked = false, rom = false;
-static uint32_t cur_baud = BK_LINK_BAUD;
 static uint32_t guard = BK_BOOT_END;            // erase / write refused below this address (BKG)
 static uint32_t wrap = 0x200000;                // flash size: addresses wrap there (from the flash id when known)
 static char detail[200];
@@ -78,12 +76,12 @@ static uint32_t get_le32(const uint8_t *p) {
 }
 
 static void put(const uint8_t *d, int n) {
-  if (n > 0) uart_write_bytes(BK_UART, (const char *)d, n);
+  tuart_write(d, n);
 }
 
 static void rx_reset() {
   rb_pos = rb_len = 0;
-  uart_flush_input(BK_UART);
+  tuart_flush_input();
 }
 
 static int32_t left_ms(uint32_t deadline) { return (int32_t)(deadline - millis()); }
@@ -91,12 +89,11 @@ static int32_t left_ms(uint32_t deadline) { return (int32_t)(deadline - millis()
 static int rx_byte(uint32_t deadline) {
   if (rb_pos < rb_len) return rb[rb_pos++];
   for (;;) {
-    size_t avail = 0;
-    uart_get_buffered_data_len(BK_UART, &avail);
+    size_t avail = tuart_available();
     int32_t left = left_ms(deadline);
     int got;
-    if (avail) got = uart_read_bytes(BK_UART, rb, (uint32_t)min(avail, sizeof(rb)), 0);
-    else got = uart_read_bytes(BK_UART, rb, 1, pdMS_TO_TICKS(left > 0 ? left : 0));
+    if (avail) got = tuart_read(rb, (int)min(avail, sizeof(rb)), 0);
+    else got = tuart_read(rb, 1, left > 0 ? left : 0);
     if (got > 0) {
       rb_len = got;
       rb_pos = 1;
@@ -111,7 +108,7 @@ static bool rx_bytes(uint8_t *dst, int n, uint32_t deadline) {
   while (k < n && rb_pos < rb_len) dst[k++] = rb[rb_pos++];
   while (k < n) {
     int32_t left = left_ms(deadline);
-    int got = uart_read_bytes(BK_UART, dst + k, (uint32_t)(n - k), pdMS_TO_TICKS(left > 0 ? left : 0));
+    int got = tuart_read(dst + k, n - k, left > 0 ? left : 0);
     if (got > 0) k += got;
     else if (left <= 0) return false;
   }
@@ -180,6 +177,7 @@ static int fail(int r, const char *fmt, ...) {
   va_start(ap, fmt);
   vsnprintf(detail, sizeof(detail), fmt, ap);
   va_end(ap);
+  tuart_event("error: %s", detail);
   return r;
 }
 
@@ -225,7 +223,7 @@ static int read4k(uint32_t addr, uint8_t *out) {
   uint8_t p[4];
   put_le32(p, addr);
   send_long(0x09, p, 4);
-  int n = recv(0x09, true, ans, sizeof(ans), 0, 200 + (uint32_t)(4200ull * 10 * 1000 / cur_baud));
+  int n = recv(0x09, true, ans, sizeof(ans), 0, 200 + (uint32_t)(4200ull * 10 * 1000 / tuart_baud()));
   if (n < 0) return fail(BK_ERR_TIMEOUT, "no answer to the read of 0x%x", (unsigned)addr);
   if (n != (int)sizeof(ans)) return fail(BK_ERR_SIZE, "read of 0x%x: %d bytes", (unsigned)addr, n - 5);
   if (rom && ans[0]) return fail(BK_ERR_STATUS, "read of 0x%x: status %d", (unsigned)addr, ans[0]);
@@ -245,7 +243,7 @@ int bk_write4k(uint32_t addr, const uint8_t *data) {
   uint8_t p[4], ans[8];
   put_le32(p, addr);
   send_long(0x07, p, 4, data, BK_SECTOR);
-  int n = recv(0x07, true, ans, sizeof(ans), 0, 1000 + (uint32_t)(4200ull * 10 * 1000 / cur_baud));
+  int n = recv(0x07, true, ans, sizeof(ans), 0, 1000 + (uint32_t)(4200ull * 10 * 1000 / tuart_baud()));
   if (n < 0) return fail(BK_ERR_TIMEOUT, "no answer to the write of 0x%x", (unsigned)addr);
   if (rom && (n < 5 || ans[0])) return fail(BK_ERR_STATUS, "write of 0x%x: status %d", (unsigned)addr, ans[0]);
   if (rom && get_le32(ans + 1) != addr)
@@ -317,11 +315,10 @@ static int sr_write(uint8_t op, const uint8_t *v, int n) {
 static void reboot() {
   const uint8_t p = 0xA5;
   send_short(0x0E, &p, 1);
-  uart_wait_tx_done(BK_UART, pdMS_TO_TICKS(50));
+  tuart_wait_tx(50);
   linked = false;
   blk_addr = 0xFFFFFFFF;
-  uart_set_baudrate(BK_UART, BK_LINK_BAUD);     // the target restarts at its reset speed
-  cur_baud = BK_LINK_BAUD;
+  tuart_set_baud(BK_LINK_BAUD);     // the target restarts at its reset speed
 }
 
 // ---------------------------------------------------------------- reading with CRC
@@ -366,23 +363,9 @@ void bk_set_reset(void (*reset)()) { reset_fn = reset; }
 
 bool bk_begin() {
   bk_end();
-  uart_config_t cfg = {};
-  cfg.baud_rate = (int)BK_LINK_BAUD;
-  cfg.data_bits = UART_DATA_8_BITS;
-  cfg.parity = UART_PARITY_DISABLE;
-  cfg.stop_bits = UART_STOP_BITS_1;
-  cfg.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
-  cfg.source_clk = UART_SCLK_DEFAULT;
-  pinMode(PIN_SWS_TX, INPUT);                   // the resistor side of the SWS wire stays quiet
-  if (uart_driver_install(BK_UART, 3 * BK_SECTOR, 0, 0, NULL, 0) != ESP_OK) return false;
-  uart_param_config(BK_UART, &cfg);
-  uart_set_pin(BK_UART, PIN_BRIDGE_TX, PIN_SWS_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-  uart_set_rx_timeout(BK_UART, 2);
-  uart_set_rx_full_threshold(BK_UART, 64);      // more time for the interrupt at 921600 (a byte every 11 µs)
-  gpio_pullup_en((gpio_num_t)PIN_SWS_RX);
+  if (!tuart_begin(BK_LINK_BAUD, 3 * BK_SECTOR, 0, "Beken download")) return false;
   on = true;
   linked = false;
-  cur_baud = BK_LINK_BAUD;
   guard = BK_BOOT_END;
   wrap = 0x200000;
   blk_addr = 0xFFFFFFFF;
@@ -392,8 +375,7 @@ bool bk_begin() {
 void bk_end() {
   if (!on) return;
   on = linked = false;
-  if (uart_is_driver_installed(BK_UART)) uart_driver_delete(BK_UART);
-  pinMode(PIN_BRIDGE_TX, INPUT);
+  tuart_end();
 }
 
 bool bk_active() { return on; }
@@ -405,10 +387,9 @@ static int switch_baud(uint32_t baud) {
   put_le32(p, baud);
   p[4] = BK_BAUD_DELAY_MS;
   send_short(0x0F, p, 5);
-  uart_wait_tx_done(BK_UART, pdMS_TO_TICKS(50));
+  tuart_wait_tx(50);
   delay(BK_BAUD_DELAY_MS / 2);
-  uart_set_baudrate(BK_UART, baud);
-  cur_baud = baud;
+  tuart_set_baud(baud);
   rx_reset();
   int n = recv(0x0F, false, a, 5, 0, 300 + BK_BAUD_DELAY_MS);
   if (n != 5 || memcmp(a, p, 5)) fail(BK_ERR_ECHO, "no acknowledgement of %u baud", (unsigned)baud);
@@ -423,11 +404,10 @@ static int back_to_link_baud() {
     put_le32(p, BK_LINK_BAUD);
     p[4] = BK_BAUD_DELAY_MS;
     send_short(0x0F, p, 5);
-    uart_wait_tx_done(BK_UART, pdMS_TO_TICKS(50));
+    tuart_wait_tx(50);
     delay(BK_BAUD_DELAY_MS / 2);
   }
-  uart_set_baudrate(BK_UART, BK_LINK_BAUD);
-  cur_baud = BK_LINK_BAUD;
+  tuart_set_baud(BK_LINK_BAUD);
   delay(BK_BAUD_DELAY_MS);
   return link_retry(3);
 }
@@ -438,8 +418,7 @@ static int catch_link(uint32_t catch_ms, BkLink *res) {
   static const uint8_t ans[8] = {0x04, 0x0E, 0x05, 0x01, 0xE0, 0xFC, 0x01, 0x00};
   linked = false;
   blk_addr = 0xFFFFFFFF;
-  uart_set_baudrate(BK_UART, BK_LINK_BAUD);
-  cur_baud = BK_LINK_BAUD;
+  tuart_set_baud(BK_LINK_BAUD);
 
   // The BootROM listens for a link check only for a moment after reset: reset, then send link checks back to
   // back until the answer comes, and reset again after BK_CYCLE_MS. TX is an input while the target is off.
@@ -450,10 +429,11 @@ static int catch_link(uint32_t catch_ms, BkLink *res) {
   bool first = true;
   while (!caught && (int32_t)(millis() - t0) < (int32_t)catch_ms) {
     if (reset_fn && (first || millis() - cycle >= BK_CYCLE_MS)) {
-      pinMode(PIN_BRIDGE_TX, INPUT);
+      tuart_release_tx();
+      tuart_event("target reset (catch)");
       reset_fn();
-      uart_set_pin(BK_UART, PIN_BRIDGE_TX, PIN_SWS_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-      uart_flush_input(BK_UART);
+      tuart_attach_tx();
+      tuart_flush_input();
       res->resets++;
       cycle = millis();
       on_us = micros();
@@ -461,12 +441,11 @@ static int catch_link(uint32_t catch_ms, BkLink *res) {
     }
     first = false;
     put(lc, sizeof(lc));
-    uart_wait_tx_done(BK_UART, pdMS_TO_TICKS(5));
-    size_t avail = 0;
-    uart_get_buffered_data_len(BK_UART, &avail);
+    tuart_wait_tx(5);
+    size_t avail = tuart_available();
     while (avail && !caught) {
       uint8_t b[64];
-      int got = uart_read_bytes(BK_UART, b, (uint32_t)min(avail, sizeof(b)), 0);
+      int got = tuart_read(b, (int)min(avail, sizeof(b)), 0);
       if (got <= 0) break;
       avail -= got;
       for (int i = 0; i < got && !caught; i++) {
@@ -494,7 +473,7 @@ static int catch_link(uint32_t catch_ms, BkLink *res) {
                 s, (unsigned)res->resets, (unsigned)res->rx_before, seen);
   }
   res->answer_ms = (micros() - on_us) / 1000;
-  uart_wait_tx_done(BK_UART, pdMS_TO_TICKS(50));
+  tuart_wait_tx(50);
   delay(10);
   if (link_retry(3) != BK_OK) return fail(BK_ERR_TIMEOUT, "the target answered once, then no more");
   linked = true;

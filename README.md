@@ -1,10 +1,12 @@
-# ESP32-C3 flasher: Telink SWS, Arm SWD, cJTAG, JTAG, SPI flash, WCH SWIO, Beken UART and ESP32 / ESP8266
+# ESP32-C3 flasher: Telink SWS, Arm SWD, cJTAG, JTAG, SPI flash, WCH SWIO, Beken, LN882H and Realtek UART, ESP32 / ESP8266
 
 An ESP32-C3 board as a flasher for small boards' chips: Telink TLSR825x over its single-wire debug pin (SWS,
 where it started), Arm Cortex-M chips over SWD or JTAG, TI CC13xx / CC26xx over two-wire cJTAG, 25-series
 SPI NOR flash, the WCH CH32V003 over its single-wire debug pin (SWIO), Beken BK7231N / BK7231T Wi-Fi chips
-over their UART download port, and ESP32 / ESP8266 chips through their ROM download mode with esptool. It also
-works as a USB–UART bridge.
+over their UART download port, the Lightning LN882H and the Realtek RTL8710B and RTL8720C through their ROM download modes, and
+ESP32 / ESP8266 chips through their ROM download mode with esptool. It also
+works as a USB–UART bridge and as a two-line UART logger that listens to a link between two other chips (firmware
+0.30), and the computer can reach it over Wi-Fi instead of USB (firmware 0.29).
 All modes use the same few wires; one is active at a time.
 
 **What is tested (2026-11-25).** The Telink mode has been used on real boards, the Arm SWD mode on one
@@ -22,9 +24,14 @@ first real chip, and keep a backup.
 | [JTAG](#four-wire-jtag) | `--jtag` | chain scan; Arm chips behind a JTAG-DP as over SWD | against a simulated chain |
 | [SPI flash](#spi-nor-flash-eg-a-routers) | `--spi` | 25-series SPI NOR (routers, dongles, modules) | host logic against simulated chips |
 | [WCH SWIO](#wch-ch32v003-over-swio) | `--wch` | WCH CH32V003 (SOP8 J4M6, TSSOP20 F4P6, …) | no; firmware and host against a simulated chip |
-| [Beken UART](#beken-bk72xx-cb2s-cb3s-wb2s--over-uart) | `--bk` | BK7231N (Tuya CB2S, CB3S, …), BK7231T (WB2S, WB3S, …) | on hardware: CB2S (BK7231N; read, write); BK7231T no |
+| [Beken UART](#beken-bk72xx-cb2s-cb3s-wb2s--over-uart) | `--bk` | BK7231N (Tuya CB2S, CB3S, …), BK7231T (WB2S, WB3S, …), BK7238 (Tuya T1) | on hardware: CB2S (BK7231N; read, write); BK7231T and BK7238 no |
 | [ESP32 / ESP8266](#esp32--esp8266-over-uart) | `--esp` | ESP32, ESP32-S2 / S3 / C2 / C3 / C6 / H2, ESP8266 (with esptool) | no; the esptool runs checked against esptool 4.14 and 5.7 without hardware |
+| [LN882H UART](#lightning-ln882h-over-uart) | `--ln` | Lightning LN882H (newer Tuya Wi-Fi / BLE modules) | no; host and bridge against a model of the ROM and the RAM loader |
+| [Realtek AmebaZ UART](#realtek-amebaz-rtl8710b-over-uart) | `--rtl` | RTL8710BN / BX (Tuya WR2, WR3 …) | no; host and bridge against a model of the ROM |
+| [Realtek AmebaZ2 UART](#realtek-amebaz2-rtl8720c-over-uart) | `--rtl2` | RTL8720CF, RTL8710CX / CM (Tuya WBR2, WBR3, CR3L …) | no; host and bridge against a model of the ROM console |
 | [UART bridge](#uart-bridge) | `bridge` | any 3.3 V UART, with a BOOT pin | no |
+| [Two-line UART logger](#two-line-uart-logger) | `sniff` | both directions of a 3.3 V UART link between two other parties (a Tuya module and its MCU), listened to without driving; Tuya MCU protocol decoded | no; the live output's ring natively, the host's parser and Tuya decoder against models, the firmware's capture only built |
+| [Wi-Fi link](#wi-fi-link) | `--host`, `wifi` | the flasher itself, reached over TCP instead of USB (every mode above) | no; the host against a model of the flasher's command side, the firmware's Wi-Fi part only built |
 
 ## Board, build and upload
 
@@ -39,20 +46,25 @@ Needs the Arduino core 3.x (ESP-IDF 5) for the RMT driver.
 
 One table for every mode; the wires are shared:
 
-| ESP32-C3 wire | SWS (Telink) | SWD (EFR32, nRF5x, STM32, …) | cJTAG (TI CC13xx / CC26xx) | JTAG | SPI flash | SWIO (WCH CH32V003) | Beken UART (BK7231N / T) | UART bridge | ESP32 / ESP8266 |
-|---|---|---|---|---|---|---|---|---|---|
-| GPIO 4 –1 k– GPIO 5 (the SWS wire) | SWS | SWDIO | TMSC | TDI | DI (flash pin 5) | SWIO (PD1; SOP8 pin 8) | TX1 (P11; CB2S pad 7), GPIO 4 an input | target TX → flasher RX (GPIO 4 is an input) | U0TXD (TX0) |
-| GPIO 0 | – | SWCLK | TCKC | TCK | CLK (pin 6) | – | – | BOOT (`--boot hi` / `lo`, open by default) | GPIO 0 (IO0), held low for the download mode |
-| GPIO 21 | – | – | – | TDO | DO (pin 2) | – | RX1 (P10; CB2S pad 5) | flasher TX → target RX | U0RXD (RX0) |
-| GPIO 20 | – | – | – | TMS | /CS (pin 1) | – | – | – | – |
-| GPIO 6 | RST | nRESET | nRESET | nRESET | RESET of the board's processor, held low | – (not used) | CEN (CB2S pad 10) | RESET | EN (ESP32), EN or RST (ESP8266) |
-| GPIO 7 (+ 10, 3, 1) | target power | target power | target power | target power | target power with `--power` only | VDD (SOP8 pin 4), switched for the catch | 3V3 (CB2S pad 1), switched for the catch | target power | 3V3 (a module while it is flashed) |
-| GND | GND | GND | GND | GND | GND (pin 4) | VSS (SOP8 pin 2) | GND (CB2S pad 3) | GND | GND |
+| ESP32-C3 wire | SWS (Telink) | SWD (EFR32, nRF5x, STM32, …) | cJTAG (TI CC13xx / CC26xx) | JTAG | SPI flash | SWIO (WCH CH32V003) | Beken UART (BK7231N / T) | UART bridge | ESP32 / ESP8266 | LN882H UART | RTL8710B UART | RTL8720C UART | UART logger (sniff) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| GPIO 4 –1 k– GPIO 5 (the SWS wire) | SWS | SWDIO | TMSC | TDI | DI (flash pin 5) | SWIO (PD1; SOP8 pin 8) | TX1 (P11; CB2S pad 7), GPIO 4 an input | target TX → flasher RX (GPIO 4 is an input) | U0TXD (TX0) | TX0 (A2), GPIO 4 an input | log TX (PA30), pulled low through GPIO 4 across the restart | log TX (PA16), GPIO 4 an input | line A (GPIO 4 an input) |
+| GPIO 0 | – | SWCLK | TCKC | TCK | CLK (pin 6) | – | – | BOOT (`--boot hi` / `lo`, open by default) | GPIO 0 (IO0), held low for the download mode | BOOT (A9), held low for the download mode | – | PA00, held high for the download mode | – (an input) |
+| GPIO 21 | – | – | – | TDO | DO (pin 2) | – | RX1 (P10; CB2S pad 5) | flasher TX → target RX | U0RXD (RX0) | RX0 (A3) | log RX (PA29) | log RX (PA15) | – (an input; see below) |
+| GPIO 20 | – | – | – | TMS | /CS (pin 1) | – | – | – | – | – | – | – | line B |
+| GPIO 6 | RST | nRESET | nRESET | nRESET | RESET of the board's processor, held low | – (not used) | CEN (CB2S pad 10) | RESET | EN (ESP32), EN or RST (ESP8266) | CEN | CEN | CEN | – (an input) |
+| GPIO 7 (+ 10, 3, 1) | target power | target power | target power | target power | target power with `--power` only | VDD (SOP8 pin 4), switched for the catch | 3V3 (CB2S pad 1), switched for the catch | target power | 3V3 (a module while it is flashed) | 3V3, switched for the restart | 3V3, switched for the restart | 3V3, switched for the restart | – (inputs: the board has its own supply) |
+| GND | GND | GND | GND | GND | GND (pin 4) | VSS (SOP8 pin 2) | GND (CB2S pad 3) | GND | GND | GND | GND | GND | GND |
 
 The SWS wire is one target pin: GPIO 5 goes to it directly, GPIO 4 through a 1 k … 1.8 k resistor.
 In the SPI mode the flash's /WP (pin 3) and /HOLD (pin 7) must be high (3.3 V) if the board does not pull them
 up, and the reset wire holds the board's own processor in reset, so that it keeps off the bus. In the UART bridge GPIO 0 is the
-target's BOOT pin, which is the SWCLK / TCK wire of the other modes.
+target's BOOT pin, which is the SWCLK / TCK wire of the other modes. The UART logger listens on the SWS wire and on
+GPIO 20, not on the bridge's GPIO 21, which the C3 drives with its boot messages at every power-up (see
+[there](#two-line-uart-logger)).
+
+The [Wi-Fi link](#wi-fi-link) takes no wires: the C3's own antenna, and power from its USB connector (a power bank
+or a USB charger is enough once Wi-Fi is set up).
 
 Pins and the power-up defaults are set in `src/config.h`. Never put 5 V on the target. Keep the data
 wires short (10 cm or less) for the faster settings.
@@ -83,7 +95,8 @@ something does not short it. The power pins stay inputs until the target is powe
 option the commands talk to a Telink chip; `--swd`, `--cjtag`, `--jtag`, `--spi`, `--wch` and `--bk` select the others. The
 commands are the same in every mode where they make sense: `info`, `rf addr len file [--twice]` (read flash),
 `wf addr file` (write and verify), `es addr len` (erase), `ea` (erase all), `--run` (restart the target at the
-end).
+end). `--host NAME` instead of `-p` reaches the flasher over [Wi-Fi](#wi-fi-link) (firmware 0.29), with the same
+commands.
 
 ## Telink TLSR825x over SWS
 
@@ -540,7 +553,8 @@ chip's CRC of it and read again (up to four times) when they differ. Expect abou
 
 - `info`: protocol and speed, the chip id (register 0x800000: 0x7231C is the BK7231N), the bootloader (by the CRC of
   its first bytes, in bk7231tools' list), the flash's JEDEC id, size and status register with its protection bits,
-  and the MAC address from the RF calibration (BK7231N 0x1D0000, BK7231T 0x1E0000).
+  and the MAC address from the RF calibration (BK7231N 0x1D0000, BK7231T 0x1E0000, BK7238 in the Tuya T1 layout
+  0x1E3000).
 - `rf addr size file`: `size 0` reads to the end of the flash. `--twice` adds the chip's CRC of the whole range.
 - `wf addr file`: clears the flash protection, compares by CRC (per 64 k, then per 4 k) and skips sectors that
   already hold the data, keeps what the file does not cover inside its first and last sector (read first), erases
@@ -628,9 +642,13 @@ no_reset`, because a DTR / RTS reset would reset the C3 itself. At the end the b
 restarted with GPIO 0 released, so it runs its firmware (`--esp-stay` leaves it in download mode). `wf`, `es` and
 `ea` erase what they need and esptool checks the MD5 of what it wrote; `rf --twice` reads twice and compares.
 
-The bridge's speed is set once (`--esp-baud`, default 115200): the C3's USB port does not pass on the host's
-speed, and the ROM takes the speed of esptool's first sync, so esptool runs at that same speed. 460800 is worth
-a try with short wires. `--esp-chip esp8266` (or esp32, esp32c3 …) skips the detection.
+The C3's USB port does not pass on the host's speed setting, so the bridge follows esptool instead (firmware
+0.25): it starts at 115200, where esptool syncs with the ROM and loads its stub, and when esptool asks for its
+working speed (`--esp-baud`, default 921600) with CHANGE_BAUDRATE, the bridge reads that command and switches its
+own UART once the target has answered. If a run fails, it is repeated at 460800 and then 115200, with the target
+restarted in download mode each time; the speed that worked is printed and kept for the next run (`rf --twice`).
+Firmware older than 0.25 runs the bridge at `--esp-baud` from the start (default 115200 there) and the ROM finds
+that speed from esptool's first sync. `--esp-chip esp8266` (or esp32, esp32c3 …) skips the detection.
 
 Wiring (see [Wiring](#wiring)): the target's TX0 to the SWS wire, its RX0 to GPIO 21, its GPIO 0 to the BOOT
 wire (the C3's GPIO 0, the SWCLK wire of the other modes), EN (ESP8266: EN or RST) to the reset wire, GND. The
@@ -639,6 +657,110 @@ high and EN high (ESP-12: 10 k resistors), on an ESP32 GPIO 2 low or open. Power
 ESP8266 or a small ESP32 module while it is flashed, not its Wi-Fi peaks. This mode is for bare modules and
 devices (plugs, switches, sensors); a development board with its own USB–UART chip is flashed through that, as
 its chip drives the same RX0 line.
+
+## Lightning LN882H over UART
+
+    python3 tlsr_c3.py -p /dev/ttyACM0 --ln info                        # ROM, flash id and size, MAC from the OTP
+    python3 tlsr_c3.py -p /dev/ttyACM0 --ln rf 0 0 backup.bin --twice   # whole flash
+    python3 tlsr_c3.py -p /dev/ttyACM0 --ln wf 0 firmware.uf2 --run     # LibreTiny / ESPHome UF2
+    python3 tlsr_c3.py -p /dev/ttyACM0 --ln wf 0 backup.bin             # a full image from 0
+    python3 tlsr_c3.py -p /dev/ttyACM0 --ln es 0x1a0000 0x1000          # erase a range (whole sectors)
+    python3 tlsr_c3.py -p /dev/ttyACM0 --ln ea                          # erase the whole flash
+
+Firmware 0.26. The flasher restarts the chip (reset wire and power pins) with its BOOT pin (GPIOA9) held low by the
+BOOT wire, which starts the ROM's download mode on UART0, and opens the [UART bridge](#uart-bridge); the rest runs in
+`tlsr_c3.py` through the bridge. The ROM takes text commands at 115200 and loads a RAM loader into the chip's RAM over
+YMODEM (`download [rambin] [0x20000000] [size]`). The loader then answers text commands: `flash_info`,
+`flash_uid`, `get_mac_in_flash_otp`, `flash_read <addr> <len>` (up to 256 bytes in hex with a CRC-16 of them, checked
+by the host and read again on a mismatch), `ferase`, `ferase_all`, and `startaddr` + `upgrade`, after which it takes
+the data over YMODEM, erases the range and writes it. `baudrate N` raises its speed: the bridge reads the host's
+bytes for that line and switches its own UART at the line's end (`src/lnscan.h`), so the host keeps the speed
+(`--ln-baud`, default 1000000; when that fails, a new session at 460800, then 115200).
+
+- **The RAM loader is not part of this repository.** It is Lightning's binary, as ltchiptool ships it. Download it
+  once as `ln882h_ramcode.bin` next to `tlsr_c3.py`
+  (<https://github.com/libretiny-eu/ltchiptool/raw/410874f66b60da1dd667dbba69f499acbf16eb03/ltchiptool/soc/ln882h/util/ramcode.bin>,
+  37872 bytes, SHA-256 `6bd437c6…a0c723`), give it with `--ln-ramcode`, or have ltchiptool installed: its copy
+  is found.
+- **Write.** The loader rounds the length up to whole 4 k sectors but not the start, so from an unaligned start it
+  would erase into the sector after the end. The host therefore always sends whole sectors: what is on the chip
+  before the start and after the end in them is read first and sent along. Afterwards the range is read back and
+  compared (`--no-verify` skips it); the loader has no CRC command. `--no-erase` is not available.
+- **A UF2** (LibreTiny / ESPHome, family LN882H) says itself where its parts go. A full image or backup goes to 0.
+  There is no bootloader guard: the download mode is in the ROM, so a wrong write cannot lock the chip out.
+- **`ea`** erases everything, also the boot loader and the partition table; the MAC address is in the flash's OTP
+  and stays.
+- **Data with a line `baudrate <digits>`** between CR / LF characters would look like the speed command to the bridge;
+  such a write is refused (it does not happen in firmware images in practice).
+- At the end the bridge is closed; `--run` restarts the chip with BOOT released, otherwise it stays in the loader.
+
+Wiring (see [Wiring](#wiring)): TX0 (A2) to the SWS wire, RX0 (A3) to GPIO 21, BOOT (A9) to the BOOT wire (the C3's
+GPIO 0), CEN to the reset wire, 3V3 to the power pins, GND. The pad names of a Tuya module are in its data sheet. The
+power pins carry the chip in download mode; mains-powered boards are not isolated, so disconnect the mains first.
+
+## Realtek AmebaZ (RTL8710B) over UART
+
+    python3 tlsr_c3.py -p /dev/ttyACM0 --rtl info                        # chip, flash id and size, MAC, OTA slot
+    python3 tlsr_c3.py -p /dev/ttyACM0 --rtl rf 0 0 backup.bin           # whole flash, checked by the chip's MD5
+    python3 tlsr_c3.py -p /dev/ttyACM0 --rtl wf 0 firmware.uf2 --run     # LibreTiny / ESPHome UF2
+    python3 tlsr_c3.py -p /dev/ttyACM0 --rtl wf 0 backup.bin             # a full image from 0
+    python3 tlsr_c3.py -p /dev/ttyACM0 --rtl es 0x1f0000 0x1000
+    python3 tlsr_c3.py -p /dev/ttyACM0 --rtl ea
+
+Firmware 0.27. For the RTL8710BN / BX of the Tuya WR modules (WR2, WR3, WR3E …). The chip starts its ROM's UART
+download mode when its log TX (PA30) is low as it comes out of reset: the bridge's `rtl` mode pulls the SWS wire low
+through GPIO 4's resistor while it restarts the chip (reset wire and power pins) and releases it 50 ms later. The ROM
+talks on the log UART at 1500000 baud, and the rest runs in `tlsr_c3.py` through the bridge:
+
+- While the ROM waits for a command it sends NAK now and then; an ACK quiets it. Reads are 1 k pieces, each answered
+  with ACK, whole 4 k sectors; writes go over XMODEM with 1 k packets that carry their flash address and a sum
+  checksum, and the ROM erases what it writes. The host always sends whole sectors (what is before the start and
+  after the end in them is read and sent along). `es` / `ea` erase sector by sector.
+- Chip type, flash id, the MAC address (eFuse) and an MD5 of a flash range come from small programs that the host
+  loads into the chip's RAM (Thumb code pieces calling the ROM's functions, from ltchiptool). They print at 115200,
+  so the host sends the ROM's speed command and then switches the bridge with its speed escape (a pause of a second
+  and `~~~S<baud>`), and back to 1500000 when the ROM is in download mode again. Every connection runs one such
+  program (for the flash size); every read and write is checked against the chip's MD5 of the range (2–3 s each,
+  most of it the pauses before the escapes). `--no-verify` skips it for a write.
+- **A UF2** (LibreTiny / ESPHome, family RTL8710B) is written into the OTA slot that the bootloader starts, chosen
+  from the switch word in the system data at 0x9000, as ltchiptool does; if that is OTA2 and the chip's OTA2 address
+  differs from the UF2's, it is refused (write a full image then). A full image or backup goes to 0.
+- `--run` restarts the chip with its TX released at the end; otherwise it stays in download mode.
+
+Wiring (see [Wiring](#wiring)): log TX (PA30) to the SWS wire, log RX (PA29) to GPIO 21, CEN to the reset wire,
+3V3 to the power pins, GND. On a WR module these are the TX / RX pads of the log UART (the module's data sheet names
+them; on the WR3 they are TXD2 / RXD2). Disconnect the mains first on a mains-powered device.
+
+## Realtek AmebaZ2 (RTL8720C) over UART
+
+    python3 tlsr_c3.py -p /dev/ttyACM0 --rtl2 info                        # chip, flash, MACs (eFuse)
+    python3 tlsr_c3.py -p /dev/ttyACM0 --rtl2 rf 0 0 backup.bin           # whole flash, checked by the chip's SHA-256
+    python3 tlsr_c3.py -p /dev/ttyACM0 --rtl2 wf 0 firmware.uf2 --run     # LibreTiny / ESPHome UF2
+    python3 tlsr_c3.py -p /dev/ttyACM0 --rtl2 wf 0 backup.bin             # a full image from 0
+    python3 tlsr_c3.py -p /dev/ttyACM0 --rtl2 es 0x1f0000 0x1000
+
+Firmware 0.28. For the RTL8720CF (Tuya WBR2, WBR3, CR3L …) and the RTL8710CX / CM. The ROM starts its download
+console when PA00 is **high** at reset: the BOOT wire (the C3's GPIO 0) holds it high while the flasher restarts the
+chip (reset wire and power pins). PA13 (RX0) must not be pulled low. The console runs on the log UART at 115200;
+`ucfg <baud>` raises its speed (`--rtl-baud`, default 1500000; when that fails, a new session at 921600, then 115200),
+and the bridge follows that line (`src/lnscan.h`). The rest runs in `tlsr_c3.py` through the bridge:
+
+- Reads are text dumps (`DB` of the flash, mapped at 0x98000000 once `hashq` has set it up), 4 k per command, about
+  five characters on the wire per byte: a 2 MB flash takes a bit over a minute at 1500000. The whole range is then
+  checked against the SHA-256 the ROM computes (`hashq`, from where the last `fwd` started; an empty, cancelled `fwd`
+  sets that).
+- Writes go over XMODEM-1K (`fwd`), which erases what it writes; the host sends whole sectors (what is before the
+  start and after the end in them is read and sent along) and checks the SHA-256 afterwards. The ROM has no erase
+  command: `es` and `ea` write 0xFF.
+- Chip type and the Wi-Fi / BT MAC addresses are in the eFuse, read by a small RAM program (ltchiptool's) that the
+  host writes with `EW` and starts through an unused command of the ROM console, whose handler it points at the
+  program. Only `info` does this.
+- **A UF2** (LibreTiny / ESPHome, family RTL8720C) is written into OTA1, as ltchiptool does. A full image or backup
+  goes to 0.
+- `--run` restarts the chip with PA00 released at the end.
+
+Wiring (see [Wiring](#wiring)): log TX (PA16) to the SWS wire, log RX (PA15) to GPIO 21, PA00 to the BOOT wire (GPIO
+0), CEN to the reset wire, 3V3 to the power pins, GND. Disconnect the mains first on a mains-powered device.
 
 ## UART bridge
 
@@ -659,9 +781,224 @@ GPIO 21, CEN to GPIO 6 and 3V3 to the power pins, keep the baud at 115200 in the
     ltchiptool flash read -d /dev/ttyACM0 -b 115200 bk72xx backup.bin
     python3 tlsr_c3.py -p /dev/ttyACM0 bridge-exit
 
-The baud rate is fixed by the `bridge` command: the C3's USB port does not pass on the host's setting.
+`--follow esp` (firmware 0.25) is for running esptool yourself through the bridge: start the bridge at 115200 with the BOOT pin low and give the tool any speed; the bridge
+switches when esptool's CHANGE_BAUDRATE has been answered by the target. Each new tool run must start from a fresh
+`bridge` command, as the stub left running stays at the raised speed:
+
+    python3 tlsr_c3.py -p /dev/ttyACM0 bridge 115200 --boot lo --follow esp
+    esptool --port /dev/ttyACM0 --baud 921600 --before no-reset --after no-reset flash-id
+    python3 tlsr_c3.py -p /dev/ttyACM0 bridge-exit
+
+`--follow ln` (firmware 0.26) is the same for the LN882H RAM loader: the bridge switches at the end of a host line
+`baudrate N` (it starts after CR / LF and holds printable characters only, see `src/lnscan.h`).
+
+`--follow ucfg` (firmware 0.28) is the same for the Realtek AmebaZ2 ROM console's `ucfg <baud> …` line.
+
+`--strap rtl` (firmware 0.27) restarts the target with its TX wire pulled low (the Realtek AmebaZ download strap).
+For any protocol, the bridge's speed can also be set from the host: after a pause of a second, `~~~S<baud>` and a
+line feed in one write (nothing of it reaches the target), the same way as the exit escape.
+
+Otherwise the baud rate is fixed by the `bridge` command: the C3's USB port does not pass on the host's setting.
 Tools must not toggle DTR / RTS, because those reset the C3 itself (`esptool --before no_reset --after
 no_reset`). GPIO 21 carries the C3's own boot messages for a moment when the flasher is plugged in.
+
+## UART log
+
+Everything that goes over the target's UART in the bridge, `--esp` and `--bk` modes passes one place in the firmware
+(`src/tuart.cpp`), which writes it to a log in the C3's RAM: every byte in both directions with its time (1 µs),
+and the events: session start with its speed, target resets, speed changes (Beken, esptool's CHANGE_BAUDRATE),
+stale bytes dropped, errors. Each UART session starts a new log; the log of the last one stays until the next
+session, `log --clear` or the flasher is unplugged, so it can be read after a failed run:
+
+    python3 tlsr_c3.py log                      # uart_log.txt
+    python3 tlsr_c3.py log run1.txt --bin run1.bin
+    python3 tlsr_c3.py log --clear
+
+The bridge does not answer commands: leave it (`bridge-exit`) before `log`. The `--esp` mode restarts the target for
+every esptool run and every retry at a lower speed, so the log holds the last of them.
+
+Data in the same direction that follows within 2 ms of the last piece is added to the same record (a console's text
+arrives a few bytes at a time), with the time of its first byte. A block takes 16 k of data; the record headers
+(direction, time, length) are kept apart from the data, so text stays contiguous and compresses as text, and the
+two parts are compressed separately with LZ4 (the block format, with a one-step lazy match search). The first 24 k
+of compressed blocks of a session stay for good (the catch, the link, the speed change), the later ones go into an
+88 k ring that drops its oldest blocks, so a long transfer keeps its start and its end; the text marks the dropped
+part. The whole log takes about 150 k of the C3's RAM; `log` prints the free heap, and the least it has been since
+the flasher started.
+
+How much fits, measured with the firmware's code on real text arriving in 16 to 64 byte pieces with a pause after
+each line: a Home Assistant log (repetitive lines) compresses about 10 times, so about 1.1 M of it fits; a Linux
+kernel log (varied lines with timestamps) about 2.5 times, about 270 k. Erased flash and protocol frames compress
+far better; random data, such as an encrypted or compressed image, not at all, and then the ring holds about 88 k
+of it. The time each block takes to compress on the C3 is not measured yet.
+
+The text has the time in seconds, `>` for host to target, `<` for target to host, `#` for events, then hex and
+ASCII 16 bytes a line. A record made of one short pattern (the link checks while catching, erased flash) shows the
+pattern once with its count, a run of equal lines is one line with its count, and a record repeated back to back is
+shown once with its count. A log of the [two-line logger](#two-line-uart-logger) shows `A` and `B` instead;
+`log --tuya` decodes the Tuya MCU protocol under the records.
+
+## Two-line UART logger
+
+    python3 tlsr_c3.py -p /dev/ttyACM0 sniff 9600 --tuya                    # live; Ctrl-C ends it
+    python3 tlsr_c3.py -p /dev/ttyACM0 sniff 9600 --baud-b 115200 --seconds 60 --out sniff.txt
+    python3 tlsr_c3.py --host c3-flasher.local sniff 9600 --tuya            # live over Wi-Fi
+    python3 tlsr_c3.py -p /dev/ttyACM0 sniff 9600 --at-boot                 # capture from every power-up, no host
+    python3 tlsr_c3.py --host c3-flasher.local log sniff.txt --tuya         # read that capture afterwards
+    python3 tlsr_c3.py -p /dev/ttyACM0 sniff --no-at-boot
+
+From firmware 0.30 the flasher listens to both directions of a UART link between two other parties, for example a
+Tuya Wi-Fi module and the board's MCU, without driving anything: live to the computer, and into the
+[UART log](#uart-log).
+
+**Wiring.** Tapped onto the link in parallel; the board keeps its own supply.
+
+| Flasher wire | Logger |
+|---|---|
+| SWS wire (GPIO 5 reads it; GPIO 4, through its resistor, is an input) | line A: one direction, e.g. the MCU's TX |
+| GPIO 20 (the JTAG TMS / SPI CS wire) | line B: the other direction, e.g. the module's TX |
+| GND | the board's GND |
+| GPIO 21, GPIO 0, GPIO 6, the power pins | not connected; all of them inputs while the logger runs |
+
+Line B is GPIO 20, not the bridge's GPIO 21: at every power-up and reset the C3's ROM and bootloader send their boot
+messages on GPIO 21 (UART0 TX), which would drive the tapped line against its own driver and reach the chip at its
+other end; GPIO 20 is an input from reset on. Both lines must be 3.3 V logic (the C3's pins are not 5 V tolerant);
+the C3 holds them with its weak pull-up (about 45 k), so that an open wire reads idle instead of noise. While the
+logger runs the reset wire, the BOOT wire, GPIO 21 and the power pins are inputs; when it ends, the flasher is back in
+its normal state (the reset wire released, the SWS mode set up again).
+
+**Live.** `sniff BAUD [--baud-b N]` prints every record as it comes: the time in seconds since the start, `A` or `B`,
+then hex and ASCII 16 bytes a line, as `log` does; events (`# ...`) are the session start, framing errors and breaks
+(wrong speed, or a line held low) and receive overflows, at most once a second per line. Ctrl-C or `--seconds` ends
+it: once the host has sent nothing for a second and a half it sends the bridge's escape, the flasher sends what is
+still waiting and answers `OK sniff closed`, and takes commands again. `--out FILE` writes the same lines to a file.
+The capture never waits for the computer: when the computer takes the output slower than the lines bring it (fast
+lines over a weak Wi-Fi link), the live output drops bytes and says how many (`# live output: N bytes dropped`, where
+the gap is); the UART log still gets everything. If the host tool was killed, `bridge-exit` ends the logger too.
+
+Over Wi-Fi the live output goes to the TCP connection that started it (the host tool keeps it open for the whole
+run). When that connection is gone (closed, broken, or replaced by a new one) the live output ends at once, unlike
+the bridge, which waits 60 s for the next tool: a client that connects next expects answers, not frames. The capture
+into the log goes on until a command line comes from any host, USB or TCP (for example `log`, which then reads it). A
+command from USB also ends a capture whose live output goes over Wi-Fi.
+
+**Capture at power-up.** `sniff BAUD --at-boot` stores the speeds in the C3's flash (NVS). From then on, at every
+power-up, the flasher leaves out its usual activation of a target (no reset pulse, no power switching) and listens
+at once, with Wi-Fi started first if it is set up; the first command line from a host, over USB or TCP, stops it
+(the script sends one as it connects), and `log` / `log --tuya` reads it. **The log is in RAM: it is lost when the
+C3 loses power.** A new `sniff` (and every UART mode) starts a new log, so read the old one first. `sniff
+--no-at-boot` switches the capture at power-up off.
+
+**Mains-powered boards.** A Tuya module and its MCU on a board whose supply is not isolated are at mains potential,
+and so is everything wired to them: the C3, its power bank, and a USB cable to the computer with the computer on it.
+Live capture is for a board powered from a safe low voltage (a bench supply, batteries), or over Wi-Fi with the C3 on
+a power bank and nobody touching it, nothing on its USB port. Otherwise use the capture at power-up: wire the C3 on
+its power bank with the board disconnected from the mains, close everything up, connect the mains and let it run;
+afterwards read the log over Wi-Fi without touching anything, or disconnect the board from the mains, then take the
+C3's wires off while the power bank keeps it running, and only then plug it into the computer.
+
+**Time resolution.** A record's time (1 µs clock) is when the flasher took its bytes from the UART driver. The driver
+hands bytes over when its FIFO holds a threshold of them (every byte up to 57600 baud, 8 up to 230400, 32 above) or
+after two character times of silence, and the loop takes them within about a millisecond (longer while a log block
+is being compressed; the driver's 4 k buffer per line covers that). So the order of a request on one line and the
+answer on the other is right when the answer starts later than about 1 ms plus two character times after the
+request's last byte (about 3 ms at 9600 baud); what both lines bring within one pass of the loop is put A first.
+Data of one line within 2 ms of its last piece joins that record, as in the UART log.
+
+**Tuya decoding.** `--tuya` (`sniff` and `log`) decodes the Tuya MCU serial protocol under each record: frames `55 AA
+<version> <command> <length> <data> <checksum>`, put together per line across records, with the command's name
+(heartbeat, product info, working mode, network status, the resets, DP command, DP report, DP query, local time,
+others as hex) and the data points (dpid, type raw / bool / value / string / enum / bitmap, length, value). Bytes
+outside frames are shown and skipped; a frame with a bad checksum is shown and the search goes on after its `55 AA`:
+
+```
+    0.412337 B 55 aa 00 00 00 00 ff                             U......
+               tuya v0 heartbeat (0x00)
+    0.421904 A 55 aa 03 00 00 01 01 04                          U.......
+               tuya v3 heartbeat (0x00), data 01
+    1.412337 B 55 aa 00 08 00 00 07                             U......
+               tuya v0 DP query (0x08)
+    1.431871 A 55 aa 03 07 00 0d 01 01 00 01 01 02 02 00 04 00  U...............
+               00 00 fa 1c                                      ....
+               tuya v3 DP report (0x07): dp 1 bool len 1 = true; dp 2 value len 4 = 250
+```
+
+Which line is which depends on the wiring; the decoder does not need to know.
+
+What runs where: the live output's ring and frames (`src/sniffring.h`) are built natively and checked with a host
+that keeps up, a slow one and one that takes almost nothing (`tests/test_sniff.py`); the host's frame parser, the
+display, the escape and `bridge-exit` against a fake flasher over a pseudo-terminal and over TCP; the Tuya decoder
+on frames split across records, two in one record, bad checksums, garbage and every data point type. The capture
+itself (`src/sniff.cpp`: two UART drivers with RX only, UART0 on GPIO 20) is built, not tried on a C3: open until
+then are the actual time resolution, the loop's speed at high baud rates on two lines, the log store with Wi-Fi on,
+and the live output's speed over USB and Wi-Fi.
+
+## Wi-Fi link
+
+    python3 tlsr_c3.py -p /dev/ttyACM0 wifi join "Home Net"        # station: joins a network (password asked)
+    python3 tlsr_c3.py -p /dev/ttyACM0 wifi ap "C3 flasher"        # or an access point of its own (192.168.4.1)
+    python3 tlsr_c3.py -p /dev/ttyACM0 wifi key                    # the key a TCP client must give (asked twice)
+    python3 tlsr_c3.py -p /dev/ttyACM0 wifi                        # status: mode, IP, name, port, key set or not
+    export C3_FLASHER_KEY=...                                       # or --key
+    python3 tlsr_c3.py --host c3-flasher.local --bk rf 0 0 backup.bin --twice
+    python3 tlsr_c3.py --host 192.168.4.1 log
+    python3 tlsr_c3.py -p /dev/ttyACM0 wifi off
+
+From firmware 0.29 the flasher can run Wi-Fi as a station (it joins a network) or as an access point of its own,
+and takes the same commands on TCP port 7171 as over USB, so the computer need not be wired to the board. The
+setting is kept in the C3's flash (NVS) and Wi-Fi starts with it at power-up. Do the set-up over USB: `wifi join` /
+`wifi ap` restart Wi-Fi, which ends a TCP connection, and a mistake in the password is put right over USB again.
+The SSID and the password go to the flasher in hex (spaces are fine), the password is asked for (or taken from
+`C3_FLASHER_WIFI_PASSWORD` in scripts) and never shown, not by the flasher's status answer either (`password set`).
+`wifi name NAME` sets the mDNS name (default `c3-flasher`, so `c3-flasher.local`; service `_c3flasher._tcp`), used
+from the next start of Wi-Fi; on an access point the flasher is at 192.168.4.1. `wifi off` switches it off for good.
+
+`--host NAME[:PORT]` (default port 7171) replaces `-p` in every command: Telink, SWD, SPI, WCH, Beken, `--esp`
+(esptool gets `socket://NAME:7171` as its port), `--ln`, `--rtl`, `--rtl2`, `bridge`, `bridge-exit`, `log`, `sniff`. One TCP
+client is served at a time; a new connection replaces the old one once it has been admitted. USB keeps working
+alongside Wi-Fi (also for the set-up and as the way back in); a command line from USB ends a bridge that a TCP
+client opened.
+
+**The key.** Without a key anyone who can reach the flasher on the network can read and write the target through
+it. `wifi key` sets one (1..64 printable characters, no spaces; an empty entry removes it); the host then gives it as
+the first line of every connection (`--key`, or better the environment variable `C3_FLASHER_KEY`), and the flasher
+takes that line out of the stream before anything else sees it: it never reaches the command parser, a bridged
+target or the UART log, and it is never printed. A connection without the right key is closed. While a bridge
+opened over TCP is on, connections from the same computer's address need no key, because esptool (or another
+target tool given `socket://NAME:7171`) cannot send it; the bridge ends by itself when no TCP client has been
+connected for 60 s. The key travels in clear text, as everything over this link does: it keeps out others on a
+trusted network, it is no protection on an untrusted one. When the flasher has no key set, do not give one either:
+the host sends it all the same, and the flasher takes it out of the stream only when it comes within the first
+second of a connection (it always does, unless a packet is lost).
+
+**Speed.** Not measured yet. The C3's USB port moves about 45 kbytes/s of base64 or more in the binary streams; a
+TCP connection over Wi-Fi may be faster or slower depending on the signal, and the UART bridge over TCP adds the
+network's delay to every answer of the target, which matters to protocols with many small exchanges.
+
+**Memory.** Wi-Fi and its TCP/IP stack take their buffers from the C3's heap while they run, so starting Wi-Fi
+gives the UART log's store back and the log then leaves 40 k of the largest free block to them (24 k without
+Wi-Fi), on top of every smaller free block (firmware 0.30; 64 k in 0.29). Wi-Fi's fixed buffers are already taken by
+then; the 40 k are for what it takes while it runs: frames in flight to and from the one TCP client (lwIP's window
+and send buffer are about 5.7 k each, a Wi-Fi buffer 1.6 k) and bursts of received frames. The log of a session holds
+less with Wi-Fi on: its store shrinks with the heap down to 21 k, the size of one block of the worst case, with the
+kept start made smaller or left out so that the ring still holds such a block; below that there is no log (`log`
+shows the store's size as `log store` and the lowest free heap since the start, the `wifi` status the free heap and
+its largest block). How much the store gets with Wi-Fi on, and whether 40 k are enough under load, is not measured
+yet: a lowest free heap under about 15 k in `log` after a session with Wi-Fi on would mean the 40 k are too few.
+`wifi off` restores the normal share from
+the next session.
+
+**Safety.** Wi-Fi isolates the computer, not the C3. A C3 (and the power bank it hangs on) wired to a
+mains-powered board whose supply is not isolated is at mains potential: do not touch it or its power bank, and plug
+nothing into its USB port while the board is on the mains. Better still, power such a board from the flasher only,
+with the mains wires disconnected, as in the [Wiring](#wiring) section.
+
+What runs where: the host side is tested against a model of the flasher's command side (`tests/test_wifi_host.py`:
+key accepted and refused, the `wifi` commands' hex encoding with the password absent from all output, a read stream
+over TCP and a connection lost in the middle of one, `bridge-exit` and `--esp` over TCP). The firmware's Wi-Fi part
+(`src/wifilink.cpp`) cannot be simulated without the ESP-IDF network stack; it is built, not tried on a C3: open until
+then are the connection to real access points, mDNS, the heap left with Wi-Fi on, the speed, and how esptool,
+ltchiptool and the LN / Realtek modes behave with the network's delays.
 
 ## Host protocol
 
@@ -701,6 +1038,35 @@ status register), `BKC addr len` (zlib CRC-32 computed by the chip), `BKE addr [
 block), `BKR addr len` (read up to 512 bytes, hex), `BKB offset hex` + `BKW addr` (fill a 4 k buffer, write it to an
 erased sector), `BKG [first writable address [flash size]]` (the bootloader guard, 0x11000 after `BK`), `BKX` (reboot).
 
+UART bridge (firmware 0.15): `BRIDGE <baud> [hi|lo|z] [bk|esp|ln|ucfg|rtl]` (BOOT level while the target is restarted; `bk`
+resets the target until a Beken ROM answers, `esp` follows esptool's CHANGE_BAUDRATE, firmware 0.25, `ln` the
+LN882H loader's `baudrate N` line, firmware 0.26, `ucfg` the AmebaZ2 ROM's `ucfg N` line, firmware 0.28, `rtl` holds the target's TX low across the restart, firmware 0.27;
+speeds up to 5000000); set its speed with a pause of a second and `~~~S<baud>\n` (firmware 0.27); leave it with
+a pause of a second and `~~~X`; the bridge belongs to the source that opened it (USB or TCP). UART log (firmware 0.25): `LOG` (stores the block being filled, answers
+`OK log stored=<bytes> blocks= raw=<bytes of records> dropped=<blocks> tx= rx= heap=<free> heap_min=`, then read it with `XR L 0 <stored>`),
+`LOG 0` (clear).
+
+Two-line UART logger (firmware 0.30): `SNIFF <baud A> [<baud B>]` (line A the SWS wire, line B GPIO 20, B's speed
+A's when left out; 1200..5000000) answers `OK sniff A <baud> B <baud>; ...`, then sends binary frames `<tag:u8>
+<t_us:u32> <n:u16> <data>` (little endian; tag 1 = line B, 2 = line A, 3 = event text; t_us the flasher's microsecond
+clock, which wraps) until a pause of a second and `~~~X` from the same host, answered by `OK sniff closed` after the
+last frame (a frame starts with a byte 1..3, a text line with a letter). The host's other bytes are ignored. The UART
+log gets everything (tag 2 = A, 1 = B, session text `sniff, A <baud>, B <baud>`). A TCP host that is gone ends the
+live output, not the capture; a command line from USB ends it, as does any command line once the live output has
+ended. `SNIFFBOOT <baud A> [<baud B>]` / `SNIFFBOOT 0` sets / clears the capture at power-up (NVS; without arguments
+the setting), answer `OK sniffboot A <a> B <b>` or `OK sniffboot off`; such a capture has no live output and ends
+at the first command line.
+
+Wi-Fi link (firmware 0.29): `WIFI` (status: `OK wifi mode=off|ap|sta ssid=<hex> pass=none|set key=none|set name=
+port= [ip= rssi= | ip= stations= | ip=none state=connecting] client=<address|none> heap= largest=`, no secrets),
+`WIFI AP <ssid hex> <password hex>` (8..63 characters), `WIFI STA <ssid hex> <password hex | ->`, `WIFI OFF`,
+`WIFI KEY <key hex | ->`, `WIFI NAME <name>`; AP and STA restart Wi-Fi and drop a TCP client. Over TCP (port 7171)
+the protocol is the same; the first line of a connection may be `AUTH <key>` (answer `OK auth`, or `ERR auth` and
+the connection is closed); with a key set it must be, except from the address of the client that opened a bridge
+while that bridge is on. Answers are gathered into whole lines before they are sent. A client that takes nothing
+for 8 s, or whose connection fails, is dropped, and a stream to it stops at once; a client that vanished without
+closing is noticed by TCP keep-alive within about half a minute.
+
 Bulk data moves in binary streams (firmware 0.18), not in text answers: `XR <src> <addr> <len>` answers
 `OK <len>` and then frames `D <n:u16> <data> <crc32>` of up to 4 k (`E <n:u16> <text>` on an error, `Z` at
 the end); `XW <dst> <addr> <len> <unit> <skip>` answers `OK`, then takes frames `<n:u16> <data> <crc32>` and
@@ -709,7 +1075,7 @@ wait in the C3's 16 k receive buffer while one is programmed. After an error the
 the line has been quiet for 300 ms, so frames sent ahead never reach the command parser. Sources and
 destinations: `F` Telink flash, `S` SWD flash (write) / memory (read), `M` SWD memory, `P` SPI flash, `C` CH32V003
 memory (read) / flash in 64-byte pages or RAM (write), `B` BK72xx flash (read: every 4 k block checked against the
-chip's CRC; write: whole erased 4 k sectors, address and length 4 k aligned); `unit`
+chip's CRC; write: whole erased 4 k sectors, address and length 4 k aligned), `L` the UART log (read); `unit`
 is the boundary no single flash write crosses, `skip 1` leaves out parts that are all 0xff (not on STM32
 L0 / L1, whose erased flash reads 0x00). The old text commands stay for single blocks. The second pass of
 `rf --twice` and the verify after `wf` only compare CRCs (`FC`, `SFC`, `PC`, `BKC`).
@@ -732,7 +1098,8 @@ L0 / L1, whose erased flash reads 0x00). The old text commands stay for single b
   option bytes (the flasher power-cycles anyway), what a protected flash reads as over debug, and the
   independent watchdog of a firmware with IWDG_SW = 0 while the core is halted.
 
-- Beken: only BK7231N and BK7231T. The BK7231Q / U, BK7238 and BK7252 protocols and the eFuse / encryption key
+- Beken: BK7231N, BK7231T and BK7238 (the BK7238 has the BK7231N's BootROM protocol; only the calibration address and
+  the UF2 family are its own, not tried on a chip). The BK7231Q / U and BK7252 protocols and the eFuse / encryption key
   readout are not handled. Open until a real chip has been on the wire: how soon after power-on the BootROM listens
   and whether the back-to-back link checks land in that window, whether 921600 (or more) is reliable over these
   wires, the 50 ms speed change delay, the CRC speed (timeouts assume at least 80 kbytes/s), the 64 k erase time
@@ -752,10 +1119,24 @@ L0 / L1, whose erased flash reads 0x00). The old text commands stay for single b
   option bytes, and the W commands.
 - `src/bk72xx.cpp` / `.h`: Beken BK72xx download protocol on UART1: catch at power-up, link, speed, flash read /
   erase / write / CRC, status registers, the bootloader guard, and the BK commands.
+- `src/tuart.cpp` / `.h`: the target's UART (TX GPIO 21, RX the SWS wire), the one way the bridge and the Beken mode
+  send, receive, change speed and drop stale bytes; every byte and event goes to the UART log there.
+- `src/lnscan.h`: the bridge's reading of a loader's speed command line (LN882H `baudrate`, AmebaZ2 `ucfg`).
+- `src/uartlog.cpp` / `.h`: the UART log: records, 16 k blocks with headers and data compressed apart (LZ4),
+  the kept start and the ring.
+- `src/sniff.cpp` / `.h`: the two-line UART logger: both lines' UART drivers (RX only), the capture into the UART
+  log and the live ring, error events, the capture at power-up in NVS.
+- `src/sniffring.h`: the logger's live output: frames in a ring that never makes the capture wait (builds natively).
+- `src/wifilink.cpp` / `.h`: the Wi-Fi link: settings in NVS, access point or station, mDNS, the TCP server with
+  its one client as a Stream, the key, and the WIFI command.
 - `tlsr_c3.py`: the command line tool on the computer (Python 3, `pyserial`).
 - `tests/`: checks without hardware (stream protocol, SPI host logic, JTAG against a simulated chain, the WCH
   firmware and host against a simulated CH32V003, the BK72xx firmware and host against a simulated BootROM /
-  bootloader).
+  bootloader, the UART log from the firmware's encoder to the host's text, the LN882H host and the bridge's speed
+  following against a model of the ROM and the RAM loader, the RTL8710B host against a model of its ROM that also
+  checks and runs the RAM programs, the RTL8720C host against a model of its ROM console, the host over TCP against
+  a model of the flasher's command side, the logger's live ring natively and its host side and Tuya decoder against
+  a fake flasher).
 
 ## Credits
 
@@ -792,6 +1173,26 @@ Beken BK72xx:
   no license file, so no code was taken from it): read for the protocol only, which is reimplemented here: the flash
   id answer with the short length field, the speed change timing, the status register opcodes per flash maker
   (Macronix), the erase time-outs and the handling of OpenBeken's `_QIO_` / `_UA_` images.
+
+Realtek AmebaZ:
+
+- ltchiptool by Kuba Szczodrzyński (MIT; `ltchiptool/soc/ambz`): the download protocol (handshakes, read, XMODEM with
+  addresses, speed table), the RAM programs (`ambzcode.py`, taken over as `RtlCode`), the OTA slot choice and the
+  system data layout, and the chip ids. rtltool by pvvx (in ltchiptool, `ambz/util/rtltool.py`): the sector erase
+  and the packet checksum.
+
+Realtek AmebaZ2: ltchiptool (MIT; `ltchiptool/soc/ambz2`, `soc/amb/efuse.py`): the console commands and their
+answers, the flash set-up, `hashq`, the cancelled `fwd`, starting a RAM program through an unused console command,
+the eFuse read program, the physical-to-logical eFuse conversion, the MAC locations, the strapping and the OTA1 choice.
+
+Lightning LN882H:
+
+- ltchiptool by Etienne Le Cousin and Kuba Szczodrzyński (MIT; <https://github.com/libretiny-eu/ltchiptool>,
+  `ltchiptool/soc/ln882h`): the sequence (ROM link, RAM loader over YMODEM, speed change, `flash_read` with its CRC,
+  `startaddr` + `upgrade`), the wiring and the RAM loader binary it ships (Lightning's, not included here).
+- OpenLN882H SDK (<https://github.com/openshwprojects/OpenLN882H>, Shanghai Lightning Semiconductor's SDK):
+  the source of the RAM loader (`project/bootcode/ramcode_dl`): its commands, the YMODEM receiver, and the erase of
+  the received range that makes the host send whole sectors. LibreTiny: the UF2 family id.
 
 ## License
 

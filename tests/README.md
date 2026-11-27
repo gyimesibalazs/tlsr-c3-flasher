@@ -8,8 +8,14 @@
     python3 tests/test_wch_host.py    # WCH host commands against the same simulation (builds it with g++)
     g++ -std=c++17 -Wall -Wextra -I tests/py32_sim/stub -I src -o /tmp/py32_sim tests/py32_sim/py32_sim.cpp src/swdflash.cpp && /tmp/py32_sim
     python3 tests/test_py32_host.py   # Puya PY32F002B / MS32C001 SWD host commands against py32_sim (builds it)
-    g++ -std=c++17 -Wall -Wextra -I tests/bk_sim/stub -I src -o /tmp/bk_sim tests/bk_sim/bk_sim.cpp src/bk72xx.cpp && /tmp/bk_sim
+    g++ -std=c++17 -Wall -Wextra -I tests/bk_sim/stub -I src -o /tmp/bk_sim tests/bk_sim/bk_sim.cpp src/bk72xx.cpp src/tuart.cpp src/uartlog.cpp && /tmp/bk_sim
     python3 tests/test_bk_host.py     # Beken BK72xx host commands against bk_sim (builds it)
+    python3 tests/test_uartlog.py     # UART log: src/uartlog.cpp built natively, its export decoded by tlsr_c3.py
+    python3 tests/test_ln_host.py     # LN882H host and src/lnscan.h against a model of the bridge, ROM and RAM loader
+    python3 tests/test_rtl_host.py    # RTL8710B host against a model of the ROM (handshakes, read, XMODEM, RAM programs)
+    python3 tests/test_rtl2_host.py   # RTL8720C host against a model of the ROM console (dumps, fwd, hashq, eFuse program)
+    python3 tests/test_wifi_host.py   # host over TCP (--host, the key, wifi, a stream, bridge-exit, --esp) against a model
+    python3 tests/test_sniff.py       # two-line UART logger: src/sniffring.h natively, the host's live output, Tuya decoder
 
 `jtag_sim` builds the real `src/swd.cpp` for the PC and runs it against a GPIO-level simulation of a JTAG
 chain (Arm JTAG-DP with a MEM-AP, an STM32 boundary-scan TAP, a device without IDCODE): chain scan, DAP
@@ -42,5 +48,26 @@ with noise, erase / write / CRC, the bootloader guard, protection, reboot, the B
 `test_bk_host.py` runs `tlsr_c3.py --bk` (info, rf --twice, wf with partial sectors and unchanged sectors skipped,
 the bootloader guard and full images, LibreTiny UF2 files, OTA packages refused, ea, --run, unknown and Macronix
 flash chips, the BK7231T, failed links) against it through `bk_sim --serve`.
+
+`test_wifi_host.py` runs `tlsr_c3.py` over TCP against a local server thread that models the flasher's command side
+(V, AUTH with a key, WIFI, an XR stream, BRIDGE with the escape and the rule that the bridge owner's address needs no
+key): connecting with and without the key and with a wrong one, `wifi ap` / `wifi join` / `wifi key` with the SSID
+and password in hex and neither the password nor the key in any output, a read stream over TCP and a connection
+that breaks in the middle of one, `bridge-exit` over TCP, and `--esp` handing `socket://…` to a fake esptool that
+reaches the "target" without the key. The firmware's Wi-Fi part (`src/wifilink.cpp`) needs the ESP-IDF network
+stack and is not simulated.
+
+`test_sniff.py` builds `src/sniffring.h` (the two-line UART logger's live output) natively as `tests/sniff_sim` and
+feeds it made-up captures of both lines (pieces of 1 to 1500 bytes, events, a clock that wraps) with a host that
+keeps up, a slow one that takes 150 bytes per piece and frames cut anywhere, and one that takes a byte now and then;
+`tlsr_c3.py`'s frame parser reads the output in random pieces, and the test checks that every frame is a piece in
+order (long ones split at 1 k) and that every gap is reported before the next frame with its exact size. The Tuya MCU
+decoder is checked on frames split across records, two in one record, a bad checksum, garbage between frames, a
+length no frame has, and every data point type. The host's `sniff` runs against a fake flasher over a
+pseudo-terminal (as the USB port) and over TCP through the command line (frames shown and decoded, the escape after
+a pause, drops counted, `--out`, `--at-boot`, `--no-at-boot`); `bridge-exit` finds the closing line behind the frames;
+`log --tuya` shows a logger session with A / B. `test_uartlog.py` also checks the small store of a session with Wi-Fi
+on and the case of too little heap for any store. The capture itself (`src/sniff.cpp`) needs the C3's UART drivers
+and is not simulated.
 
 None of this replaces a test on a real target.

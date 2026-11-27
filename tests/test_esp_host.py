@@ -8,19 +8,23 @@ log = []
 
 
 class FakeFlasher:
-    def __init__(self, port='COM9', baud=0):
+    def __init__(self, port='COM9', baud=0, key=None):
         self.ser = types.SimpleNamespace(close=lambda: log.append('close'))
     def cmd(self, text, timeout=5):
         log.append(text)
         return 'bridge %s' % text.split()[1] if text.startswith('BRIDGE') else ''
 
 
-def fake_esptool(version, fail=False, write_files=None):
+def fake_esptool(version, fail=0, write_files=None):
+    """fail: the number of runs that fail first (True: all)"""
     m = types.ModuleType('esptool')
     m.__version__ = version
+    left = [fail]
     def main(argv):
         log.append(('esptool',) + tuple(argv))
-        if fail:
+        if left[0] is True or left[0] > 0:
+            if left[0] is not True:
+                left[0] -= 1
             raise RuntimeError('Failed to connect')
         if write_files is not None and argv[-4].startswith('read'):
             with open(argv[-1], 'wb') as out:
@@ -30,19 +34,19 @@ def fake_esptool(version, fail=False, write_files=None):
 
 
 def args(op, **kw):
-    a = types.SimpleNamespace(op=op, port='COM9', esp_baud=115200, esp_chip='', esp_stay=False,
+    a = types.SimpleNamespace(op=op, port='COM9', esp_baud=0, esp_chip='', esp_stay=False,
                               address=0, size=0, filename='', twice=False, no_verify=False, no_erase=False)
     for k, v in kw.items():
         setattr(a, k, v)
     return a
 
 
-def run(a, esptool):
+def run(a, esptool, follow=True):
     log.clear()
     sys.modules['esptool'] = esptool
     T.Flasher = FakeFlasher
-    T.bridge_exit = lambda port: (log.append('bridge-exit'), 'OK bridge closed')[1]
-    T.esp_main(FakeFlasher(), a)
+    T.bridge_exit = lambda port, key=None: (log.append('bridge-exit'), 'OK bridge closed')[1]
+    T.esp_main(FakeFlasher(), a, follow=follow)
     return list(log)
 
 
@@ -50,15 +54,21 @@ def esptool_calls(seq):
     return [c[1:] for c in seq if isinstance(c, tuple)]
 
 
-# info, esptool 5: download mode first, esptool without resets, bridge closed, then a plain restart
+# info, esptool 5: download mode first with the bridge at 115200 following esptool's speed change to 921600,
+# esptool without resets, bridge closed, then a plain restart
 seq = run(args('info'), fake_esptool('5.1.0'))
-assert seq[0] == 'BRIDGE 115200 lo' and seq[1] == 'close', seq
-assert esptool_calls(seq) == [('--port', 'COM9', '--baud', '115200', '--before', 'no-reset', '--after', 'no-reset',
+assert seq[0] == 'BRIDGE 115200 lo esp' and seq[1] == 'close', seq
+assert esptool_calls(seq) == [('--port', 'COM9', '--baud', '921600', '--before', 'no-reset', '--after', 'no-reset',
                                'flash-id')], seq
 assert seq[-3:] == ['bridge-exit', 'RST', 'close'], seq
 
+# firmware older than 0.25: the bridge runs at the esptool speed from the start, 115200 by default
+seq = run(args('info'), fake_esptool('5.1.0'), follow=False)
+assert seq[0] == 'BRIDGE 115200 lo' and esptool_calls(seq)[0][3] == '115200', seq
+
 # esptool 4 spells with underscores; chip and speed are passed on
-seq = run(args('wf', address=0x1000, filename='fw.bin', esp_baud=460800, esp_chip='esp8266'), fake_esptool('4.8.1'))
+seq = run(args('wf', address=0x1000, filename='fw.bin', esp_baud=460800, esp_chip='esp8266'), fake_esptool('4.8.1'),
+          follow=False)
 assert seq[0] == 'BRIDGE 460800 lo', seq
 assert esptool_calls(seq) == [('--port', 'COM9', '--baud', '460800', '--before', 'no_reset', '--after', 'no_reset',
                                '--chip', 'esp8266', 'write_flash', '0x1000', 'fw.bin')], seq
@@ -90,12 +100,20 @@ try:
 except T.FlasherError as e:
     assert 'differ' in str(e)
 
-# an esptool failure still closes the bridge and restarts the target, then reports the error
+# a failed run is repeated at the next lower speed, the target restarted in download mode each time; the later runs
+# stay at the speed that worked
+seq = run(args('rf', size=0x100, filename=fn, twice=True), fake_esptool('5.0.0', fail=1, write_files=[b'a' * 256] * 2))
+calls = esptool_calls(seq)
+assert [c[3] for c in calls] == ['921600', '460800', '460800'], calls
+assert seq.count('BRIDGE 115200 lo esp') == 3 and seq.count('bridge-exit') == 3, seq
+
+# an esptool failure at every speed still closes the bridge and restarts the target, then reports the error
 try:
     seq = run(args('info'), fake_esptool('5.0.0', fail=True))
     raise AssertionError('must fail')
 except T.FlasherError as e:
     assert 'Failed to connect' in str(e) and log[-3:] == ['bridge-exit', 'RST', 'close'], (e, log)
+    assert [c[3] for c in esptool_calls(log)] == ['921600', '460800', '115200'], log
 
 # operations that do not exist in this mode
 for op in ('selftest', 'pins'):

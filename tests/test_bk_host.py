@@ -28,7 +28,8 @@ def build_sim():
     out = os.path.join(tempfile.gettempdir(), 'bk_sim_%d' % os.getpid())
     subprocess.check_call(['g++', '-std=c++17', '-O1', '-I', os.path.join(HERE, 'bk_sim', 'stub'),
                            '-I', os.path.join(ROOT, 'src'), '-o', out, os.path.join(HERE, 'bk_sim', 'bk_sim.cpp'),
-                           os.path.join(ROOT, 'src', 'bk72xx.cpp')])
+                           os.path.join(ROOT, 'src', 'bk72xx.cpp'), os.path.join(ROOT, 'src', 'tuart.cpp'),
+                           os.path.join(ROOT, 'src', 'uartlog.cpp')])
     return out
 
 
@@ -170,6 +171,12 @@ def main():
         assert t.rom and t.chip == 'BK7231N' and t.flash_id == 'eb6015' and t.size == 0x200000, vars(t)
         assert t.baud == 921600 and 'status 401c: protected' in text and 'c8:47:8c:12:34:56' in text, text
         print(text.strip().replace('\n', '\n    '))
+
+        # BK7238 (Tuya T1): the same BootROM protocol; the MAC is in the calibration of the T1 layout
+        f.raw('SIM new chip=7238')
+        t, text = run(f, args('info'))
+        assert t.rom and t.chip == 'BK7238' and 'c8:47:8c:12:34:56' in text and '0x1e3000' in text, text
+        f.raw('SIM new sr1=1c sr2=40')
 
         # full backup, twice: every block checked by CRC while reading, then the CRC of the whole range
         out = os.path.join(tmp, 'dump.bin')
